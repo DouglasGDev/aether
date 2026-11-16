@@ -266,6 +266,29 @@ pub fn parse_tool_calls(text: &str, nomes: &[&str]) -> Vec<ToolCall> {
     extrair(text, nomes).0
 }
 
+/// A chamada que o teto de tokens deixou aberta, ainda com o nome da ferramenta
+/// escrito: é o texto inteiro que a continuação re-prefila, para o modelo
+/// terminar o próprio corpo em vez de o app executar uma chamada pela metade.
+///
+/// `None` quando todas as chamadas fecham — a resposta está inteira — e quando
+/// o nome que abriu a chamada não é uma ferramenta conectada: continuar uma
+/// alucinação é só gastar a placa. Diferente de `parse_tool_calls`, aqui não
+/// precisa existir nenhum argumento inteiro — o corte costuma comer justamente
+/// o primeiro — porque nada é executado: o que se pede é o resto da frase.
+pub fn chamada_pendente(texto: &str, nomes: &[&str]) -> Option<String> {
+    let mut de = 0usize;
+    while let Some(achado) = texto[de..].find(CALL_OPEN) {
+        let inicio = de + achado;
+        let depois = inicio + CALL_OPEN.len();
+        let Some(fecho) = texto[depois..].find(CALL_CLOSE) else {
+            let nome = nome_da_chamada(&texto[depois..])?;
+            return nomes.iter().any(|n| *n == nome).then(|| texto.to_string());
+        };
+        de = depois + fecho + CALL_CLOSE.len();
+    }
+    None
+}
+
 /// As chamadas e os intervalos de texto que cada uma ocupou. Os intervalos são
 /// o que a tela esconde; chamá-los junto evita as duas leituras divergirem.
 fn extrair(text: &str, nomes: &[&str]) -> (Vec<ToolCall>, Vec<(usize, usize)>) {
@@ -312,16 +335,25 @@ fn extrair(text: &str, nomes: &[&str]) -> (Vec<ToolCall>, Vec<(usize, usize)>) {
     (calls, marcas)
 }
 
+/// O nome que a chamada declara, lido da etiqueta da ferramenta. É o mesmo
+/// corte de `parse_function`, e é o que a continuação confere contra as
+/// ferramentas conectadas antes de gastar a placa: um `<` no lugar do `>` é o
+/// modelo abrindo o primeiro parâmetro sem fechar a etiqueta do nome, e aí não
+/// há nome a validar.
+fn nome_da_chamada(block: &str) -> Option<String> {
+    let after = &block[block.find(FN_OPEN)? + FN_OPEN.len()..];
+    let fim = after.find(['>', '<'])?;
+    let nome = after[..fim].trim();
+    (!nome.is_empty()).then(|| nome.to_string())
+}
+
 fn parse_function(block: &str) -> Option<ToolCall> {
+    let name = nome_da_chamada(block)?;
     let after = &block[block.find(FN_OPEN)? + FN_OPEN.len()..];
     // O nome termina no `>` que fecha a etiqueta. Um `<` antes desse `>` é o
     // modelo abrindo o primeiro parâmetro sem fechar a etiqueta do nome — deriva
     // que ele produz, e que lida como nome viraria uma ferramenta inexistente.
     let fim = after.find(['>', '<'])?;
-    let name = after[..fim].trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
     let corpo = &after[fim..];
     let mut body = if corpo.starts_with('>') { &corpo[1..] } else { corpo };
     body = match body.find(FN_CLOSE) {
@@ -528,6 +560,47 @@ pub fn afirma_que_fez(texto: &str) -> bool {
     .any(|marca| baixo.contains(marca))
 }
 
+/// A promessa de fazer, dita por quem ainda vai fazer e que para pedindo
+/// licença. É o outro lado da moeda de `afirma_que_fez`, e foi medida na
+/// conversa real do Granite 4.2 3B: o modelo escreve o arquivo inteiro num bloco
+/// de código, diz "vou atualizar o arquivo agora" e fecha com "Confirme
+/// (sim/não)". Nada acontece naquele turno, e o dono da máquina fica com uma
+/// pergunta que a tela de aprovação já responde melhor — ela é o gate, e mostra
+/// o que vai ser escrito antes de escrever.
+///
+/// Exige os dois lados de propósito: "vou criar um resumo" sem pedir licença é
+/// um plano legítimo, e "confirme se entendeu" sem promessa nenhuma é conversa.
+pub fn promete_e_pede_licenca(texto: &str) -> bool {
+    let baixo = texto.to_lowercase();
+    const VAI: [&str; 13] = [
+        "vou criar",
+        "vou escrever",
+        "vou atualizar",
+        "vou salvar",
+        "vou aplicar",
+        "vou modificar",
+        "vou editar",
+        "vou substituir",
+        "vou gravar",
+        "i will create",
+        "i will write",
+        "i will update",
+        "i will save",
+    ];
+    const LICECA: [&str; 9] = [
+        "confirme",
+        "confirma",
+        "digite",
+        "aprovar",
+        "autorizar",
+        "posso prosseguir",
+        "quer que eu",
+        "se você aprovar",
+        "me diga se devo",
+    ];
+    VAI.iter().any(|m| baixo.contains(m)) && LICECA.iter().any(|m| baixo.contains(m))
+}
+
 /// Uma chamada cercada por bloco de código perde a cerca junto com ela: sem
 /// isso sobra na tela um bloco vazio que não diz nada. A cerca só é comida
 /// quando está colada no bloco, separada só por espaço em branco.
@@ -573,6 +646,59 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "everything__echo");
         assert_eq!(calls[0].arguments["message"], "olá mundo");
+    }
+
+    /// A chamada fechada não está pendente: o corpo veio inteiro, e executar é
+    /// o que o laço já faz.
+    #[test]
+    fn chamada_fechada_nao_pede_continuacao() {
+        assert!(chamada_pendente(&sample(), NOMES).is_none());
+    }
+
+    /// O corte do teto no meio de um corpo de arquivo: o `tool_call` abre, o
+    /// nome vem, o parâmetro começa e nada fecha. É exatamente aqui que a
+    /// continuação assume, e o prefilo tem de ser o texto inteiro — a prosa
+    /// inclusive — porque é dela que o modelo retoma.
+    #[test]
+    fn chamada_aberta_no_meio_do_corpo_e_preamar_para_continuar() {
+        let cortada = format!(
+            "Vou escrever o arquivo.{c}\n{f}srv__run{gt}\n{p}conteudo{gt}\n<!DOCTYPE html>\n<body>",
+            c = CALL_OPEN,
+            f = FN_OPEN,
+            gt = ">",
+            p = PARAM_OPEN,
+        );
+        assert_eq!(chamada_pendente(&cortada, NOMES).as_deref(), Some(cortada.as_str()));
+    }
+
+    #[test]
+    fn nome_fora_das_ferramentas_nao_gasta_a_placa() {
+        let inventada = format!(
+            "{c}\n{f}srv__nao_existe{gt}\n{p}conteudo{gt}\n<html>",
+            c = CALL_OPEN,
+            f = FN_OPEN,
+            gt = ">",
+            p = PARAM_OPEN,
+        );
+        assert!(chamada_pendente(&inventada, NOMES).is_none());
+        // Sem ferramenta conectada não há o que continuar.
+        assert!(chamada_pendente(&inventada, &[]).is_none());
+    }
+
+    /// Duas chamadas, a primeira inteira e a segunda cortada: a pendência é da
+    /// segunda, e a prosa das duas continua sendo o que o modelo escreveu.
+    #[test]
+    fn segunda_chamada_cortada_continua_a_partir_do_texto_inteiro() {
+        let texto = format!("{}{}E agora a outra.", sample(), {
+            format!(
+                "\n{c}\n{f}srv__run{gt}\n{p}conteudo{gt}\n<met",
+                c = CALL_OPEN,
+                f = FN_OPEN,
+                gt = ">",
+                p = PARAM_OPEN,
+            )
+        });
+        assert_eq!(chamada_pendente(&texto, NOMES).as_deref(), Some(texto.as_str()));
     }
 
     #[test]
@@ -771,6 +897,27 @@ mod tests {
         assert!(afirma_que_fez("O arquivo foi escrito com a ferramenta."));
         assert!(!afirma_que_fez("Vou criar um arquivo HTML. Quer que eu proceda?"));
         assert!(!afirma_que_fez("A capital do Brasil é Brasília."));
+    }
+
+    /// As duas frases são a transcrição do turno real que não fez nada: o
+    /// modelo escreveu o HTML inteiro num bloco, anunciou a substituição e parou
+    /// pedindo "sim". É o que a cabeceira passa a fechar.
+    #[test]
+    fn promessa_de_escrita_com_licenca_pedida_e_o_defeito_medido() {
+        assert!(promete_e_pede_licenca(
+            "Agora vou substituir o conteúdo atual do arquivo `E:\\teste\\landing_page.html` \
+             pelo novo conteúdo acima usando a ferramenta de edição. Confirme se esse é \
+             exatamente o que você quer (sim/não)."
+        ));
+        assert!(promete_e_pede_licenca(
+            "Vou atualizar o arquivo agora com essas melhorias. Por favor, digite \"Sim\" \
+             para prosseguir com o update do arquivo."
+        ));
+        // Os dois lados são exigidos juntos: plano sem licença é conversa, e
+        // licença sem promessa de escrever não é o defeito.
+        assert!(!promete_e_pede_licenca("Vou criar um resumo do que você disse."));
+        assert!(!promete_e_pede_licenca("Confirme se entendeu o conceito de KV cache."));
+        assert!(!promete_e_pede_licenca("A capital do Brasil é Brasília."));
     }
 
     #[test]

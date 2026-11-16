@@ -374,10 +374,14 @@ fn escrever_atomico(alvo: &Path, conteudo: &str) -> Result<()> {
 
 pub fn escrever(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
     let alvo = caminho(args, pastas)?;
+    // O corpo é obrigatório no esquema, e é obrigatório aqui pelo mesmo motivo:
+    // uma chamada cortada no teto de tokens chega só com o `caminho`, e um
+    // `String::new()` nesse ponto criaria um arquivo vazio dizendo "Criado".
+    // Esvaziar um arquivo é legítimo, mas quem decide é quem pede — o modelo
+    // escreve `conteudo: ""`, não omite o argumento.
     let conteudo = match args.get("conteudo") {
         Some(Value::String(texto)) => texto.clone(),
-        Some(Value::Null) | None => String::new(),
-        Some(outro) => outro.to_string(),
+        _ => bail!(tr("erros.argumentoFaltando", &[("nome", "conteudo")])),
     };
     if alvo.exists() && !alvo.is_file() {
         bail!(tr("erros.naoEArquivo", &[("caminho", &alvo.display().to_string())]));
@@ -731,6 +735,33 @@ mod tests {
         let Vista::Escrita { criado, .. } = saida.vista else { panic!("vista errada") };
         assert!(!criado);
         assert_eq!(fs::read_to_string(&alvo).unwrap(), "novo");
+        limpar(&raiz);
+    }
+
+    /// A chamada cortada no teto de tokens chega só com o caminho. Sem o corpo
+    /// não há arquivo a criar: o que estava acontecendo era um zero bytes
+    /// anunciado como "Criado", e o modelo sem nada para corrigir.
+    #[test]
+    fn escrever_sem_corpo_nao_toca_o_disco() {
+        let (raiz, pastas) = cenario("escrever-sem-corpo");
+        let alvo = raiz.join("pagina.html");
+        let erro = escrever(&args(json!({"caminho": alvo})), &pastas)
+            .err()
+            .expect("sem conteúdo a ferramenta tem de recusar");
+        assert!(erro.to_string().contains("conteudo"), "{erro}");
+        assert!(!alvo.exists(), "recusar não é criar arquivo vazio");
+        limpar(&raiz);
+    }
+
+    /// Esvaziar é um pedido legítimo, e ele vem dito: `conteudo` presente e
+    /// vazio. O que a recusa protege é a ausência, não a string vazia.
+    #[test]
+    fn conteudo_vazio_explicito_e_permitido() {
+        let (raiz, pastas) = cenario("escrever-vazio");
+        let alvo = raiz.join("a.txt");
+        fs::write(&alvo, "velho").unwrap();
+        escrever(&args(json!({"caminho": alvo, "conteudo": ""})), &pastas).unwrap();
+        assert_eq!(fs::read_to_string(&alvo).unwrap(), "");
         limpar(&raiz);
     }
 

@@ -105,7 +105,7 @@
     "podeApagar": "Pode apagar"
   },
   "conversa": {
-    "promptSistema": "Você é Aether, um assistente local que roda no computador do usuário. Responda em {idioma}, de forma breve e direta.",
+    "promptSistema": "Você é Aether, um assistente local que roda no computador do usuário. Responda em {idioma}, de forma breve e direta. Aja com as ferramentas em vez de descrever a ação: quem aprova cada ação é a tela de aprovação, então não peça confirmação na resposta.",
     "pastasConcedidas": "Pastas concedidas — os únicos caminhos que existem para você: {lista}. Use caminho absoluto dentro delas; fora delas você não tem acesso a nada.",
     "raciocinio": "Raciocínio",
     "ferramentas": "Ferramentas",

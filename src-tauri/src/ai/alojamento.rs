@@ -246,6 +246,13 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         camada,
         fixo,
         // 2 = K e V; 2 bytes = o f16 do flash attention.
+        //
+        // Numa arquitetura híbrida (parte das camadas com estado de espaço de
+        // estados em vez de atenção, como `qwen35` declara com
+        // `full_attention_interval`), isto é teto, não conta exata: as camadas
+        // lineares também ocupam cache, só que com outra forma. O que confere o
+        // número é o delta real de VRAM que a carga produz — `engine-probe
+        // alojar:` — e não esta fórmula.
         kv_por_token: 2 * camadas as u64 * cabecas_kv * dimensao * 2,
         janela_maxima: numero(md, &chave("context_length")).unwrap_or(0) as usize,
         template,

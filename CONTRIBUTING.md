@@ -51,6 +51,15 @@ tem de vir de um log ou de uma medição desta máquina, com o comando que o pro
   precisar do engine usa `acquire` e devolve antes de gerar.
 - Ferramenta que o modelo pediu passa pelo gate. Não existe atalho de execução
   para o conector local: ele entra no mesmo cadastro que um servidor MCP.
+- Entrada nova no catálogo de modelos entra medida, não estimada: os bytes vêm do
+  `tree/main` do HuggingFace arquivo por arquivo, a janela e a licença vêm do
+  cabeçalho GGUF, e a arquitetura tem de estar registrada na `llama.dll`
+  vendorizada — `every_entry_is_an_architecture_the_engine_runs` confere isso
+  lendo o binário. O que diz "Apache-2.0" ou "5,3 GB" sem ter lido a fonte é
+  propaganda dentro de código.
+- O prompt do sistema é curto porque foi medido: o Granite 4.2 3B passa a
+  ignorar a pergunta quando o prompt é longo ou em outra língua. Acrescentar uma
+  frase aqui exige rodar a conversa de verdade depois, não só o `cargo test`.
 
 ## Ciclo de mudança
 

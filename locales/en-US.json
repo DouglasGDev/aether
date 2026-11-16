@@ -105,7 +105,7 @@
     "podeApagar": "May delete"
   },
   "conversa": {
-    "promptSistema": "You are Aether, a local assistant that runs on the user's computer. Reply in {idioma}, briefly and directly.",
+    "promptSistema": "You are Aether, a local assistant that runs on the user's computer. Reply in {idioma}, briefly and directly. Act with the tools instead of describing the action: the approval screen is what authorizes each one, so do not ask for confirmation in your reply.",
     "pastasConcedidas": "Granted folders — the only paths that exist for you: {lista}. Use an absolute path inside them; outside them you have access to nothing.",
     "raciocinio": "Reasoning",
     "ferramentas": "Tools",

@@ -5,8 +5,8 @@
 //! que o gate negou volta ao modelo como erro, nunca como sucesso inventado.
 
 use super::chat::{
-    CALL_OPEN, ChatMessage, ChatTemplate, ToolCall, ToolSpec, afirma_que_fez, corpo_de_codigo,
-    inicio_de_chamada, parse_tool_calls, strip_tool_calls,
+    CALL_OPEN, ChatMessage, ChatTemplate, ToolCall, ToolSpec, afirma_que_fez, chamada_pendente,
+    corpo_de_codigo, inicio_de_chamada, parse_tool_calls, promete_e_pede_licenca, strip_tool_calls,
 };
 use super::engine::{Emission, Engine, SamplingParams, StopReason};
 use super::memoria::Achado;
@@ -43,6 +43,31 @@ const TURN_MARKER: &str = concat!("<", "|im_start|>");
 /// a resposta sai vazia: é ele que marca onde a resposta começa.
 const THINK_OPEN: &str = concat!("<", "think>");
 const THINK_CLOSE: &str = concat!("</", "think>");
+
+/// Rede de segurança da retomada de chamada cortada. O limite real é o espaço
+/// que sobra na janela, medido rodada a rodada, não este número: ele só impede
+/// que um modelo faça o laço girar sem fim.
+const CONTINUACOES_MAX: usize = 16;
+/// Tokens que a última geração de um turno precisa ter para valer a pena. Sem
+/// esta reserva, a retoma seguinte poderia entrar na janela e ser cortada em
+/// zero tokens: o corpo não avançaria e o turno giraria até o teto de rodadas.
+const RESERVA_MINIMA: usize = 32;
+
+/// Cabe mais uma retoma do corpo cortado? A resposta é conta, não opinião: a
+/// retoma prefila o prompt inteiro com o que já foi escrito, de modo que o
+/// espaço consumido é `prompt + gerados` e o próximo corte ainda precisa de
+/// `teto` células. `retoma_ate_a_janela_encher` confere a conta com os números
+/// do turno real que escreveu a página de 8.447 bytes.
+fn retomada_cabe(
+    prompt: usize,
+    gerados: usize,
+    janela: usize,
+    teto: usize,
+    continuacoes: usize,
+) -> bool {
+    continuacoes < CONTINUACOES_MAX
+        && janela.saturating_sub(prompt + gerados + teto) >= RESERVA_MINIMA
+}
 
 /// O que a sessão entrega a quem escuta. Todo evento é fato ocorrido.
 #[derive(Debug, Clone, Serialize)]
@@ -374,7 +399,10 @@ fn encaixe(
 /// ferramenta não tem no esquema nem um caminho nem um corpo. O app não inventa
 /// para onde escrever.
 fn cabeca_de_chamada(resposta: &str, tools: &[ToolSpec]) -> Option<String> {
-    if !afirma_que_fez(resposta) {
+    // Ou ele diz que fez, ou diz que vai fazer e para pedindo licença. Os dois
+    // deixam o disco como a resposta descreve, e os dois têm o corpo escrito por
+    // ele mesmo abaixo, que é o que impede o app de inventar um arquivo.
+    if !afirma_que_fez(resposta) && !promete_e_pede_licenca(resposta) {
         return None;
     }
     corpo_de_codigo(resposta)?;
@@ -421,6 +449,11 @@ pub fn run_turn(
     // um objeto JSON com um `name` que não está aqui é prosa, não execução.
     let nomes: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
     let mut rounds = 0usize;
+    // Continuações de uma mesma chamada cortada no teto. Não é rodada de
+    // ferramenta — nada foi executado —, mas também não é para ir até o modelo
+    // cansar: o teto é o espaço que sobra na janela, e o `CONTINUACOES_MAX` é a
+    // rede de segurança. Sem teto nenhum, a ferramenta diria o que faltou.
+    let mut continuacoes = 0usize;
     let mut prompt_tokens = 0usize;
     let mut generated_tokens = 0usize;
     let mut prompt_ms = 0u64;
@@ -430,6 +463,10 @@ pub fn run_turn(
     // em vez de escrevê-lo. Uma vez só: insistir duas vezes seria o app falando
     // pelo modelo.
     let mut cabecilha: Option<String> = None;
+    // `cabecilha` volta a `None` a cada rodada consumida, então ela sozinha não
+    // guarda a promessa de "uma vez": sem este bool o turno pode reinvestir a
+    // cabeceira indefinidamente enquanto o modelo responder em prosa.
+    let mut cabeceira_usada = false;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -498,6 +535,39 @@ pub fn run_turn(
             bail!(tr("erros.pedidoCancelado", &[]));
         }
 
+        // O teto de tokens cortou o corpo de um arquivo no meio. Rodar a chamada
+        // pela metade é o que cria um arquivo vazio com a cara de sucesso: o
+        // `caminho` já fechou, o corpo não. O que fecha o serviço é continuar de
+        // onde o modelo parou — o texto dele vira prefilo e a rodada seguinte só
+        // escreve o resto, sem uma linha inventada pelo app. Com teto próprio,
+        // porque insistir sem fim seria queimar a placa numa resposta que não
+        // termina: aí a chamada roda com o que tem e a ferramenta diz o que
+        // faltou, em vez de calar.
+        // O teto de três retomas foi medido e perdido: o corpo de uma página de
+        // 3,6 KB em HTML passa de 1.200 tokens, e 3 × 400 do usuário não chegam
+        // lá. A chamada fechava cortada, a ferramenta devolvia "falta o
+        // argumento", e o modelo recomeçava o arquivo inteiro a cada rodada até
+        // estourar o limite de rodadas. O que limita a retoma é o espaço que
+        // sobra na janela — cada retoma prefila o prompt com o corpo já escrito.
+        // Cabe, continua; não cabe, roda com o que tem e a ferramenta diz o que
+        // faltou, em vez de calar.
+        if generation.stop == StopReason::MaxTokens
+            && retomada_cabe(
+                generation.prompt_tokens,
+                generation.generated_tokens,
+                engine.context(),
+                config.params.max_tokens,
+                continuacoes,
+            )
+        {
+            if let Some(aberta) = chamada_pendente(&raw, &nomes) {
+                continuacoes += 1;
+                emit(SessionEvent::Replace { text: String::new() });
+                cabecilha = Some(aberta);
+                continue;
+            }
+        }
+
         let answer = if config.enable_thinking {
             match raw.find(THINK_CLOSE) {
                 Some(i) => {
@@ -520,8 +590,9 @@ pub fn run_turn(
             // continua vazio. Uma vez, e só uma, a saída em prosa é fechada e
             // ele recomeça de dentro da chamada — o caminho e o corpo continuam
             // sendo os dele, e a aprovação continua sendo de quem assiste.
-            if cabecilha.is_none() && rounds == 0 {
+            if !cabeceira_usada && rounds == 0 {
                 if let Some(cabeca) = cabeca_de_chamada(&answer, config.tools) {
+                    cabeceira_usada = true;
                     emit(SessionEvent::Replace { text: String::new() });
                     cabecilha = Some(cabeca);
                     continue;
@@ -813,5 +884,42 @@ mod tests {
             cabeca_de_chamada("Aqui está o HTML:\n\n```html\n<p>x</p>\n```", &ferramentas),
             None
         );
+    }
+
+    /// O turno medido na conversa real que motivou isto: o modelo escreve o
+    /// arquivo inteiro, diz "vou atualizar agora" e para pedindo "sim". Com o
+    /// corpo na resposta, a cabeceira fecha a prosa e a escrita acontece — com a
+    /// aprovação na tela, que é onde ela sempre esteve.
+    #[test]
+    fn promessa_de_escrita_com_corpo_abre_a_chamada() {
+        let ferramentas = [escrita("computador__escrever_arquivo")];
+        let resposta = concat!(
+            "Vou atualizar o arquivo agora com essas melhorias.\n\n",
+            "```html\n<!DOCTYPE html>\n<body>oi</body>\n```\n\n",
+            "Confirme se esse é exatamente o que você quer (sim/não)."
+        );
+        assert!(cabeca_de_chamada(resposta, &ferramentas).is_some());
+    }
+
+    /// Os pares abaixo foram lidos do turno real no aplicativo nativo, com
+    /// Ornith 1.5 9B, janela 8192 e teto 400 (traço `[corte]` de 16/11): a conta
+    /// dizia não em `prompt=3654` enquanto havia 3.738 tokens livres, e o
+    /// arquivo não nascia. Com a conta do espaço, a mesma chamada fechou em
+    /// sete gerações e a ferramenta escreveu 8.447 bytes.
+    #[test]
+    fn retoma_ate_a_janela_encher() {
+        // A linha em que o teto antigo de três desistiu: ainda cabia.
+        assert!(retomada_cabe(3654, 400, 8192, 400, 3));
+        // As retomas que de fato rodaram naquele turno.
+        for (prompt, continuacoes) in [(1988, 0), (2388, 1), (3188, 3), (3988, 5)] {
+            assert!(retomada_cabe(prompt, 400, 8192, 400, continuacoes), "prompt {prompt}");
+        }
+        // A última geração do mesmo turno: sobrou 30 de espaço, e aí insistir
+        // seria girar sem escrever nada.
+        assert!(!retomada_cabe(7461, 301, 8192, 400, 6));
+        // Janela que não comporta nem uma geração inteira.
+        assert!(!retomada_cabe(7500, 400, 4096, 400, 0));
+        // A rede de segurança continua valendo com espaço de sobra.
+        assert!(!retomada_cabe(1988, 400, 8192, 400, CONTINUACOES_MAX));
     }
 }

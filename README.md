@@ -12,8 +12,8 @@ inferência é parte deste repositório, e o aplicativo é o dono da placa.
 
 | Caminho | O que executa | Quando |
 | --- | --- | --- |
-| GPU | llama.cpp pelo backend **Vulkan** | sempre que existe placa Vulkan registrada |
-| CPU | implementação própria em candle (`src-tauri/src/ai/granite.rs`) | máquina sem GPU, ou quando a placa recusa a carga |
+| GPU | llama.cpp pelo backend **Vulkan** — qualquer arquitetura que a `llama.dll` vendorizada registre | sempre que existe placa Vulkan registrada |
+| CPU | implementação própria em candle (`src-tauri/src/ai/granite.rs`), só granite | máquina sem GPU, ou quando a placa recusa a carga |
 
 Vulkan é a porta única para NVIDIA, AMD e Intel — não há SDK de fabricante no
 meio. Antes de carregar qualquer modelo, `src-tauri/src/ai/alojamento.rs` lê a VRAM livre
@@ -26,19 +26,28 @@ Os binários do llama.cpp e do sherpa-onnx não estão no repositório. Veja
 
 ## O que ele faz
 
-- **Catálogo de modelos** — 30 variantes Granite 4.2 GGUF e 2 quants do
-  Qwen3-Embedding 0.6B, com download retomável, cancelamento e estado medido em
-  disco. Um arquivo de apoio que chegou como ponteiro Git LFS é tratado como
-  ausente, não como instalado.
+- **Catálogo de modelos** — 35 variantes GGUF em duas famílias: Granite 4.2
+  (3B e 8B, Apache-2.0) e Ornith 1.5 9B (MIT, janela de 262 mil, o modelo de
+  programação), mais 2 quants do Qwen3-Embedding 0.6B. Cada tamanho é lido do
+  `tree/main` do HuggingFace, arquivo por arquivo, e cada família é conferida
+  contra a tabela de arquiteturas da `llama.dll` vendorizada. Download
+  retomável, cancelamento e estado medido em disco. Um arquivo de apoio que
+  chegou como ponteiro Git LFS é tratado como ausente, não como instalado.
 - **Roteador** — classifica o pedido e escolhe o modelo pela capacidade real da
   placa; a escolha é exibida com o motivo auditável e os sinais que a produziram.
   Um modelo fixado nas Escalas passa na frente do roteador.
 - **Laço de ferramentas** — o modelo chama ferramentas MCP e locais, o gate pede
   aprovação quando a ação muda algo, e o resultado volta ao modelo. As duas
-  gramáticas que aparecem na prática são lidas: o XML declarado pelo
-  `chat_template.jinja` do fabricante e o JSON em que modelos pequenos às vezes
-  caem. Uma chamada cortada no meio pelo teto de tokens roda com o que tem
-  inteiro; uma chamada com nome que não existe devolve a lista dos nomes reais.
+  gramáticas que aparecem na prática são lidas: o XML declarado pelo template
+  que o próprio GGUF publica — é ele que o modelo viu no treino, e o
+  `chat_template.jinja` do repositório de pesos pode ser outra versão — e o JSON
+  em que modelos pequenos às vezes
+  caem. Uma chamada cortada no meio pelo teto de tokens é retomada de onde o
+  modelo parou, tantas vezes quantas a janela permitir — o resto do corpo é ele
+  quem escreve, e o app não inventa linha;
+  se ainda assim faltar um argumento obrigatório, a ferramenta recusa e diz o
+  que faltou, em vez de criar um arquivo vazio com a cara de sucesso; uma
+  chamada com nome que não existe devolve a lista dos nomes reais.
 - **Conector local** — 12 ferramentas de arquivo, terminal, código, memória e
   sistema, dentro das pastas que a pessoa concedeu. Ele entra no mesmo cadastro,
   na mesma allowlist e no mesmo gate que um servidor MCP de terceiros.
@@ -119,10 +128,15 @@ sai da máquina.
 
 ## Limites conhecidos
 
-- O modelo de conversa padrão tem 3 bilhões de parâmetros. Ele às vezes traduz o
-  nome de uma ferramenta ao chamá-la, e o repositório não finge que isso é
-  confiabilidade: o erro devolve os nomes reais e o laço para quando o modelo
-  insiste, em vez de queimar a placa.
+- O modelo que o roteador escolhe para uma tarefa média tem 3 bilhões de
+  parâmetros. Ele às vezes traduz o nome de uma ferramenta ao chamá-la, e o
+  repositório não finge que isso é confiabilidade: o erro devolve os nomes reais
+  e o laço para quando o modelo insiste, em vez de queimar a placa. Para
+  programação existe o Ornith 1.5 9B no gerenciador de modelos — ele não vem
+  instalado, são 5,4 GiB de pesos, e o roteador só o escolhe depois de baixado.
+- O caminho de CPU executa só granite, porque é uma implementação própria em
+  candle. Numa máquina sem GPU, as outras famílias do catálogo não carregam, e o
+  aplicativo diz qual arquitetura pediu o quê em vez de falhar mudo.
 - Adaptadores LoRA/QLoRA por turno estão em construção; o que existe hoje é o
   catálogo GGUF, o roteador e a montagem de contexto.
 - Janela e teto de tokens são escalas do usuário. Quando o pedido não cabe nem
