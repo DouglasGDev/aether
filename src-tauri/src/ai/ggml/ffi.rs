@@ -179,7 +179,7 @@ pub struct Ggml {
     tem_decodificador: unsafe extern "C" fn(*const c_void) -> bool,
     ler_agrupamento: unsafe extern "C" fn(*const c_void) -> c_int,
     memoria: unsafe extern "C" fn(*const c_void) -> *mut c_void,
-    memoria_remover: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int) -> bool,
+    memoria_limpar: unsafe extern "C" fn(*mut c_void, bool),
     lote_de_um: unsafe extern "C" fn(*mut Token, c_int) -> Lote,
     decodificar: unsafe extern "C" fn(*mut c_void, Lote) -> c_int,
     codificar: unsafe extern "C" fn(*mut c_void, Lote) -> c_int,
@@ -285,7 +285,7 @@ impl Ggml {
                 tem_decodificador: simbolo(&llama, "llama_model_has_decoder")?,
                 ler_agrupamento: simbolo(&llama, "llama_pooling_type")?,
                 memoria: simbolo(&llama, "llama_get_memory")?,
-                memoria_remover: simbolo(&llama, "llama_memory_seq_rm")?,
+                memoria_limpar: simbolo(&llama, "llama_memory_clear")?,
                 lote_de_um: simbolo(&llama, "llama_batch_get_one")?,
                 decodificar: simbolo(&llama, "llama_decode")?,
                 codificar: simbolo(&llama, "llama_encode")?,
@@ -567,9 +567,15 @@ impl Ggml {
         if memoria.is_null() {
             return;
         }
-        // `seq < 0` casa com qualquer sequência e `p0`/`p1` negativos casam com
-        // a extensão inteira: é o pedido "apaga tudo".
-        unsafe { (self.memoria_remover)(memoria, -1, -1, -1) };
+        // `llama_memory_clear` é o pedido de "apaga tudo"; `seq_rm(-1, -1, -1)`
+        // parece o mesmo e não é: o `-1` de "qualquer sequência" do cabeçalho é
+        // rejeitado por esta build contra `n_seq_max = 1` — medido no log do app
+        // (`seq_rm: invalid seq_id (-1) - larger than n_seq_max (1)`), e como a
+        // função devolve `false` e ninguém olha, o cache do turno anterior
+        // continuava ocupado e o lote seguinte morria em "failed to find a
+        // memory slot". Os buffers em si não precisam de zeragem: o que decide
+        // o aproveitamento de uma célula é o metadado, que aqui volta a vazio.
+        unsafe { (self.memoria_limpar)(memoria, false) };
     }
 
     /// Carrega o GGUF de um adaptador **contra o modelo** que já está em

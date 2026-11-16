@@ -79,6 +79,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(path) = prompt.strip_prefix("kvc:") {
         return kv_consistency(&dir, &weights, context, path, max_tokens);
     }
+    // O esquecimento entre turnos: a mesma janela, dois turnos seguidos, sem
+    // recarregar nada. É a miniatura do segundo turno de uma conversa real.
+    if let Some(path) = prompt.strip_prefix("esquecer:") {
+        return dois_turnos(&dir, &weights, context, max_tokens, path);
+    }
     // O veredito de alojamento previsto, contra o delta de VRAM que a carga real
     // produz. `alojar:` traz as janelas separadas por vírgula.
     if let Some(list) = prompt.strip_prefix("alojar:") {
@@ -1201,4 +1206,97 @@ fn dump_dequantized(dir: &PathBuf, weights: &str, names: &str) -> anyhow::Result
         );
     }
     Ok(())
+}
+
+/// Dois turnos seguidos no mesmo contexto carregado, sem recarregar nada entre
+/// eles. É a miniatura do que a conversa faz: o primeiro turno preenche a janela
+/// (o texto do arquivo é repetido até não sobrar espaço para a resposta) e o
+/// segundo chega com um prompt maior que a sobra do primeiro.
+///
+/// O que está em jogo é o esquecimento do motor. Medido no aplicativo com o
+/// Ornith 1.5 9B e a `llama.dll` vendorizada, o segundo turno morria em
+/// `decode: failed to find a memory slot for batch of size 2048` porque o
+/// `llama_memory_seq_rm(mem, -1, -1, -1)` era recusado pela biblioteca e o cache
+/// do turno anterior continuava ocupado. A sonda sai com código 1 quando o
+/// segundo turno falha — é isso que faz dela um gate e não um relatório.
+fn dois_turnos(
+    dir: &PathBuf,
+    weights: &str,
+    context: usize,
+    max_tokens: usize,
+    path: &str,
+) -> anyhow::Result<()> {
+    let mut engine = Engine::load("ggml", dir, weights, context, &dlls())?;
+    let acelerador = engine.acelerador();
+    println!(
+        "carga: {} | backend={} dispositivo={:?} janela={}",
+        weights, acelerador.tipo, acelerador.dispositivo, engine.context()
+    );
+
+    let base = std::fs::read_to_string(path).context("falha ao ler o prompt")?;
+    let alvo = engine.context().saturating_sub(max_tokens + 64).max(64);
+    let mut cheio = String::new();
+    let mut blocos = 0usize;
+    while engine.count_tokens(&cheio)? < alvo {
+        cheio.push_str(base.trim_end());
+        cheio.push('\n');
+        blocos += 1;
+    }
+    println!(
+        "turno 1: {} blocos de {} bytes = {} tokens (alvo {}, janela {})",
+        blocos,
+        base.len(),
+        engine.count_tokens(&cheio)?,
+        alvo,
+        engine.context()
+    );
+
+    let params = SamplingParams { max_tokens, temperature: 0.0, ..SamplingParams::default() };
+    let stop = [concat!("<", "|im_start|>").to_string()];
+    let cancel = AtomicBool::new(false);
+
+    let mut turno = |n: usize, texto: &str| -> anyhow::Result<String> {
+        let ids: Vec<u32> = engine
+            .tokenizer()
+            .encode(texto, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .get_ids()
+            .to_vec();
+        let inicio = Instant::now();
+        let resposta = engine.generate(&ids, &params, &stop, &cancel, |_| {})?;
+        println!(
+            "turno {n}: {} tokens de prompt + {} gerados em {:.2}s ({:.1} t/s) | parada={:?} | resposta={:?}{}",
+            resposta.prompt_tokens,
+            resposta.generated_tokens,
+            inicio.elapsed().as_secs_f64(),
+            resposta.decode_tokens_per_second(),
+            resposta.stop,
+            resposta.text.chars().take(120).collect::<String>(),
+            if resposta.text.contains('\u{fffd}') { " | TEM CARACTERE DE SUBSTITUIÇÃO" } else { "" },
+        );
+        Ok(resposta.text)
+    };
+
+    turno(1, &cheio)?;
+    // O segundo turno traz texto próprio, maior que a sobra da janela: é a conta
+    // que só fecha porque o primeiro foi esquecido. Com uma pergunta de duas
+    // linhas isto passaria até sem esquecer nada, e a sonda não mediria nada.
+    let pergunta = format!(
+        "{}\nResponda com uma palavra: qual é a capital do Brasil?",
+        base.trim_end()
+    );
+    match turno(2, &pergunta) {
+        Ok(texto) if !texto.trim().is_empty() => {
+            println!("esquecer: OK — dois turnos na mesma janela carregada");
+            Ok(())
+        }
+        Ok(_) => {
+            eprintln!("esquecer: o segundo turno devolveu texto vazio");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("esquecer: O SEGUNDO TURNO FALHOU: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
