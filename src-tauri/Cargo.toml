@@ -1,0 +1,65 @@
+[package]
+name = "aether"
+version = "0.1.0"
+description = "Aether Core - local-first multi-agent system"
+edition = "2024"
+rust-version = "1.88"
+# `src/bin/engine_probe.rs` é uma ferramenta de medição à parte; sem isto
+# `cargo run` (e portanto `tauri dev`) não sabe qual dos dois executar.
+default-run = "aether"
+
+[lib]
+name = "aether_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rmcp = { version = "3.10", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+tokio = { version = "1.53.3", features = ["full"] }
+anyhow = "1.0.104"
+http = "1.5.0"
+candle = { package = "candle-core", version = "0.11.1" }
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
+tokenizers = "0.23"
+minijinja = { version = "3.1", features = ["serde", "preserve_order"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+reqwest = { version = "0.13", features = ["stream"] }
+futures-util = "0.3"
+encoding_rs = "0.8"
+cpal = "0.18.2"
+ringbuf = "0.6.0"
+libloading = "0.9.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+] }
+
+[[bin]]
+name = "aether"
+path = "src/main.rs"
+
+[[bin]]
+name = "engine-probe"
+path = "src/bin/engine_probe.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = true
+
+# `tauri dev` compila em debug, e debug alcança o motor de inferência: medido no
+# Granite 4.2 3B, o perfil de debug não emitia um único token em 10 minutos contra
+# 11,3 tokens/s do mesmo build otimizado. Dependências vão a opt-level 3; o crate
+# do app continua em debug, que é o que recompila rápido.
+[profile.dev.package."*"]
+opt-level = 3

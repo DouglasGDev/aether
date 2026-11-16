@@ -1,0 +1,3785 @@
+:root {
+  --bg: #05070c;
+  --glass: rgba(20, 26, 38, 0.72);
+  --glass-soft: rgba(28, 36, 51, 0.55);
+  --line: rgba(120, 145, 190, 0.16);
+  --line-strong: rgba(140, 170, 215, 0.3);
+  --text: #e8edf7;
+  --muted: #8e9ab4;
+  --accent: #5eead4;
+  --read: #5eead4;
+  --write: #fbbf24;
+  --danger: #fb7185;
+
+  color-scheme: dark;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--text);
+  background:
+    radial-gradient(900px 620px at 50% 8%, rgba(46, 92, 122, 0.28), transparent 70%),
+    radial-gradient(700px 520px at 12% 100%, rgba(58, 44, 110, 0.22), transparent 70%),
+    radial-gradient(700px 520px at 92% 90%, rgba(20, 84, 84, 0.2), transparent 70%),
+    var(--bg);
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: var(--text);
+  background: rgba(8, 12, 20, 0.75);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 11px;
+  outline: none;
+  width: 100%;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+textarea {
+  resize: vertical;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.stage {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  gap: 12px;
+  width: 100%;
+  max-width: 1080px;
+  height: 100%;
+  margin: 0 auto;
+  padding: 16px 22px 18px;
+}
+
+.stage-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #cfe0f2;
+}
+
+.brand-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 14px var(--accent);
+}
+
+.stage-core {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.stage-sheet {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px;
+}
+
+.stage-sheet::-webkit-scrollbar {
+  width: 8px;
+}
+
+.stage-sheet::-webkit-scrollbar-thumb {
+  background: rgba(130, 160, 205, 0.22);
+  border-radius: 8px;
+}
+
+.stage-sheet::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.core {
+  --core: #5eead4;
+  --rate: 1;
+  width: clamp(150px, 24vh, 230px);
+  aspect-ratio: 1;
+  filter: drop-shadow(0 0 26px color-mix(in srgb, var(--core) 26%, transparent));
+  transition: filter 400ms ease;
+}
+
+.core-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.core-halo,
+.core-ring,
+.core-heart,
+.core-pip {
+  transform-box: view-box;
+  transform-origin: 50% 50%;
+}
+
+.core-halo {
+  fill: color-mix(in srgb, var(--core) 7%, transparent);
+  stroke: color-mix(in srgb, var(--core) 16%, transparent);
+  stroke-width: 1;
+  transition: fill 400ms ease, stroke 400ms ease;
+}
+
+.core-ring {
+  fill: none;
+  stroke: var(--core);
+  stroke-linecap: round;
+  transition: stroke 400ms ease, opacity 400ms ease;
+}
+
+.ring-a {
+  stroke-width: 2;
+  stroke-dasharray: 120 26 60 26 180 90.655;
+  opacity: 0.75;
+  animation: core-spin calc(26s / var(--rate)) linear infinite;
+}
+
+.ring-b {
+  stroke-width: 3;
+  stroke-dasharray: 90 22 140 22 70 58.124;
+  opacity: 0.9;
+  animation: core-spin calc(17s / var(--rate)) linear infinite reverse;
+}
+
+.ring-c {
+  stroke-width: 2;
+  stroke-dasharray: 60 18 100 18 60 45.593;
+  opacity: 0.6;
+  animation: core-spin calc(11s / var(--rate)) linear infinite;
+}
+
+.core-heart {
+  fill: color-mix(in srgb, var(--core) 22%, transparent);
+  stroke: var(--core);
+  stroke-width: 1.5;
+  animation: core-breathe 5.5s ease-in-out infinite;
+}
+
+.core-pip {
+  fill: var(--core);
+}
+
+@keyframes core-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes core-breathe {
+  0%,
+  100% {
+    opacity: 0.7;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+
+@keyframes core-alarm {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.97);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.03);
+  }
+}
+
+.core-dormant {
+  --core: #4a5a76;
+  filter: none;
+}
+
+.core-dormant .core-ring {
+  animation-play-state: paused;
+  opacity: 0.3;
+}
+
+.core-dormant .core-heart {
+  animation: none;
+  opacity: 0.5;
+}
+
+.core-ready {
+  --core: #5eead4;
+  --rate: 1;
+}
+
+.core-listening {
+  --core: #7dd3fc;
+  --rate: 1.7;
+}
+
+.core-working {
+  --core: #a78bfa;
+  --rate: 5;
+}
+
+.core-awaiting {
+  --core: #fbbf24;
+  --rate: 1.3;
+}
+
+.core-awaiting .core-halo {
+  animation: core-alarm 1.5s ease-in-out infinite;
+}
+
+.core-awaiting .core-heart {
+  animation: core-breathe 1.5s ease-in-out infinite;
+}
+
+.core-fault {
+  --core: #fb7185;
+}
+
+.core-fault .core-ring {
+  animation-play-state: paused;
+}
+
+.core-fault .core-heart {
+  animation: none;
+}
+
+.trust {
+  position: relative;
+}
+
+.trust-current {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px 7px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  font-size: 13px;
+  font-weight: 600;
+  backdrop-filter: blur(12px);
+}
+
+.trust-plan {
+  color: #9fb2cd;
+}
+
+.trust-default {
+  color: var(--accent);
+}
+
+.trust-auto-accept {
+  color: #86efac;
+}
+
+.trust-auto {
+  color: var(--write);
+}
+
+.trust-full-access {
+  color: var(--danger);
+}
+
+.trust-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 170px;
+  padding: 6px;
+  border-radius: 14px;
+  border: 1px solid var(--line-strong);
+  background: rgba(12, 17, 27, 0.96);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(16px);
+}
+
+.trust-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+  color: var(--muted);
+}
+
+.trust-option:hover {
+  background: rgba(120, 150, 200, 0.12);
+  color: var(--text);
+}
+
+.trust-option.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+}
+
+/* Confiança dada precisa ser vista e retirada sem novo pedido: o gatilho conta
+   os servidores liberados e o menu fecha cada um em uma linha revogável. */
+.trust-badge {
+  display: grid;
+  place-items: center;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--read) 24%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.trust-sep {
+  margin: 4px 0 0;
+  padding: 8px 11px 5px;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6f7c96;
+}
+
+.trust-grant {
+  display: grid;
+  gap: 3px;
+  padding: 8px 11px 9px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+  color: var(--muted);
+}
+
+.trust-grant:hover {
+  background: rgba(248, 113, 113, 0.1);
+  color: var(--text);
+}
+
+/* Duas linhas: o nome do servidor precisa caber inteiro, senão a confiança
+   concedida fica ilegível justamente na hora de ser revista. */
+.trust-grant-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.trust-grant-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trust-grant-action {
+  justify-self: end;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.intent {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 8px 8px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.intent:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow:
+    0 14px 40px rgba(0, 0, 0, 0.45),
+    0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.intent-icon {
+  width: 20px;
+  height: 20px;
+  color: var(--accent);
+}
+
+.intent-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  padding: 10px 0;
+  font-size: 16px;
+  box-shadow: none;
+}
+
+.intent-input:focus {
+  border: 0;
+  box-shadow: none;
+}
+
+.intent-input::placeholder {
+  color: #6d7a94;
+}
+
+.intent-send {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border: 0;
+  border-radius: 50%;
+  background: linear-gradient(150deg, #5eead4, #38bdf8);
+  color: #04121a;
+}
+
+.intent-send .icon {
+  width: 19px;
+  height: 19px;
+}
+
+.intent-send.stop {
+  background: linear-gradient(150deg, #fb7185, #f43f5e);
+  color: #1a0508;
+}
+
+.stage-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* A lista de ferramentas é agrupada por servidor: quem decide o que chamar
+   precisa ver de onde vem cada capacidade, e o servidor de terceiros é o que
+   fala inglês. Uma coluna de grupos, cada um com a sua grade. */
+.capabilities {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cap-grupo {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cap-grupo-cabeca {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  padding: 4px 10px 4px 6px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.cap-grupo-cabeca:hover {
+  color: var(--text);
+  background: rgba(34, 44, 62, 0.55);
+}
+
+.cap-grupo-cabeca .icon {
+  width: 15px;
+  height: 15px;
+  transition: transform 140ms ease;
+}
+
+.cap-gira {
+  transform: rotate(-90deg);
+}
+
+.cap-grupo-nome {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.cap-grupo-total {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.cap-linha {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(236px, 1fr));
+  gap: 8px;
+}
+
+.capability {
+  --tone: var(--read);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  text-align: left;
+  backdrop-filter: blur(10px);
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+
+.capability:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--tone) 45%, transparent);
+  background: rgba(34, 44, 62, 0.7);
+}
+
+.capability-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 9px;
+  color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tone) 26%, transparent);
+}
+
+.capability-icon .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.capability-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  /* O nome de uma ferramenta de servidor é o que ele anunciou, e cortá-lo no
+     meio da palavra esconde o que o botão faz. Duas linhas chegam para todos. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.capability-risk {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 12%, transparent);
+  white-space: nowrap;
+}
+
+.sheet,
+.approval-card {
+  border-radius: 20px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  padding: 16px 18px;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.sheet-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-radius: 11px;
+  color: var(--tone, var(--accent));
+  background: color-mix(in srgb, var(--tone, var(--accent)) 14%, transparent);
+}
+
+.sheet-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.model-acelerador {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.model-acelerador.gpu {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.model-acelerador-nome {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  max-width: 22ch;
+}
+
+/* Onde os bytes ficaram. É estado, não explicação: a frase inteira cabe no
+   chip e o número medido fica no título. */
+.model-alojamento {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  max-width: 48ch;
+}
+
+/* Quem decide é o roteador enquanto ninguém fixa um modelo. O chip vira botão
+   no dia em que "Usar" fixa um: a mesma linha mostra o estado e a saída dele. */
+button.model-roteador {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+button.model-roteador:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text);
+}
+
+button.model-roteador.on {
+  border-style: dashed;
+}
+
+button.model-roteador .icon {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+}
+
+.sheet-close {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.sheet-close:hover {
+  background: rgba(120, 150, 200, 0.14);
+  color: var(--text);
+}
+
+.sheet-note {
+  margin: 0;
+  padding: 26px 4px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.sheet-fields {
+  display: grid;
+  gap: 14px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #b9c6dc;
+}
+
+.field-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.field-hint {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: #6f7c96;
+}
+
+.field.missing input,
+.field.missing select,
+.field.missing textarea {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.field.missing .field-dot {
+  background: var(--danger);
+}
+
+.toggle-row {
+  display: flex;
+}
+
+.toggle {
+  position: relative;
+  width: 52px;
+  height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(8, 12, 20, 0.8);
+  transition: background 160ms ease, border-color 160ms ease;
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #7c8aa4;
+  transition: transform 160ms ease, background 160ms ease;
+}
+
+.toggle.on {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.toggle.on .toggle-knob {
+  transform: translateX(24px);
+  background: var(--accent);
+}
+
+.sheet-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.sheet-actions button,
+.approval-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong);
+  background: rgba(30, 39, 56, 0.7);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.sheet-actions button:hover,
+.approval-actions button:hover {
+  background: rgba(44, 57, 80, 0.85);
+}
+
+button.primary {
+  border-color: transparent;
+  background: linear-gradient(150deg, #5eead4, #38bdf8);
+  color: #04121a;
+}
+
+button.primary:hover {
+  background: linear-gradient(150deg, #7df0dc, #55c8fb);
+}
+
+button.danger {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: #ffc2cb;
+}
+
+button.danger:hover {
+  background: color-mix(in srgb, var(--danger) 24%, transparent);
+}
+
+button.icon-only {
+  padding: 8px;
+  border-radius: 10px;
+}
+
+/* Ação dentro de uma lista, fora do rodapé do sheet: o mesmo peso das bordas
+   dos campos, para ler como parte da linha e não como um aviso solto. */
+button.ghost {
+  padding: 9px 16px;
+  border-radius: 11px;
+  border: 1px solid var(--line-strong);
+  background: rgba(30, 39, 56, 0.7);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+button.ghost:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: rgba(44, 57, 80, 0.85);
+  color: var(--text);
+}
+
+/* Dentro de uma linha de lista o botão não pode mandar na altura da linha. */
+button.small {
+  padding: 6px 12px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.approval-card {
+  --tone: var(--write);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas:
+    "ask ask"
+    "shield title"
+    "shield source"
+    "risk risk"
+    "args args"
+    "actions actions";
+  gap: 4px 14px;
+  border-color: color-mix(in srgb, var(--tone) 42%, transparent);
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.5),
+    0 0 44px color-mix(in srgb, var(--tone) 12%, transparent);
+}
+
+.approval-shield {
+  grid-area: shield;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 15px;
+  color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tone) 32%, transparent);
+}
+
+.approval-shield .icon {
+  width: 24px;
+  height: 24px;
+}
+
+.approval-title {
+  grid-area: title;
+  align-self: end;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.approval-source {
+  grid-area: source;
+  align-self: start;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.approval-risk {
+  grid-area: risk;
+  margin-top: 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--tone);
+}
+
+.approval-args {
+  grid-area: args;
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(6, 10, 17, 0.6);
+  border: 1px solid var(--line);
+}
+
+.approval-arg {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.approval-arg dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.approval-arg dd {
+  margin: 0;
+  font-size: 13px;
+  word-break: break-word;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.approval-actions {
+  grid-area: actions;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+/* Last so the risk tone beats the defaults on .capability and .approval-card. */
+.effect-read-only {
+  --tone: var(--read);
+}
+
+.effect-mutating {
+  --tone: var(--write);
+}
+
+.effect-destructive {
+  --tone: var(--danger);
+}
+
+.sheet.fault {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+.sheet.fault .sheet-icon {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.result-body {
+  display: grid;
+  gap: 12px;
+}
+
+.result-text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.result-image {
+  max-width: 100%;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+}
+
+.result-audio {
+  width: 100%;
+}
+
+.result-structured {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(6, 10, 17, 0.6);
+  border: 1px solid var(--line);
+}
+
+.result-structured > div {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.result-structured dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.result-structured dd {
+  margin: 0;
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.nodes {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.node {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  width: 84px;
+  padding: 8px 4px;
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+}
+
+.node:hover {
+  background: rgba(120, 150, 200, 0.1);
+}
+
+.node-orb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: rgba(16, 22, 34, 0.8);
+  color: #6f7d97;
+  transition: color 200ms ease, border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.node.online .node-orb {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+.node-dot {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #4b5768;
+  border: 2px solid #080c14;
+}
+
+.node.online .node-dot {
+  background: #4ade80;
+}
+
+.node-name {
+  font-size: 11px;
+  color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node.online .node-name {
+  color: #cfe0f2;
+}
+
+.node.add .node-orb {
+  border-style: dashed;
+}
+
+.fault-bar {
+  position: fixed;
+  top: 62px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: max-content;
+  max-width: min(680px, 92vw);
+  padding: 10px 10px 10px 14px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  background: rgba(38, 14, 22, 0.95);
+  color: #ffd7dd;
+  font-size: 13px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(14px);
+}
+
+.fault-bar > .icon {
+  color: var(--danger);
+}
+
+.fault-bar span {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.fault-bar .icon-only {
+  border: 0;
+  background: transparent;
+  color: #ffd7dd;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(3, 5, 10, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.modal-card {
+  width: min(560px, 100%);
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 18px 20px 20px;
+  border-radius: 20px;
+  border: 1px solid var(--line-strong);
+  background: rgba(12, 17, 27, 0.98);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.7);
+}
+
+.server-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.server-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(24, 32, 47, 0.6);
+}
+
+.server-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Separador de seção dentro de uma folha: diz o que vem abaixo, sem descrever
+   como usar, que é papel do README. */
+.sheet-sep {
+  margin: 20px 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6f7c96;
+}
+
+.sheet-hint {
+  margin: 0 0 12px;
+  font-size: 11.5px;
+  color: #6f7c96;
+}
+
+/* A linha do catálogo não cabe em uma fila: o usuário precisa ver o pacote
+   fixado, o que o servidor faz e o que já existe no disco antes de clicar. */
+.server-row.server-catalogo {
+  display: grid;
+  align-items: start;
+  gap: 7px;
+  padding: 12px 14px;
+}
+
+.server-pacote {
+  margin: 0;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: #6f7c96;
+  overflow-wrap: anywhere;
+}
+
+.server-descricao {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.server-marcas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.server-chip {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(120, 145, 190, 0.1);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.server-chip.ok {
+  border-color: color-mix(in srgb, var(--read) 38%, transparent);
+  background: color-mix(in srgb, var(--read) 20%, transparent);
+  color: var(--text);
+}
+
+.server-chip.aviso {
+  border-color: color-mix(in srgb, var(--write) 38%, transparent);
+  background: color-mix(in srgb, var(--write) 18%, transparent);
+  color: var(--text);
+}
+
+/* Enquanto o npm trabalha, a linha mostra a fase e o fim da fila de saída. O
+   rodapé de ações some nesse instante: não há o que clicar duas vezes. */
+.server-obra {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.server-obra-fase {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.server-log {
+  flex: 1 1 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(4, 7, 12, 0.75);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: #9fb0cc;
+  max-height: 92px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.server-acoes {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.server-acoes .icon-only {
+  margin-left: auto;
+}
+
+.server-falha {
+  margin: 0;
+  font-size: 12px;
+  color: #ffc2cb;
+  overflow-wrap: anywhere;
+}
+
+.connector-form {
+  display: grid;
+  gap: 12px;
+}
+
+.connector-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.connector-form .error {
+  margin: 0;
+  font-size: 12.5px;
+  color: #ffc2cb;
+}
+
+.connector-form .primary {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.talk {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+  padding: 4px 2px 10px;
+}
+
+.talk-user {
+  justify-self: end;
+  max-width: 78%;
+  padding: 10px 14px;
+  border-radius: 14px 14px 4px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--glass));
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.talk-agent {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  max-width: 92%;
+}
+
+.talk-model {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.talk-model .icon {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+}
+
+.talk-model-name {
+  font-weight: 600;
+  color: #cfe0f2;
+  letter-spacing: 0.02em;
+}
+
+.talk-model-why {
+  color: var(--muted);
+}
+
+.talk-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  animation: talk-pulse 1.6s ease-in-out infinite;
+}
+
+.talk-loading .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.talk-think {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(10, 14, 22, 0.5);
+  padding: 7px 11px;
+}
+
+.talk-think summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  list-style: none;
+}
+
+.talk-think summary::-webkit-details-marker {
+  display: none;
+}
+
+.talk-think summary .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.talk-think p {
+  margin: 8px 0 2px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #a8b4cc;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.talk-tool {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  font-size: 12.5px;
+}
+
+.talk-tool .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+}
+
+.talk-tool-name {
+  font-weight: 600;
+  color: #cfe0f2;
+  overflow-wrap: anywhere;
+}
+
+.talk-tool-state {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.talk-tool.running {
+  border-color: color-mix(in srgb, var(--write) 34%, transparent);
+}
+
+.talk-tool.running .icon {
+  color: var(--write);
+}
+
+.talk-tool.ok .talk-tool-state .icon {
+  color: var(--read);
+}
+
+.talk-tool.fail {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+.talk-tool.fail .talk-tool-state .icon {
+  color: var(--danger);
+}
+
+.talk-tool-out {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  max-height: 160px;
+  overflow: auto;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #9fabc4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.talk-text {
+  padding: 11px 15px;
+  border-radius: 14px 14px 14px 4px;
+  border: 1px solid var(--line);
+  background: var(--glass);
+  font-size: 14.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.talk-caret {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 3px;
+  vertical-align: -2px;
+  border-radius: 2px;
+  background: var(--accent);
+  animation: talk-blink 1s steps(2, start) infinite;
+}
+
+.talk-wait {
+  display: inline-flex;
+  gap: 5px;
+  padding: 12px 15px;
+  border-radius: 14px 14px 14px 4px;
+  border: 1px solid var(--line);
+  background: var(--glass);
+}
+
+.talk-wait span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.35;
+  animation: talk-pulse 1.2s ease-in-out infinite;
+}
+
+.talk-wait span:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.talk-wait span:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes talk-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes talk-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .core-ring,
+  .core-heart,
+  .core-halo {
+    animation: none;
+  }
+
+  .capability {
+    transition: none;
+  }
+
+  .talk-caret,
+  .talk-wait span,
+  .talk-loading {
+    animation: none;
+  }
+
+  .talk-caret {
+    opacity: 0.7;
+  }
+}
+
+.model-card {
+  width: min(720px, 100%);
+  display: flex;
+  flex-direction: column;
+}
+
+.model-card::-webkit-scrollbar {
+  width: 8px;
+}
+
+.model-card::-webkit-scrollbar-thumb {
+  background: rgba(130, 160, 205, 0.22);
+  border-radius: 8px;
+}
+
+.model-card::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.model-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.model-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: rgba(24, 32, 47, 0.6);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.model-tab .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.model-tab:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.model-tab.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.model-count {
+  min-width: 19px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.model-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px;
+  margin-bottom: 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(8, 12, 20, 0.75);
+  color: var(--muted);
+}
+
+.model-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.model-search .icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.model-search input {
+  border: 0;
+  background: transparent;
+  padding: 10px 0;
+}
+
+.model-search input:focus {
+  box-shadow: none;
+}
+
+.model-fault {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  border-radius: 11px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: #ffd7dd;
+  font-size: 12.5px;
+}
+
+.model-families {
+  display: grid;
+  gap: 12px;
+}
+
+.model-family {
+  padding: 13px 14px 12px;
+  border-radius: 15px;
+  border: 1px solid var(--line);
+  background: rgba(20, 27, 40, 0.62);
+}
+
+.model-family-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 11px;
+}
+
+.model-family-name {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.model-family-meta {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.model-variants {
+  display: grid;
+  gap: 6px;
+}
+
+.model-variant {
+  display: grid;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: rgba(10, 15, 24, 0.6);
+}
+
+.model-variant.loaded {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.model-variant-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.model-quant {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+}
+
+.model-auto {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--accent);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.model-size {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.model-state {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.model-size + .model-state {
+  margin-left: 0;
+}
+
+.model-state .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.model-state.ready {
+  color: var(--accent);
+}
+
+.model-state.partial {
+  color: var(--write);
+}
+
+.model-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.model-actions button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line-strong);
+  background: rgba(28, 36, 51, 0.7);
+  font-size: 12px;
+}
+
+.model-actions button .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.model-actions button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.model-actions button.primary {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.model-actions button.icon-only {
+  padding: 6px 8px;
+  margin-left: auto;
+}
+
+.model-job {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.model-job-phase {
+  flex: none;
+  max-width: 130px;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-bar {
+  flex: 1;
+  min-width: 60px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(120, 145, 190, 0.18);
+  overflow: hidden;
+}
+
+.model-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #7dd3fc);
+  transition: width 0.2s linear;
+}
+
+.model-job-read {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.model-job .icon-only {
+  flex: none;
+  padding: 4px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+}
+
+.model-job .icon-only .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.model-variant-fault {
+  margin: 0;
+  font-size: 11.5px;
+  color: #ffd7dd;
+}
+
+.model-more {
+  margin-top: 9px;
+  padding: 5px 10px;
+  border-radius: 9px;
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.model-more:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Cartões de resultado do ToolCard. O painel é interno — mora dentro do vidro
+   do .talk-tool e do .sheet — então desce um tom acima do fundo do app.
+   O --tone por tipo diz a natureza da ação; comando e sistema usam o padrão. */
+.card {
+  --tone: var(--accent);
+  position: relative;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+  font-size: 12.5px;
+}
+
+.card-arquivo,
+.card-lista,
+.card-busca {
+  --tone: var(--read);
+}
+
+.card-escrita,
+.card-edicao,
+.card-pasta,
+.card-movido {
+  --tone: var(--write);
+}
+
+.card-apagado {
+  --tone: var(--danger);
+}
+
+.card.fail {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+/* O ponto de estado no canto só aparece no cartão de comando: abre espaço ali. */
+.card-comando {
+  padding-right: 36px;
+}
+
+/* Dentro do .talk-tool o cartão é o segundo item de uma grade de 3 colunas. */
+.talk-tool > .card {
+  grid-column: 1 / -1;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 9px;
+  color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 14%, transparent);
+}
+
+.card-kind {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--tone) 30%, transparent);
+  background: color-mix(in srgb, var(--tone) 12%, transparent);
+  color: var(--tone);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Alvo pode ser um caminho inteiro: encurta, nunca quebra a linha do cabeçalho. */
+.card-name {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cfe0f2;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.card-facts {
+  min-width: 0;
+  flex: 0 1 auto;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-icon .icon,
+.card-row .icon,
+.card-move .icon,
+.card-flag .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.card-code,
+.card-out,
+.card-rows,
+.card-diffs {
+  max-height: 260px;
+  margin: 0;
+  overscroll-behavior: contain;
+}
+
+.card-code::-webkit-scrollbar,
+.card-out::-webkit-scrollbar,
+.card-rows::-webkit-scrollbar,
+.card-diffs::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.card-code::-webkit-scrollbar-thumb,
+.card-out::-webkit-scrollbar-thumb,
+.card-rows::-webkit-scrollbar-thumb,
+.card-diffs::-webkit-scrollbar-thumb {
+  background: rgba(130, 160, 205, 0.22);
+  border-radius: 8px;
+}
+
+.card-code::-webkit-scrollbar-track,
+.card-out::-webkit-scrollbar-track,
+.card-rows::-webkit-scrollbar-track,
+.card-diffs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.card-code,
+.card-out {
+  padding: 9px 11px;
+  overflow: auto;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: rgba(4, 8, 14, 0.72);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #a8b4cc;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+}
+
+.card-code {
+  position: relative;
+}
+
+.card-out {
+  color: #9fabc4;
+}
+
+.card-out.error {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: #ffd7dd;
+}
+
+/* Etiqueta do idioma do código: a faixa do topo é reservada para ela. */
+.card-code[data-linguagem]:not([data-linguagem=""]) {
+  padding-top: 26px;
+}
+
+.card-code[data-linguagem]:not([data-linguagem=""])::after {
+  content: attr(data-linguagem);
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(12, 17, 27, 0.95);
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* Rótulo curto de seção dentro do cartão: prévia, saída, saída de erro. */
+.card-section {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.card-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.card-rows,
+.card-diffs {
+  display: grid;
+  gap: 4px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.card-diffs {
+  gap: 6px;
+}
+
+.card-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 6px;
+  border-radius: 8px;
+  transition: background 140ms ease;
+}
+
+.card-row:hover {
+  background: rgba(120, 150, 200, 0.1);
+}
+
+.card-row .icon {
+  color: var(--muted);
+}
+
+.row-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cfe0f2;
+}
+
+.row-size {
+  flex: none;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.row-date {
+  flex: none;
+  color: #6f7c96;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.row-label {
+  min-width: 0;
+  flex: 1;
+  color: var(--muted);
+}
+
+.row-value {
+  flex: none;
+  color: #cfe0f2;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-hit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  align-items: baseline;
+  padding: 5px 9px;
+  border-radius: 9px;
+  border-left: 2px solid color-mix(in srgb, var(--tone) 45%, transparent);
+  background: rgba(10, 15, 24, 0.6);
+}
+
+.hit-file {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: #cfe0f2;
+}
+
+.hit-line {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hit-text {
+  grid-column: 1 / -1;
+  color: #a8b4cc;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.card-diff {
+  display: grid;
+  gap: 3px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(10, 15, 24, 0.6);
+}
+
+.diff-line {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+
+.diff-before,
+.diff-after {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 2px 7px;
+  border-radius: 7px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diff-before {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+}
+
+.diff-after {
+  color: var(--read);
+  background: color-mix(in srgb, var(--read) 11%, transparent);
+}
+
+.diff-tag {
+  flex: none;
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.card-move {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.card-move .icon {
+  color: var(--tone);
+}
+
+.move-from,
+.move-to {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.move-from {
+  color: var(--muted);
+}
+
+.move-to {
+  color: #cfe0f2;
+}
+
+.card-at {
+  margin: 0;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.card-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  justify-self: start;
+  margin: 0;
+  padding: 4px 9px;
+  border-radius: 9px;
+  border: 1px solid var(--line-strong);
+  background: rgba(24, 32, 47, 0.6);
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.card-flag.warn {
+  border-color: color-mix(in srgb, var(--write) 45%, transparent);
+  background: color-mix(in srgb, var(--write) 12%, transparent);
+  color: var(--write);
+}
+
+.card-state {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 21px;
+  height: 21px;
+  border-radius: 50%;
+}
+
+.card-state .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.card-state.ok {
+  color: var(--read);
+  background: color-mix(in srgb, var(--read) 16%, transparent);
+}
+
+.card-state.bad {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+/* Dialogo de pastas concedidas. */
+.folder-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 7px 7px 7px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(24, 32, 47, 0.6);
+}
+
+.folder-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 9px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.folder-icon .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.folder-name {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: #cfe0f2;
+}
+
+/* O caminho encolhe primeiro: é o que sobra quando a linha fica apertada. */
+.folder-path {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.folder-row .icon-only {
+  flex: none;
+  padding: 5px 6px;
+  border-radius: 9px;
+}
+
+.folder-row .icon-only .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.folder-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 14px;
+}
+
+.folder-form .primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sheet-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border-radius: 11px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: #ffd7dd;
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.sheet-error .icon {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  color: var(--danger);
+}
+
+/* Dialogo de idioma: uma linha por arquivo de locales/. */
+.locale-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.locale-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(24, 32, 47, 0.6);
+  text-align: left;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.locale-row:hover {
+  border-color: var(--line-strong);
+  background: rgba(34, 44, 62, 0.7);
+}
+
+.locale-row.on {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.locale-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.locale-tag {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(120, 150, 200, 0.12);
+  color: var(--muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.locale-check {
+  display: grid;
+  place-items: center;
+  width: 21px;
+  height: 21px;
+  flex: none;
+  border-radius: 50%;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.locale-check .icon {
+  width: 13px;
+  height: 13px;
+}
+
+/* O que a ferramenta é, antes do que ela faz: o título do pedido de aprovação. */
+.approval-ask {
+  grid-area: ask;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #6f7c96;
+}
+
+/* O rótulo dentro do bloco de argumentos, que já é uma grade de uma coluna. */
+.approval-data {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6f7c96;
+}
+
+.talk-tools {
+  width: 100%;
+  display: grid;
+  gap: 6px;
+}
+
+.talk-tools-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6f7c96;
+}
+
+.talk-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.talk-tool-head .talk-tool-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.talk-tool-head .talk-tool-state {
+  flex: none;
+}
+
+/* As evidências da rota: o chip do modelo vira ficha quando precisa de uma
+   segunda linha, senão continuaria uma pílula de um fôlego só. */
+.talk-model:has(.talk-signals) {
+  border-radius: 14px;
+  padding: 7px 11px 8px;
+}
+
+.talk-signals {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin: 0;
+  padding: 7px 0 0;
+  border-top: 1px solid var(--line);
+  list-style: none;
+}
+
+.talk-signals li {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+  font-size: 10.5px;
+  color: #93a2bd;
+  white-space: nowrap;
+}
+/* ─── Grafo neural ──────────────────────────────────────────────────────────
+   O mundo é maior que a janela de propósito: ele rola. As posições são pixels
+   desse mundo, e é por isso que o SVG não tem viewBox — um fio e a porta de
+   onde ele sai precisam cair no mesmo ponto sem nenhuma conta de escala. */
+.grafo {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  min-height: 0;
+}
+
+.grafo-topo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.grafo-acoes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.grafo-minus {
+  width: 12px;
+  height: 2px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+/* A lente tem o tamanho do mundo já ampliado; o quadro é a janela que rola. */
+.grafo-quadro {
+  flex: 1;
+  min-height: 220px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(620px 340px at 50% 50%, rgba(46, 92, 122, 0.16), transparent 70%),
+    rgba(6, 10, 17, 0.6);
+  touch-action: none;
+  cursor: crosshair;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.grafo-quadro:has(.lig-cabeca:active) {
+  cursor: grabbing;
+}
+
+/* A lente tem exatamente o tamanho do mundo já ampliado, e é ela que corta o
+   que sobra do mundo quando o zoom é menor que 1 — sem isso a barra de rolagem
+   do quadro mostraria um mundo maior que o desenhado. */
+.grafo .grafo-lente {
+  position: relative;
+  overflow: hidden;
+}
+
+.grafo .grafo-mundo {
+  position: absolute;
+  left: 0;
+  top: 0;
+  background-image:
+    linear-gradient(rgba(120, 145, 190, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(120, 145, 190, 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+.lig-conta {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.lig-wires {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+/* O fio parado é uma trilha, não um cabo de luz: com vinte sinapses desenhadas,
+   o que manda é a que disparou. Opacidade e espessura só sobem sob o cursor ou
+   no pulso do turno. */
+.lig-fio {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-opacity: 0.45;
+  stroke-linecap: round;
+  transition: stroke-opacity 0.16s ease, stroke-width 0.16s ease;
+}
+
+.lig-fio--le {
+  stroke: var(--read);
+  --brilho: var(--read);
+}
+.lig-fio--altera {
+  stroke: var(--write);
+  --brilho: var(--write);
+}
+.lig-fio--apaga {
+  stroke: var(--danger);
+  --brilho: var(--danger);
+}
+.lig-fio--pasta {
+  stroke: color-mix(in srgb, var(--accent) 60%, var(--muted));
+  --brilho: var(--accent);
+}
+
+/* A borda de acerto do fio: um traço largo e invisível por cima do visível,
+   para cortar a ligação sem precisar acertar dois pixels. */
+.lig-fio-area {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+/* Passar o cursor por cima é o único jeito de seguir um fio entre vinte traços
+   finos: ele acende sem precisar de mira. */
+.lig-fio-area:hover + .lig-fio {
+  stroke-opacity: 1;
+  stroke-width: 2.4;
+}
+
+/* O pulso não é enfeite: ele liga quando o núcleo chamou aquela ferramenta, e
+   o fio é a mesma identidade — `conector__ferramenta` — que o evento traz. */
+.lig-fio.disparando,
+.lig-fio.disparada,
+.lig-fio.falhou {
+  stroke-opacity: 1;
+}
+
+.lig-fio.disparando {
+  stroke-width: 2.6;
+  stroke-dasharray: 10 14;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--brilho) 45%, transparent));
+  animation: lig-fluxo 0.7s linear infinite;
+}
+
+.lig-fio.disparada {
+  stroke-width: 3;
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--brilho) 60%, transparent));
+}
+
+.lig-fio.falhou {
+  stroke: var(--danger);
+  stroke-width: 3;
+  stroke-dasharray: 4 8;
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--danger) 70%, transparent));
+}
+
+@keyframes lig-fluxo {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+/* O fio que ainda está na mão: nasce da porta tocada e morre no cursor. */
+.lig-fio--novo {
+  stroke: var(--accent);
+  stroke-width: 2.2;
+  stroke-opacity: 1;
+  stroke-dasharray: 6 7;
+  opacity: 0.9;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 45%, transparent));
+}
+
+.lig-no--aether.alvo {
+  border-color: var(--accent);
+  box-shadow: 0 0 42px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.lig-no--aether.alvo .lig-aether-nome {
+  color: var(--accent);
+}
+
+.lig-no {
+  position: absolute;
+  border-radius: 14px;
+  border: var(--lig-borda) solid var(--line-strong);
+  background: rgba(12, 17, 27, 0.96);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+}
+
+.lig-no--on {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--line-strong));
+}
+
+/* Na prateleira de baixo não há fio nenhum: o cartão espera, e por isso ele
+   recua de brilho. Ligado, o mesmo cartão ganha a borda e as sinapses. */
+.lig-no--ocio {
+  border-color: var(--line);
+  background: rgba(9, 13, 21, 0.82);
+  box-shadow: none;
+}
+
+.lig-cabeca {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.lig-cabeca:active {
+  cursor: grabbing;
+}
+
+.lig-no-nome {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #dbe6f5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lig-no-estado {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: #4b5768;
+}
+
+.lig-no-estado.on {
+  background: #4ade80;
+  box-shadow: 0 0 10px color-mix(in srgb, #4ade80 55%, transparent);
+}
+
+.lig-no-toggle {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.lig-no-toggle:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.lig-no-toggle .icon {
+  width: 15px;
+  height: 15px;
+}
+
+/* O número do cartão responde "quantas sinapses este servidor tem?" sem abrir
+   nada — e é tabular porque dois dígitos não podem empurrar o nome. */
+.lig-no-conta {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  background: rgba(94, 234, 212, 0.08);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A fileira de dobra: o que o servidor anuncia e o núcleo não cobra fica
+   escondida atrás dela, em vez de espalhada pelo grafo inteiro. */
+.lig-dobra {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  margin: 0;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 0 0 13px 13px;
+  background: rgba(120, 150, 200, 0.07);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.lig-dobra:hover {
+  background: rgba(120, 150, 200, 0.14);
+  color: var(--text);
+}
+
+.lig-portas {
+  display: grid;
+  padding: var(--lig-portas-topo) 0 var(--lig-portas-rodape);
+}
+
+.lig-advertencia {
+  margin: 0;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+/* Desconectado, o nó ainda não tem portas: o cartão inteiro vira o botão de
+   conectar, porque é esta a única coisa que se pode fazer com ele aqui. */
+.lig-conectar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 0 0 13px 13px;
+  background: rgba(94, 234, 212, 0.08);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lig-conectar:hover {
+  background: rgba(94, 234, 212, 0.16);
+}
+
+/* A porta é o único jeito de ligar e desligar uma ferramenta daqui. O ponto na
+   borda é onde o fio encosta; o resto da linha é alvo. */
+.lig-porta {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: var(--lig-porta);
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+}
+
+.lig-porta--saida { padding: 0 18px 0 12px; }
+.lig-porta--entrada { padding: 0 12px 0 18px; }
+
+.lig-porta:hover {
+  background: rgba(120, 150, 200, 0.09);
+  color: var(--text);
+}
+
+.lig-porta-nome {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* O ponto é um botão: é nele que o dedo pousa para puxar um fio, e é nele que
+   a tecla Enter liga ou desliga a ferramenta. O acerto real é maior que o
+   desenho, por isso o ::before de 26px. */
+.lig-ponto {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-strong);
+  background: rgba(8, 12, 20, 0.9);
+  cursor: grab;
+  touch-action: none;
+}
+
+.lig-ponto::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
+  border-radius: 50%;
+}
+
+.lig-ponto:hover {
+  border-color: var(--accent);
+}
+
+.lig-ponto:active {
+  cursor: grabbing;
+}
+
+.lig-ponto:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.lig-ponto.pulso {
+  animation: lig-pulsar 0.7s ease-in-out infinite;
+}
+
+@keyframes lig-pulsar {
+  50% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+}
+
+.lig-porta--saida .lig-ponto { right: -6px; }
+.lig-porta--entrada .lig-ponto { left: -6px; }
+
+.lig-porta--le.on .lig-ponto { border-color: var(--read); background: var(--read); }
+.lig-porta--altera.on .lig-ponto { border-color: var(--write); background: var(--write); }
+.lig-porta--apaga.on .lig-ponto { border-color: var(--danger); background: var(--danger); }
+
+.lig-porta.on .lig-porta-nome {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.lig-no--aether {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background:
+    radial-gradient(120px 70px at 50% 45%, rgba(94, 234, 212, 0.18), transparent 70%),
+    rgba(12, 17, 27, 0.98);
+  box-shadow: 0 0 34px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.lig-aether-nome {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.lig-no--pasta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 14px;
+  border-style: dashed;
+}
+
+/* A pasta despeja no Aether pela borda de baixo do cartão: é onde o desenho da
+   porta e a conta do fio têm que cair no mesmo pixel. */
+.lig-no--pasta .lig-ponto {
+  left: 50%;
+  right: auto;
+  top: auto;
+  bottom: -5px;
+  margin: 0 0 0 -6px;
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--muted));
+  background: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.lig-pasta-nome {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: #cfe0f2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lig-cortar {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.lig-cortar:hover {
+  color: var(--danger);
+}
+
+.lig-cortar .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.voz-pulso {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.voz-pulso button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.voz-pulso .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.voz-vozes {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 6px;
+  max-height: 274px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.voz-voz {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 4px;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: rgba(10, 15, 24, 0.6);
+}
+
+.voz-escolha {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+}
+
+.voz-escolha:hover {
+  background: rgba(120, 150, 200, 0.12);
+}
+
+.voz-escolha.on {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.voz-escolha.on .voz-nome {
+  color: var(--accent);
+}
+
+.voz-nome {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voz-genero {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.voz-voz .icon-only {
+  flex: none;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.voz-voz .icon-only:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--accent);
+}
+
+.voz-voz .icon-only .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.voz-valor {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.voz-dado {
+  font-size: 12.5px;
+  color: #b9c6dc;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voz-ligada {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  animation: talk-pulse 1.6s ease-in-out infinite;
+}
+
+.voz-nivel,
+.intent-nivel {
+  display: block;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(120, 145, 190, 0.18);
+  overflow: hidden;
+}
+
+.intent-nivel {
+  flex: none;
+  width: 96px;
+}
+
+.voz-nivel-fill,
+.intent-nivel-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #7dd3fc);
+  transition: width 100ms linear;
+}
+
+.intent-mic {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: rgba(30, 39, 56, 0.7);
+  color: var(--muted);
+}
+
+.intent-mic:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--accent);
+}
+
+.intent-mic .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.intent-escuta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.intent.ouvindo {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow:
+    0 14px 40px rgba(0, 0, 0, 0.45),
+    0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.intent.ouvindo .intent-icon {
+  animation: talk-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voz-ligada,
+  .lig-ponto.pulso,
+  .lig-fio.disparando,
+  .intent.ouvindo .intent-icon {
+    animation: none;
+  }
+
+  .lig-fio.disparando {
+    stroke-dasharray: none;
+  }
+
+  .voz-nivel-fill,
+  .intent-nivel-fill {
+    transition: none;
+  }
+}
+
+/* ─── Palco: orbe ou grafo ──────────────────────────────────────────────────
+   O grafo é o centro do palco, não uma folha por cima da conversa: a conversa
+   continua embaixo, e é por isso que a linha do núcleo troca de tamanho. */
+button.ligado {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* No palco do grafo a moldura manda: é ela que mostra onde cada fio entra, e
+   uma folha de conversa de meia tela ao lado de um desenho cortado é só ruído.
+   A faixa de conectores some daqui — os cartões do mundo já são ela. */
+.stage--grafo {
+  grid-template-rows: auto minmax(0, 1fr) minmax(96px, 22vh) auto;
+}
+
+.stage--grafo .stage-core {
+  align-items: stretch;
+  min-height: 0;
+}
+
+/* ─── Painel das escalas de geração ───────────────────────────────────────
+   O mesmo contrato do cartão de conversa: um valor por linha, o número do
+   lado do rótulo, e o que o motor aceitou é o que aparece. */
+.geracao {
+  display: grid;
+  gap: 14px;
+}
+
+.geracao-marca {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.geracao-chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.geracao-valor {
+  margin-left: auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.geracao-semente {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.geracao-semente input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 11px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Medida do turno ─────────────────────────────────────────────────────
+   Números que saíram do motor, não estimativas: tokens, ritmo e o motivo pelo
+   qual a geração parou. */
+.talk-medidas {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.talk-medidas > span {
+  white-space: nowrap;
+}
+
+.talk-medidas .aviso {
+  color: var(--write);
+}
+
+/* ─── Barra de proximidade do cartão de memória ───────────────────────────
+   O cosseno que classificou o trecho, desenhado como o número que ele é: um
+   valor medido entre 0 e 1, não uma nota escrita depois. */
+.hit-meta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.hit-score {
+  display: block;
+  width: 54px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(120, 145, 190, 0.18);
+  overflow: hidden;
+}
+
+.hit-score-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--read);
+}
+
+/* De onde o trecho veio. Na fusão é isto que diz se o achado foi o vetor, a
+   palavra escrita, ou os dois concordando. */
+.hit-origem {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.hit-origem.ambas {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+}
+
+/* ─── Folha de memória (RAG) ──────────────────────────────────────────────
+   Uma folha só: o codificador, as escalas que o núcleo aprova, a varredura e
+   o teste que procura exatamente como o turno procura. */
+.memoria {
+  display: grid;
+  gap: 14px;
+}
+
+.memoria-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.memoria-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.memoria-chip .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.memoria-chip.gpu {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  color: #cfe0f2;
+}
+
+/* O que o arquivo declara e a biblioteca não aplica: aparece, mas não se faz
+   de capacidade. */
+.memoria-chip.aviso {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  color: color-mix(in srgb, var(--danger) 78%, #e8eef7);
+}
+
+.memoria-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--write) 45%, transparent);
+  color: var(--write);
+}
+
+.memoria-auto.ligada {
+  border-color: color-mix(in srgb, var(--read) 45%, transparent);
+  color: var(--read);
+}
+
+.memoria-auto .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.memoria-bloco {
+  display: grid;
+  gap: 8px;
+}
+
+/* O seletor do modo é o interruptor da busca inteira: vetorial acha o parecido,
+   léxico acha o identificador escrito, híbrida confere as duas listas. */
+.memoria-modos {
+  display: flex;
+  gap: 6px;
+}
+
+.memoria-modos .model-tab {
+  flex: 1;
+  justify-content: center;
+}
+
+.memoria-varredura {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.memoria-teste {
+  display: grid;
+  gap: 8px;
+}
+
+.memoria-teste-linha {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memoria-teste-linha input {
+  flex: 1;
+  min-width: 0;
+}
+
+.memoria-achados {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+/* ─── Painel do ajuste fino ───────────────────────────────────────────────
+   Uma linha por adaptador: o que o arquivo é, o que o dono escolheu e o que a
+   placa respondeu. As três colunas existem porque as três coisas são diferentes,
+   e somá-las numa só palavra escondiria a escolha que não virou peso. */
+.adaptadores {
+  display: grid;
+  gap: 14px;
+}
+
+.adaptadores-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.adaptadores-lista {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.adaptador {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(24, 32, 47, 0.6);
+}
+
+/* A borda é a resposta do motor, não a escolha da tela: acende só com o delta
+   sobre os pesos do modelo em memória. */
+.adaptador.aplicada {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.adaptador .toggle {
+  flex: none;
+}
+
+.adaptador-corpo {
+  display: grid;
+  gap: 4px;
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.adaptador-nome {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: #cfe0f2;
+}
+
+.adaptador-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.adaptador-chips .memoria-chip {
+  padding: 2px 8px;
+  font-size: 10.5px;
+}
+
+.adaptador-forca {
+  display: grid;
+  gap: 4px;
+  flex: 0 1 190px;
+  min-width: 150px;
+}
+
+.adaptador-estado {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 11.5px;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.adaptador-estado.ligada {
+  color: var(--accent);
+}
+
+.adaptador-estado .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.adaptador .icon-only {
+  flex: none;
+  padding: 5px 6px;
+  border-radius: 9px;
+}
+
+.adaptador .icon-only .icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* O motivo sai por linha: um adaptador que não abriu não esconde os outros, e
+   o texto é o que a biblioteca disse, não uma frase nossa. */
+.adaptador-motivo {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--danger);
+}

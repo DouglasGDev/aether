@@ -1,0 +1,687 @@
+use super::approval::{ApprovalBroker, ApprovalOutcome, ApprovalRequest, wait_for_decision};
+use super::catalog::{CatalogBudget, CatalogEntry, render};
+use super::tool::ToolInfo;
+use crate::connectors::{ConnectorKind, DesktopOs, McpEntry, Registry, ToolMeta, parse_qualified_name};
+use crate::idiomas::tr;
+use crate::local::{self, pastas::Pastas};
+use crate::permissions::{Decision, PendingApproval, PermissionGate, ToolEffect};
+use anyhow::{Context, Result, anyhow, bail};
+use http::{HeaderName, HeaderValue};
+use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+use rmcp::service::{RoleClient, RunningService, ServiceError};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
+use tokio::process::Command;
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+type Client = RunningService<RoleClient, ()>;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum McpEvent {
+    ToolsDiscovered {
+        connector_id: String,
+        tools: Vec<ToolInfo>,
+    },
+    ApprovalRequested {
+        request: ApprovalRequest,
+    },
+    ApprovalSettled {
+        id: String,
+        approved: bool,
+    },
+    Disconnected {
+        connector_id: String,
+    },
+}
+
+enum ConnectionCommand {
+    Call {
+        params: CallToolRequestParams,
+        reply: oneshot::Sender<Result<CallToolResult, ServiceError>>,
+    },
+    Shutdown,
+}
+
+/// Um servidor MCP é um processo separado, com um canal de comandos. O conector
+/// embutido é o próprio aplicativo: não há canal, e a chamada roda aqui dentro.
+/// Os dois passam pelo mesmo gate e pela mesma fila de aprovação.
+#[derive(Clone)]
+enum Canal {
+    Remoto(mpsc::Sender<ConnectionCommand>),
+    Local,
+}
+
+struct Connection {
+    canal: Canal,
+    /// Tudo que o servidor anunciou, sem filtro. O que o modelo pode usar é o
+    /// que `tools` devolve, já passado pela allowlist do cadastro: assim, ligar
+    /// ou desligar uma ferramenta no grafo vale na chamada seguinte, sem
+    /// precisar derrubar e levantar o processo do servidor.
+    anunciadas: Vec<ToolInfo>,
+}
+
+pub struct McpManager {
+    registry: RwLock<Registry>,
+    gate: Arc<Mutex<PermissionGate>>,
+    approvals: Arc<ApprovalBroker>,
+    connections: RwLock<HashMap<String, Connection>>,
+    events: broadcast::Sender<McpEvent>,
+    next_id: AtomicU64,
+    pastas: Arc<RwLock<Pastas>>,
+    /// A memória do assistente. Compartilhada com o estado pelo mesmo motivo das
+    /// pastas: `buscar_memoria` é uma ferramenta local, e uma ferramenta local
+    /// executa numa tarefa bloqueante que não pode prender o runtime.
+    memoria: Arc<crate::ai::memoria::Custodio>,
+}
+
+/// As ferramentas que o próprio aplicativo sabe executar, na ordem do catálogo.
+/// Sem filtro aqui: a allowlist é aplicada na leitura, por `permitidas`.
+fn ferramentas_locais() -> Vec<ToolInfo> {
+    local::catalogo()
+        .iter()
+        .map(|f| ToolInfo::local(local::CONECTOR, f))
+        .collect()
+}
+
+/// O recorte da allowlist. Uma ferramenta que o servidor anunciou e o usuário
+/// desligou no grafo some daqui: não aparece para o modelo nem passa na chamada.
+fn permitidas(registry: &Registry, connector_id: &str, anunciadas: &[ToolInfo]) -> Vec<ToolInfo> {
+    match registry.get(connector_id) {
+        Some(connector) => anunciadas
+            .iter()
+            .filter(|tool| connector.allows_tool(&tool.name))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+impl McpManager {
+    pub fn new(
+        registry: Registry,
+        gate: Arc<Mutex<PermissionGate>>,
+        pastas: Arc<RwLock<Pastas>>,
+        memoria: Arc<crate::ai::memoria::Custodio>,
+    ) -> Self {
+        let (events, _) = broadcast::channel(256);
+        Self {
+            registry: RwLock::new(registry),
+            gate,
+            approvals: Arc::new(ApprovalBroker::new()),
+            connections: RwLock::new(HashMap::new()),
+            events,
+            next_id: AtomicU64::new(1),
+            pastas,
+            memoria,
+        }
+    }
+
+    /// Trocar o idioma muda o nome e a descrição que o modelo lê. Sem isto a
+    /// conversa continuaria recebendo as ferramentas no idioma anterior.
+    pub fn recarregar_embutido(&self) {
+        let anunciadas = ferramentas_locais();
+        let tools = {
+            let registry = self.registry.read().expect("registry lock poisoned");
+            if registry.get(local::CONECTOR).is_none() {
+                return;
+            }
+            permitidas(&registry, local::CONECTOR, &anunciadas)
+        };
+        {
+            let mut connections = self.connections.write().expect("connections lock poisoned");
+            let Some(connection) = connections.get_mut(local::CONECTOR) else { return };
+            connection.anunciadas = anunciadas;
+        }
+        let _ = self.events.send(McpEvent::ToolsDiscovered {
+            connector_id: local::CONECTOR.to_string(),
+            tools,
+        });
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<McpEvent> {
+        self.events.subscribe()
+    }
+
+    pub fn approvals(&self) -> Arc<ApprovalBroker> {
+        Arc::clone(&self.approvals)
+    }
+
+    pub fn registry_snapshot(&self) -> Registry {
+        self.registry
+            .read()
+            .expect("registry lock poisoned")
+            .clone()
+    }
+
+    // Registering a server from the UI must not tear down live connections, so
+    // the allowlist is swapped in place rather than rebuilding the manager.
+    pub fn replace_registry(&self, registry: Registry) {
+        *self.registry.write().expect("registry lock poisoned") = registry;
+    }
+
+    pub fn connected_ids(&self) -> Vec<String> {
+        self.connections
+            .read()
+            .expect("connections lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn pastas_concedidas(&self) -> Vec<String> {
+        self.pastas
+            .read()
+            .expect("pastas envenenadas")
+            .raizes
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect()
+    }
+
+    /// O processo filho já nasceu com a lista de pastas na linha de comando,
+    /// então mudar a concessão obriga a relançar quem depende dela. Chamado
+    /// depois de conceder ou revogar uma pasta.
+    ///
+    /// Devolve (servidor, motivo) para cada um que não voltou a subir: revogar a
+    /// última pasta, por exemplo, deixa o servidor de arquivos desconectado, e
+    /// isso é um fato que a interface precisa poder mostrar.
+    pub async fn recarregar_pastas(&self) -> Vec<(String, String)> {
+        let alvos: Vec<String> = self
+            .connections
+            .read()
+            .expect("connections lock poisoned")
+            .keys()
+            .filter(|id| {
+                super::instalador::pronto(id)
+                    .is_some_and(|p| p.escopo == super::instalador::Escopo::PastasConcedidas)
+            })
+            .cloned()
+            .collect();
+        let mut falhas = Vec::new();
+        for id in alvos {
+            // Desconectamos sempre: o processo velho tem as pastas antigas.
+            if let Err(e) = self.disconnect(&id).await {
+                falhas.push((id, format!("{e:#}")));
+                continue;
+            }
+            if let Err(e) = self.connect(&id).await {
+                falhas.push((id, format!("{e:#}")));
+            }
+        }
+        falhas
+    }
+
+    pub fn tools(&self, connector_id: &str) -> Vec<ToolInfo> {
+        let anunciadas = self.anunciadas(connector_id);
+        let registry = self.registry.read().expect("registry lock poisoned");
+        permitidas(&registry, connector_id, &anunciadas)
+    }
+
+    /// Se uma ferramenta está ligada de fato: anunciada pelo servidor e dentro da
+    /// allowlist do cadastro. É isto que decide se a memória entra no prompt — o
+    /// núcleo não tem uma segunda regra para ela.
+    pub fn ferramenta_ativa(&self, connector_id: &str, nome: &str) -> bool {
+        let qualificado = format!("{connector_id}__{nome}");
+        self.tools(connector_id)
+            .iter()
+            .any(|tool| tool.qualified_name == qualificado)
+    }
+
+    /// O que o servidor anunciou de fato, sem o recorte da allowlist. São essas
+    /// portas que o grafo desenha: o que está desligado precisa continuar
+    /// visível para poder ser religado.
+    pub fn anunciadas(&self, connector_id: &str) -> Vec<ToolInfo> {
+        self.connections
+            .read()
+            .expect("connections lock poisoned")
+            .get(connector_id)
+            .map(|c| c.anunciadas.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn search_tools(&self, query: &str) -> Vec<ToolInfo> {
+        let tools: Vec<ToolInfo> = self
+            .connected_ids()
+            .into_iter()
+            .flat_map(|id| self.tools(&id))
+            .collect();
+        super::intent::rank(&tools, query)
+    }
+
+    pub fn catalog(&self, budget: &CatalogBudget) -> String {
+        let entries: Vec<CatalogEntry> = self
+            .connected_ids()
+            .into_iter()
+            .flat_map(|id| self.tools(&id))
+            .map(|t| CatalogEntry {
+                qualified_name: t.qualified_name,
+                connector_id: t.connector_id,
+                description: t.description,
+            })
+            .collect();
+        render(&entries, budget)
+    }
+
+    pub async fn connect(&self, connector_id: &str) -> Result<Vec<ToolInfo>> {
+        if self
+            .connections
+            .read()
+            .expect("connections lock poisoned")
+            .contains_key(connector_id)
+        {
+            bail!(tr("erros.servidorJaConectado", &[("id", connector_id)]));
+        }
+
+        let stored = {
+            let registry = self.registry.read().expect("registry lock poisoned");
+            registry.get(connector_id).cloned().ok_or_else(|| {
+                anyhow!(tr("erros.servidorNaoRegistrado", &[("id", connector_id)]))
+            })?
+        };
+
+        // Conectar o conector embutido não inicia processo nem abre rede: só
+        // publica as ferramentas que o próprio aplicativo sabe executar.
+        if stored.kind == ConnectorKind::Builtin {
+            let anunciadas = ferramentas_locais();
+            let tools = {
+                let registry = self.registry.read().expect("registry lock poisoned");
+                permitidas(&registry, connector_id, &anunciadas)
+            };
+            self.connections.write().expect("connections lock poisoned").insert(
+                connector_id.to_string(),
+                Connection { canal: Canal::Local, anunciadas },
+            );
+            let _ = self.events.send(McpEvent::ToolsDiscovered {
+                connector_id: connector_id.to_string(),
+                tools: tools.clone(),
+            });
+            return Ok(tools);
+        }
+
+        let connector = crate::config::resolve_connector(&stored).with_context(|| {
+            tr("erros.falhaResolverSegredos", &[("id", connector_id)])
+        })?;
+        let entry = connector.entry_on(DesktopOs::current()).ok_or_else(|| {
+            anyhow!(tr("erros.servidorSemEntrada", &[("id", connector_id)]))
+        })?;
+
+        // Um servidor do catálogo que só enxerga pastas recebe as concedidas
+        // agora, não quando foi instalado: revogar uma pasta tem de valer já.
+        let entry = match super::instalador::pronto(connector_id) {
+            Some(pronto) if pronto.escopo == super::instalador::Escopo::PastasConcedidas => {
+                let pastas = self.pastas_concedidas();
+                super::instalador::com_pastas(pronto, entry.clone(), &pastas)?
+            }
+            _ => entry.clone(),
+        };
+
+        let client = Self::dial(&entry).await?;
+        let advertised = client
+            .list_all_tools()
+            .await
+            .context(tr("erros.falhaListarFerramentas", &[]))?;
+
+        let anunciadas: Vec<ToolInfo> = advertised
+            .iter()
+            .map(|tool| ToolInfo::from_rmcp(connector_id, tool))
+            .collect();
+        let tools: Vec<ToolInfo> = anunciadas
+            .iter()
+            .filter(|tool| connector.allows_tool(&tool.name))
+            .cloned()
+            .collect();
+
+        let (sender, receiver) = mpsc::channel(32);
+        tokio::spawn(run_connection(client, receiver));
+
+        self.connections
+            .write()
+            .expect("connections lock poisoned")
+            .insert(
+                connector_id.to_string(),
+                Connection {
+                    canal: Canal::Remoto(sender),
+                    anunciadas,
+                },
+            );
+
+        let _ = self.events.send(McpEvent::ToolsDiscovered {
+            connector_id: connector_id.to_string(),
+            tools: tools.clone(),
+        });
+        Ok(tools)
+    }
+
+    // An unanswered approval must not suspend a tool call forever, and expiring
+    // it has to resume the waiter as denied rather than leave it parked.
+    pub fn expire_approvals(&self) -> Vec<String> {
+        let expired = self
+            .gate
+            .lock()
+            .expect("permission gate poisoned")
+            .expire_pending(Instant::now());
+        for id in &expired {
+            self.approvals.resolve(id, false);
+            let _ = self.events.send(McpEvent::ApprovalSettled {
+                id: id.clone(),
+                approved: false,
+            });
+        }
+        expired
+    }
+
+    pub async fn disconnect(&self, connector_id: &str) -> Result<()> {
+        let connection = self
+            .connections
+            .write()
+            .expect("connections lock poisoned")
+            .remove(connector_id);
+        let Some(connection) = connection else {
+            bail!(tr("erros.servidorNaoConectado", &[("id", connector_id)]));
+        };
+
+        // Revoke before the process dies, so no waiter can resume against it.
+        self.approvals.cancel_connector(connector_id);
+        self.gate
+            .lock()
+            .expect("permission gate poisoned")
+            .flush_connector(connector_id);
+
+        if let Canal::Remoto(sender) = connection.canal {
+            let _ = sender.send(ConnectionCommand::Shutdown).await;
+        }
+        let _ = self.events.send(McpEvent::Disconnected {
+            connector_id: connector_id.to_string(),
+        });
+        Ok(())
+    }
+
+    pub async fn call_tool(
+        &self,
+        qualified_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CallToolResult> {
+        let meta = {
+            let registry = self.registry.read().expect("registry lock poisoned");
+            ToolMeta::resolve(&registry, qualified_name)
+        };
+        let meta = match meta {
+            Some(meta) => meta,
+            // O nome que o modelo escreveu não é uma ferramenta que ele possa
+            // chamar. Dizer só isso faz ele procurar bloqueio político onde houve
+            // um nome errado: medido no Granite 4.2 3B, que chamou
+            // `computador__write_file` e gastou 3.483 tokens tentando gravar o
+            // arquivo por `echo` no terminal. Com a lista na resposta do erro, a
+            // correção cabe na rodada seguinte.
+            None => {
+                let nomes = |id: &str| -> Vec<String> {
+                    self.tools(id).into_iter().map(|t| t.qualified_name).collect()
+                };
+                // O conector pode nem estar conectado: aí a lista útil é a de
+                // tudo o que existe agora, senão o erro não ensina nada.
+                let lista = match parse_qualified_name(qualified_name) {
+                    Some((id, _)) if !nomes(id).is_empty() => nomes(id),
+                    _ => self
+                        .connected_ids()
+                        .iter()
+                        .flat_map(|id| nomes(id))
+                        .collect(),
+                };
+                bail!(tr(
+                    "erros.ferramentaInexistente",
+                    &[("nome", qualified_name), ("lista", &lista.join(", "))]
+                ));
+            }
+        };
+
+        let arguments = match arguments {
+            serde_json::Value::Object(map) => map,
+            _ => bail!(tr("erros.argumentosInvalidos", &[])),
+        };
+
+        let (canal, effect) = {
+            let connections = self.connections.read().expect("connections lock poisoned");
+            let connection = connections.get(&meta.connector_id).ok_or_else(|| {
+                anyhow!(tr("erros.servidorNaoConectado", &[("id", &meta.connector_id)]))
+            })?;
+            let effect = connection
+                .anunciadas
+                .iter()
+                .find(|t| t.name == meta.tool)
+                .map(|t| t.effect)
+                .unwrap_or(ToolEffect::Mutating);
+            (connection.canal.clone(), effect)
+        };
+
+        let compound = arguments_contain_shell_compound(&arguments);
+        let decision = self.gate.lock().expect("permission gate poisoned").decide(
+            &meta.connector_id,
+            effect,
+            compound,
+        );
+
+        match decision {
+            Decision::Deny => bail!(tr(
+                "erros.negadaPeloModo",
+                &[("nome", qualified_name)]
+            )),
+            Decision::Allow => {}
+            Decision::Ask => {
+                let request = ApprovalRequest {
+                    id: format!("apr-{}", self.next_id.fetch_add(1, Ordering::Relaxed)),
+                    connector_id: meta.connector_id.clone(),
+                    tool: meta.tool.clone(),
+                    arguments: serde_json::Value::Object(arguments.clone()),
+                };
+                let receiver = self.approvals.register(&request);
+                self.gate
+                    .lock()
+                    .expect("permission gate poisoned")
+                    .insert_pending(
+                        request.id.clone(),
+                        PendingApproval {
+                            connector_id: request.connector_id.clone(),
+                            tool: request.tool.clone(),
+                            effect,
+                            compound,
+                            created_at: Instant::now(),
+                        },
+                    );
+                let _ = self.events.send(McpEvent::ApprovalRequested {
+                    request: request.clone(),
+                });
+
+                // The call is suspended here, not executed and rolled back.
+                let outcome = wait_for_decision(receiver).await;
+
+                self.gate
+                    .lock()
+                    .expect("permission gate poisoned")
+                    .resolve_pending(&request.id);
+                let _ = self.events.send(McpEvent::ApprovalSettled {
+                    id: request.id.clone(),
+                    approved: outcome.is_approved(),
+                });
+                match outcome {
+                    ApprovalOutcome::Approved => {}
+                    ApprovalOutcome::Denied => bail!(tr("erros.acaoNegada", &[])),
+                    ApprovalOutcome::Cancelled => {
+                        bail!(tr("erros.servidorCaiuNaAprovacao", &[]))
+                    }
+                }
+            }
+        }
+
+        match canal {
+            Canal::Local => {
+                // Uma cópia das pastas, nunca o lock atravessando o await: a
+                // concessão de uma pasta não pode ficar presa atrás de um comando.
+                let pastas = self.pastas.read().expect("pastas envenenadas").clone();
+                let memoria = Arc::clone(&self.memoria);
+                let nome = meta.tool.clone();
+                let argumentos = serde_json::Value::Object(arguments);
+                let saida = tokio::task::spawn_blocking(move || {
+                    local::executar(&nome, argumentos, &pastas, &memoria)
+                })
+                .await
+                .map_err(|e| anyhow!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])))??;
+
+                let mut resultado = CallToolResult::success(vec![ContentBlock::text(saida.texto)]);
+                // O cartão visual nasce do mesmo resultado que o texto do modelo.
+                resultado.structured_content = Some(saida.vista.para_json());
+                resultado.is_error = Some(saida.erro);
+                Ok(resultado)
+            }
+            Canal::Remoto(sender) => {
+                let params =
+                    CallToolRequestParams::new(meta.tool.clone()).with_arguments(arguments);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                sender
+                    .send(ConnectionCommand::Call {
+                        params,
+                        reply: reply_tx,
+                    })
+                    .await
+                    .map_err(|_| {
+                        anyhow!(tr("erros.servidorParou", &[("id", &meta.connector_id)]))
+                    })?;
+
+                reply_rx
+                    .await
+                    .map_err(|_| {
+                        anyhow!(tr("erros.servidorDerrubouChamada", &[("id", &meta.connector_id)]))
+                    })?
+                    .map_err(|e| {
+                        anyhow!(tr("erros.falhaChamarFerramenta", &[("detalhe", &e.to_string())]))
+                    })
+            }
+        }
+    }
+
+    async fn dial(entry: &McpEntry) -> Result<Client> {
+        match entry {
+            McpEntry::Stdio { command, args, env } => {
+                let mut cmd = Command::new(command);
+                cmd.args(args).envs(env);
+                let transport = TokioChildProcess::new(cmd)
+                    .context(tr("erros.falhaIniciarServidor", &[]))?;
+                ().serve(transport).await.map_err(|e| {
+                    anyhow!(tr("erros.falhaConectarServidor", &[("detalhe", &format!("{e:?}"))]))
+                })
+            }
+            McpEntry::Http { url, headers } => {
+                let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
+                if !headers.is_empty() {
+                    let mut parsed = HashMap::new();
+                    for (name, value) in headers {
+                        let name = HeaderName::from_bytes(name.as_bytes()).with_context(|| {
+                            tr("erros.cabecalhoInvalido", &[("nome", name)])
+                        })?;
+                        let value = HeaderValue::from_str(value).with_context(|| {
+                            tr("erros.valorCabecalhoInvalido", &[("nome", name.as_str())])
+                        })?;
+                        parsed.insert(name, value);
+                    }
+                    config = config.custom_headers(parsed);
+                }
+                let transport = StreamableHttpClientTransport::from_config(config);
+                ().serve(transport).await.map_err(|e| {
+                    anyhow!(tr("erros.falhaConectarServidor", &[("detalhe", &format!("{e:?}"))]))
+                })
+            }
+        }
+    }
+}
+
+async fn run_connection(client: Client, mut receiver: mpsc::Receiver<ConnectionCommand>) {
+    while let Some(command) = receiver.recv().await {
+        match command {
+            ConnectionCommand::Call { params, reply } => {
+                let result = client.call_tool(params).await;
+                let _ = reply.send(result);
+            }
+            ConnectionCommand::Shutdown => break,
+        }
+    }
+    let _ = client.cancel().await;
+}
+
+// Any string argument could reach a shell, so a pipe or substitution anywhere
+// revokes the benefit of a prefix-based session grant.
+fn arguments_contain_shell_compound(arguments: &serde_json::Map<String, serde_json::Value>) -> bool {
+    fn scan(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                text.contains('|')
+                    || text.contains(';')
+                    || text.contains("&&")
+                    || text.contains("$(")
+                    || text.contains('`')
+                    || text.contains('>')
+            }
+            serde_json::Value::Array(items) => items.iter().any(scan),
+            serde_json::Value::Object(map) => map.values().any(scan),
+            _ => false,
+        }
+    }
+    arguments.values().any(scan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map,
+            _ => panic!("fixture must be an object"),
+        }
+    }
+
+    #[test]
+    fn plain_arguments_are_not_compound() {
+        assert!(!arguments_contain_shell_compound(&map(
+            json!({ "path": "/tmp/file.txt" })
+        )));
+    }
+
+    #[test]
+    fn pipe_marks_arguments_compound() {
+        assert!(arguments_contain_shell_compound(&map(
+            json!({ "command": "cat a | grep b" })
+        )));
+    }
+
+    #[test]
+    fn substitution_marks_arguments_compound() {
+        assert!(arguments_contain_shell_compound(&map(
+            json!({ "command": "echo $(whoami)" })
+        )));
+        assert!(arguments_contain_shell_compound(&map(
+            json!({ "command": "echo `whoami`" })
+        )));
+    }
+
+    #[test]
+    fn compound_detection_recurses_into_nested_values() {
+        assert!(arguments_contain_shell_compound(&map(
+            json!({ "steps": [{ "run": "a && b" }] })
+        )));
+        assert!(!arguments_contain_shell_compound(&map(
+            json!({ "steps": [{ "run": "a" }], "count": 3, "flag": true })
+        )));
+    }
+
+    #[test]
+    fn empty_arguments_are_not_compound() {
+        assert!(!arguments_contain_shell_compound(&map(json!({}))));
+    }
+}

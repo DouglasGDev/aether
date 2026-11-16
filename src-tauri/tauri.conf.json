@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Aether",
+  "version": "0.1.0",
+  "identifier": "ai.aether.core",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Aether",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "vendor/sherpa-onnx/lib/sherpa-onnx-c-api.dll": "sherpa-onnx-c-api.dll",
+      "vendor/sherpa-onnx/lib/onnxruntime.dll": "onnxruntime.dll",
+      "vendor/sherpa-onnx/lib/onnxruntime_providers_shared.dll": "onnxruntime_providers_shared.dll",
+      "vendor/llama-cpp/lib/llama.dll": "llama.dll",
+      "vendor/llama-cpp/lib/ggml.dll": "ggml.dll",
+      "vendor/llama-cpp/lib/ggml-base.dll": "ggml-base.dll",
+      "vendor/llama-cpp/lib/ggml-vulkan.dll": "ggml-vulkan.dll",
+      "vendor/llama-cpp/lib/libomp.dll": "libomp.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-x64.dll": "ggml-cpu-x64.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-sse42.dll": "ggml-cpu-sse42.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-sandybridge.dll": "ggml-cpu-sandybridge.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-ivybridge.dll": "ggml-cpu-ivybridge.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-haswell.dll": "ggml-cpu-haswell.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-skylakex.dll": "ggml-cpu-skylakex.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-cannonlake.dll": "ggml-cpu-cannonlake.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-icelake.dll": "ggml-cpu-icelake.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-alderlake.dll": "ggml-cpu-alderlake.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-cascadelake.dll": "ggml-cpu-cascadelake.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-cooperlake.dll": "ggml-cpu-cooperlake.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-sapphirerapids.dll": "ggml-cpu-sapphirerapids.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-zen4.dll": "ggml-cpu-zen4.dll",
+      "vendor/llama-cpp/lib/ggml-cpu-piledriver.dll": "ggml-cpu-piledriver.dll"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  }
+}

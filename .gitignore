@@ -1,0 +1,26 @@
+# Saída de build e cache de dependências.
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Binários de terceiros que o build procura ao lado do executável. Eles não
+# vivem no repositório: são 88 MB de DLLs do llama.cpp e do sherpa-onnx, e quem
+# clona instala pelo passo documentado em src-tauri/vendor/README.md. Os
+# cabeçalhos, as licenças e o SHA256SUMS.txt destes pacotes estão versionados.
+src-tauri/vendor/**/lib/*.dll
+src-tauri/vendor/**/lib/*.so
+src-tauri/vendor/**/lib/*.dylib
+
+# Artefatos soltos de execução.
+*.exe
+*.pdb
+*.log
+
+# Estado local e editor.
+*.local
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
