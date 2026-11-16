@@ -58,8 +58,10 @@ mesmos placeholders.
 
 ## Rodar
 
-Pré-requisitos: Windows 10+, Rust (stable), Node 20+, WebView2 Runtime, e as DLLs
-vendorizadas no lugar (link acima).
+Pré-requisitos: Windows 10+, Rust (stable), Node 20+ e WebView2 Runtime. As DLLs
+vendorizadas (link acima) não são pré-requisito para compilar — sem elas o build
+avisa e segue; elas são pré-requisito para a inferência rodar na placa e para o
+instalador levá-las.
 
 ```sh
 npm install
