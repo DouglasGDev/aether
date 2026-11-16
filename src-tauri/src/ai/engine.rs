@@ -225,6 +225,14 @@ pub struct Engine {
     motor: Motor,
     tokenizer: Tokenizer,
     eos_tokens: Vec<u32>,
+    /// O template de conversa que o arquivo GGUF publica, quando publica. É a
+    /// fonte que a sessão usa para renderizar o prompt; sem ele, o aplicativo
+    /// recua para o `chat_template.jinja` baixado junto.
+    template: Option<String>,
+    /// Os tokens que encerram uma resposta, escritos como texto: a sequência de
+    /// parada que a geração observa. Vêm do vocabulário do arquivo, não de uma
+    /// lista de marcadores supostos.
+    paradas: Vec<String>,
     acelerador: Acelerador,
 }
 
@@ -251,16 +259,24 @@ impl Engine {
                 &[("caminho", &tokenizer_path.display().to_string()), ("detalhe", &e.to_string())]
             ))
         })?;
-        let eos_tokens = eos_from_generation_config(&dir.join("generation_config.json"))?;
+        let weights = dir.join(weights_file);
+        // A ficha é lida uma vez e serve a três decisões: onde os pesos vão
+        // morar, qual template renderizar e quais tokens encerram a resposta.
+        let ficha = super::alojamento::fichar(&weights).ok();
+        let eos_tokens = match eos_from_generation_config(&dir.join("generation_config.json")) {
+            Ok(ids) if !ids.is_empty() => ids,
+            // Um GGUF que traz o vocabulário inteiro dentro de si pode não ter
+            // generation_config.json no repositório de origem. O fim de resposta
+            // continua escrito no arquivo que roda, e é dele que a biblioteca lê
+            // — não é uma suposição, é o mesmo metadado.
+            _ => ficha.as_ref().map(|f| f.eos.clone()).unwrap_or_default(),
+        };
         if eos_tokens.is_empty() {
             bail!(tr("erros.semEosDeclarado", &[]));
         }
-
-        let weights = dir.join(weights_file);
         // A VRAM é lida antes da carga. Depois dela o livre já descontaria o
         // próprio modelo, e a conta deixaria de ser previsão para ser retrospecto.
         let capacidade = super::alojamento::capacidade(dlls).ok().flatten();
-        let ficha = super::alojamento::fichar(&weights).ok();
         let livre_antes = capacidade.as_ref().map(|c| c.livre).unwrap_or(0);
         // O veredito antes da carga é o que manda a placa e é o que a tela mostra:
         // o mesmo número decide quantas camadas sobem e conta a história no chip.
@@ -296,6 +312,8 @@ impl Engine {
                     model_id: model_id.to_string(),
                     tokenizer,
                     eos_tokens,
+                    template: ficha.as_ref().and_then(|f| f.template.clone()),
+                    paradas: ficha.map(|f| f.paradas).unwrap_or_default(),
                     motor: Motor::Gpu { motor },
                     acelerador,
                 })
@@ -311,6 +329,8 @@ impl Engine {
                     model_id: model_id.to_string(),
                     tokenizer,
                     eos_tokens,
+                    template: ficha.as_ref().and_then(|f| f.template.clone()),
+                    paradas: ficha.map(|f| f.paradas).unwrap_or_default(),
                     motor: Motor::Cpu { model, config, pos: 0 },
                     acelerador: Acelerador {
                         tipo: "cpu",
@@ -372,6 +392,18 @@ impl Engine {
 
     pub fn eos_tokens(&self) -> &[u32] {
         &self.eos_tokens
+    }
+
+    /// O template que os pesos carregados declaram, no texto exato do arquivo.
+    pub fn template(&self) -> Option<&str> {
+        self.template.as_deref()
+    }
+
+    /// As sequências de parada do modelo. Uma lista vazia é a resposta honesta
+    /// de um arquivo que não declara vocabulário — quem gera continua parando no
+    /// EOS, que é o que a biblioteca também faz.
+    pub fn paradas(&self) -> &[String] {
+        &self.paradas
     }
 
     pub fn count_tokens(&self, text: &str) -> Result<usize> {

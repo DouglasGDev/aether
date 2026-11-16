@@ -73,9 +73,19 @@ pub const SUPPORT_FILES: [&str; 4] = [
 /// de geração — o que sai dele é um vetor, não texto.
 pub const SUPPORT_EMBEDDINGS: [&str; 2] = ["tokenizer.json", "tokenizer_config.json"];
 
-/// Abaixo de Q4_K_M a perda de qualidade é visível: o usuário pode baixar, mas o
-/// roteador não escolhe sozinho.
-macro_rules! variant {
+/// O que um GGUF que traz o vocabulário e o template dentro de si precisa vir de
+/// fora: o tokenizador rápido, que é o que o aplicativo usa para contar tokens e
+/// montar o prompt. O template e o fim de resposta são lidos do próprio arquivo
+/// que roda, então pedir os outros dois seria baixar o que não se usa — e
+/// reclamar de um `generation_config.json` que o repositório não publica.
+pub const SUPPORT_TOKENIZADOR: [&str; 2] = ["tokenizer.json", "tokenizer_config.json"];
+
+/// Abaixo de Q4_K_M a perda de qualidade é visível: o usuário pode baixar,
+/// mas o roteador não escolhe sozinho. Cada macro é uma série: os fatos que não
+/// mudam entre quants ficam escritos uma vez, e cada linha do catálogo é
+/// `(quant, bytes, routable)`. Os bytes são os do `tree/main` do HuggingFace,
+/// lidos arquivo por arquivo — não é conta de parâmetro.
+macro_rules! granite {
     ($size:literal, $tier:expr, $params:expr, $quant:literal, $bytes:expr, $routable:expr) => {
         ModelSpec {
             id: concat!("granite-4.2-", $size, "b-", $quant),
@@ -100,45 +110,76 @@ macro_rules! variant {
     };
 }
 
-pub const CATALOG: [ModelSpec; 30] = [
-    variant!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
-    variant!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
-    variant!("3", Tier::Leve, 3.0, "Q3_K_M", 1_835_968_032, false),
-    variant!("3", Tier::Leve, 3.0, "Q3_K_L", 1_974_576_672, false),
-    variant!("3", Tier::Leve, 3.0, "Q4_0", 2_129_118_752, false),
-    variant!("3", Tier::Leve, 3.0, "Q4_K_S", 2_142_881_312, false),
-    variant!("3", Tier::Leve, 3.0, "Q4_K_M", 2_244_011_552, true),
-    variant!("3", Tier::Leve, 3.0, "Q4_1", 2_341_783_072, false),
-    variant!("3", Tier::Leve, 3.0, "Q5_0", 2_554_447_392, false),
-    variant!("3", Tier::Leve, 3.0, "Q5_K_S", 2_554_447_392, false),
-    variant!("3", Tier::Leve, 3.0, "Q5_K_M", 2_613_634_592, true),
-    variant!("3", Tier::Leve, 3.0, "Q5_1", 2_767_111_712, false),
-    variant!("3", Tier::Leve, 3.0, "Q6_K", 3_006_359_072, true),
-    variant!("3", Tier::Leve, 3.0, "Q8_0", 3_892_651_552, true),
-    variant!("3", Tier::Leve, 3.0, "bf16", 7_323_461_152, true),
-    variant!("8", Tier::Pesado, 8.0, "Q2_K", 3_412_312_192, false),
-    variant!("8", Tier::Pesado, 8.0, "Q3_K_S", 3_942_957_184, false),
-    variant!("8", Tier::Pesado, 8.0, "Q3_K_M", 4_347_052_160, false),
-    variant!("8", Tier::Pesado, 8.0, "Q3_K_L", 4_699_897_984, false),
-    variant!("8", Tier::Pesado, 8.0, "Q4_0", 5_055_955_072, false),
-    variant!("8", Tier::Pesado, 8.0, "Q4_K_S", 5_090_820_224, false),
-    variant!("8", Tier::Pesado, 8.0, "Q4_K_M", 5_347_917_952, true),
-    variant!("8", Tier::Pesado, 8.0, "Q4_1", 5_579_718_784, false),
-    variant!("8", Tier::Pesado, 8.0, "Q5_0", 6_103_482_496, false),
-    variant!("8", Tier::Pesado, 8.0, "Q5_K_S", 6_103_482_496, false),
-    variant!("8", Tier::Pesado, 8.0, "Q5_K_M", 6_253_887_616, true),
-    variant!("8", Tier::Pesado, 8.0, "Q5_1", 6_627_246_208, false),
-    variant!("8", Tier::Pesado, 8.0, "Q6_K", 7_216_480_384, true),
-    variant!("8", Tier::Pesado, 8.0, "Q8_0", 9_345_613_952, true),
-    variant!("8", Tier::Pesado, 8.0, "bf16", 17_587_421_312, true),
+// O modelo de programação. A série Ornith 1.5 é a que os rankings de código de
+// 2026 mostram no topo e a que o Granite não alcança: 9B densos, janela de 262
+// mil, MIT, e — medido no template que o próprio GGUF publica — a mesma
+// gramática XML de chamada de ferramenta que a sessão já sabe ler. A arquitetura
+// `qwen35` é registrada pela llama.dll vendorizada, e é isso que o teste do
+// catálogo confere contra o binário.
+macro_rules! ornith {
+    ($quant:literal, $bytes:expr, $routable:expr) => {
+        ModelSpec {
+            id: concat!("ornith-1.5-9b-", $quant),
+            display: concat!("Ornith 1.5 9B ", $quant),
+            series: "Ornith 1.5 9B",
+            family: "qwen35",
+            tier: Tier::Pesado,
+            genero: Genero::Conversa,
+            parameters_b: 9.0,
+            license: "MIT",
+            quant: $quant,
+            dir: "ornith-1.5-9b",
+            weights_repo: "ornith-ai/Ornith-1.5-9B-GGUF",
+            weights_file: concat!("Ornith-1.5-9B-", $quant, ".gguf"),
+            weights_bytes: $bytes,
+            support_repo: "ornith-ai/Ornith-1.5-9B",
+            support_files: &SUPPORT_TOKENIZADOR,
+            query_prefix: None,
+            context_limit: 262_144,
+            routable: $routable,
+        }
+    };
+}
+
+pub const CATALOG: [ModelSpec; 35] = [
+    granite!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
+    granite!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
+    granite!("3", Tier::Leve, 3.0, "Q3_K_M", 1_835_968_032, false),
+    granite!("3", Tier::Leve, 3.0, "Q3_K_L", 1_974_576_672, false),
+    granite!("3", Tier::Leve, 3.0, "Q4_0", 2_129_118_752, false),
+    granite!("3", Tier::Leve, 3.0, "Q4_K_S", 2_142_881_312, false),
+    granite!("3", Tier::Leve, 3.0, "Q4_K_M", 2_244_011_552, true),
+    granite!("3", Tier::Leve, 3.0, "Q4_1", 2_341_783_072, false),
+    granite!("3", Tier::Leve, 3.0, "Q5_0", 2_554_447_392, false),
+    granite!("3", Tier::Leve, 3.0, "Q5_K_S", 2_554_447_392, false),
+    granite!("3", Tier::Leve, 3.0, "Q5_K_M", 2_613_634_592, true),
+    granite!("3", Tier::Leve, 3.0, "Q5_1", 2_767_111_712, false),
+    granite!("3", Tier::Leve, 3.0, "Q6_K", 3_006_359_072, true),
+    granite!("3", Tier::Leve, 3.0, "Q8_0", 3_892_651_552, true),
+    granite!("3", Tier::Leve, 3.0, "bf16", 7_323_461_152, true),
+    granite!("8", Tier::Pesado, 8.0, "Q2_K", 3_412_312_192, false),
+    granite!("8", Tier::Pesado, 8.0, "Q3_K_S", 3_942_957_184, false),
+    granite!("8", Tier::Pesado, 8.0, "Q3_K_M", 4_347_052_160, false),
+    granite!("8", Tier::Pesado, 8.0, "Q3_K_L", 4_699_897_984, false),
+    granite!("8", Tier::Pesado, 8.0, "Q4_0", 5_055_955_072, false),
+    granite!("8", Tier::Pesado, 8.0, "Q4_K_S", 5_090_820_224, false),
+    granite!("8", Tier::Pesado, 8.0, "Q4_K_M", 5_347_917_952, true),
+    granite!("8", Tier::Pesado, 8.0, "Q4_1", 5_579_718_784, false),
+    granite!("8", Tier::Pesado, 8.0, "Q5_0", 6_103_482_496, false),
+    granite!("8", Tier::Pesado, 8.0, "Q5_K_S", 6_103_482_496, false),
+    granite!("8", Tier::Pesado, 8.0, "Q5_K_M", 6_253_887_616, true),
+    granite!("8", Tier::Pesado, 8.0, "Q5_1", 6_627_246_208, false),
+    granite!("8", Tier::Pesado, 8.0, "Q6_K", 7_216_480_384, true),
+    granite!("8", Tier::Pesado, 8.0, "Q8_0", 9_345_613_952, true),
+    granite!("8", Tier::Pesado, 8.0, "bf16", 17_587_421_312, true),
+    ornith!("Q4_K_M", 5_780_090_816, true),
+    ornith!("Q5_K_M", 6_642_544_576, true),
+    ornith!("Q6_K", 7_558_901_696, true),
+    ornith!("Q8_0", 9_786_060_384, true),
+    // 18 GB: baixável numa máquina com mais placa, e o roteador não a escolhe.
+    ornith!("BF16", 18_407_321_184, false),
 ];
 
-/// Os modelos que viram vetor, não texto. É a memória do Aether: as pastas
-/// concedidas são lidas por semelhança de sentido, e para isso precisa de um
-/// codificador. Escolhido por três razões medidas no próprio repositório: é
-/// multilíngue (o usuário fala português), é Apache-2.0 como o resto do
-/// aplicativo, e os 600 milhões de parâmetros cabem na placa sem tirar o modelo
-/// de conversa de lá.
 pub const EMBEDS: [ModelSpec; 2] = [
     ModelSpec {
         id: "qwen3-embedding-0.6b-q8_0",
@@ -334,35 +375,72 @@ mod tests {
         assert!(find("nao-existe").is_none());
     }
 
+    /// O contrato do catálogo é o motor vendorizado, não a minha memória: cada
+    /// família declarada tem de estar registrada na `llama.dll` que o aplicativo
+    /// carrega. A tabela de arquiteturas do llama.cpp é lida como texto do
+    /// binário, então o que se verifica aqui é o arquivo real. Sem as DLLs
+    /// (clone recém-feito) não há o que conferir, e o teste diz isso em vez de
+    /// passar fingindo.
     #[test]
     fn every_entry_is_an_architecture_the_engine_runs() {
-        for spec in CATALOG {
-            assert_eq!(spec.family, "granite");
+        let dll = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor")
+            .join("llama-cpp")
+            .join("lib")
+            .join("llama.dll");
+        let Ok(binario) = std::fs::read(&dll) else {
+            eprintln!("{} ausente: nada contra o que conferir", dll.display());
+            return;
+        };
+        let mut familias: Vec<&str> = CATALOG.iter().map(|m| m.family).collect();
+        familias.extend(EMBEDS.iter().map(|m| m.family));
+        for familia in familias.iter().collect::<Vec<_>>() {
+            let chave = format!("{familia}\0");
+            assert!(
+                binario.windows(chave.len()).any(|janela| janela == chave.as_bytes()),
+                "a família {familia} não está registrada na llama.dll vendorizada"
+            );
         }
     }
 
-    /// candle-core implementa `from_data` para cada um destes em CPU; uma quant
-    /// fora da lista seria um download que o motor não abre.
+    /// O caminho de CPU é o candle, e ele só implementa granite. Para as outras
+    /// famílias a placa é obrigatória, e o que se cobra aqui é que a quant exista
+    /// como tipo GGUF — uma quant escrita errado seria um download que nenhum
+    /// motor abre.
     #[test]
-    fn quants_are_all_implemented_by_candle_on_cpu() {
-        const IMPLEMENTED: [&str; 15] = [
+    fn quants_are_all_implemented_by_the_engine() {
+        const DO_CANDLE: [&str; 15] = [
             "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q4_1", "Q5_0",
             "Q5_K_S", "Q5_K_M", "Q5_1", "Q6_K", "Q8_0", "bf16",
         ];
+        const DO_GGUF: [&str; 16] = [
+            "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q4_1", "Q5_0",
+            "Q5_K_S", "Q5_K_M", "Q5_1", "Q6_K", "Q8_0", "bf16", "BF16",
+        ];
         for spec in CATALOG {
             assert!(
-                IMPLEMENTED.contains(&spec.quant),
-                "{} não é executável pelo motor",
+                DO_GGUF.contains(&spec.quant),
+                "{} não é um tipo de quant que o motor abre",
                 spec.quant
             );
+            if spec.family == "granite" {
+                assert!(
+                    DO_CANDLE.contains(&spec.quant),
+                    "granite na quant {} não é executável pelo candle",
+                    spec.quant
+                );
+            }
         }
     }
 
     #[test]
     fn every_size_has_a_routable_baseline() {
-        for size in ["3", "8"] {
-            let id = format!("granite-4.2-{size}b-Q4_K_M");
-            assert!(find(&id).unwrap().routable);
+        for id in [
+            "granite-4.2-3b-Q4_K_M",
+            "granite-4.2-8b-Q4_K_M",
+            "ornith-1.5-9b-Q4_K_M",
+        ] {
+            assert!(find(id).unwrap().routable, "{id} não é escolhível");
         }
     }
 

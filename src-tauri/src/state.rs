@@ -373,7 +373,14 @@ impl AiRuntime {
             // acabou de ligar — com o relatório do motor no lugar de uma suposição.
             let aplicados = engine.usar_adaptadores(&pedidos);
             *self.aplicados.lock().expect("aplicados envenenados") = aplicados;
-            let template = ChatTemplate::from_file(&dir.join("chat_template.jinja"))?;
+            // O template é o que os pesos carregados declaram. Um GGUF traz o
+            // seu, e é ele que o modelo viu no treino; o arquivo do repositório
+            // de origem pode ser outra versão — e versão diferente é gramática
+            // de chamada de ferramenta diferente.
+            let template = match engine.template() {
+                Some(fonte) => ChatTemplate::from_string(fonte, spec.weights_file)?,
+                None => ChatTemplate::from_file(&dir.join("chat_template.jinja"))?,
+            };
             *self.acelerador.lock().expect("acelerador envenenado") =
                 Some(engine.acelerador().clone());
             // A janela real é a que a biblioteca aceitou, e ela é gravada aqui,

@@ -640,7 +640,7 @@
     "arquiteturaNaoGranite": "the GGUF architecture \"{arquitetura}\" is not granite; this engine cannot run it",
     "falhaCarregarTensores": "failed to load the model tensors",
     "falhaAbrirTokenizador": "could not open the tokenizer {caminho}: {detalhe}",
-    "semEosDeclarado": "generation_config.json does not declare eos_token_id; I will not invent one",
+    "semEosDeclarado": "no end-of-reply token declared — neither in generation_config.json nor in the GGUF file; I will not invent one",
     "nadaParaInferir": "empty prompt: nothing to infer",
     "promptForaDaJanela": "a prompt of {tokens} tokens does not fit the {janela} window",
     "jsonInvalidoEm": "invalid JSON in {caminho}: {detalhe}",

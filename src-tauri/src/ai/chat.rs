@@ -97,6 +97,15 @@ impl ChatTemplate {
                 &[("caminho", &path.display().to_string()), ("detalhe", &e.to_string())]
             ))
         })?;
+        Self::from_string(&source, &path.display().to_string())
+    }
+
+    /// O template escrito dentro do GGUF chega por aqui. É a fonte preferida: o
+    /// arquivo que roda é o que o modelo viu no treino, e o repositório de pesos
+    /// pode publicar outra versão do mesmo template — com outra gramática de
+    /// chamada de ferramenta, que é justamente o que a sessão precisa acertar.
+    /// `origem` é o que aparece na reclamação quando o Jinja não compila.
+    pub fn from_string(source: &str, origem: &str) -> Result<Self> {
         let mut env = Environment::new();
         // O transformers renderiza com trim_blocks/lstrip_blocks ligados; com os
         // defaults do minijinja o prompt ganha newlines que o modelo nunca viu no
@@ -112,8 +121,8 @@ impl ChatTemplate {
         // O tojson do minijinja não aceita ensure_ascii e escapa HTML; o template
         // do modelo usa a semântica do Python, então o filtro é registrado aqui.
         env.add_filter("tojson", tojson);
-        env.add_template_owned("chat", source)
-            .with_context(|| tr("erros.templateJinjaInvalido", &[("caminho", &path.display().to_string())]))?;
+        env.add_template_owned("chat", source.to_string())
+            .with_context(|| tr("erros.templateJinjaInvalido", &[("caminho", origem)]))?;
         Ok(Self { env })
     }
 

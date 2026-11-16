@@ -409,7 +409,14 @@ pub fn run_turn(
     mut emit: impl FnMut(SessionEvent),
     mut run_tool: impl FnMut(&ToolCall) -> Result<ToolOutcome>,
 ) -> Result<TurnOutcome> {
-    let stop = [TURN_MARKER.to_string()];
+    // O que fecha um turno é o vocabulário do modelo que está em memória, e não
+    // um marcador suposto: um arquivo cujo EOS é outro token pararia sempre no
+    // limite de tokens. O marcador de turno continua na lista porque um modelo
+    // que desanda a repetir ChatML precisa de onde cair.
+    let mut stop: Vec<String> = engine.paradas().to_vec();
+    if !stop.iter().any(|s| s == TURN_MARKER) {
+        stop.push(TURN_MARKER.to_string());
+    }
     // Os nomes das ferramentas conectadas é que dizem onde termina uma chamada:
     // um objeto JSON com um `name` que não está aqui é prosa, não execução.
     let nomes: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();

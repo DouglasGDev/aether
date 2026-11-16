@@ -80,6 +80,68 @@ pub struct Ficha {
     pub kv_por_token: u64,
     /// A janela que o arquivo declara — o teto do que o modelo aceita.
     pub janela_maxima: usize,
+    /// O template de conversa que o próprio arquivo publica. É o que a biblioteca
+    /// usaria ao renderizar o prompt; o aplicativo usa o mesmo, porque um
+    /// template de outro lugar — o repositório de pesos, por exemplo — pode ser
+    /// outra versão, e aí a gramática de chamada de ferramenta que o modelo
+    /// aprendeu não é a que ele está sendo convidado a falar.
+    pub template: Option<String>,
+    /// Os ids que encerram uma resposta, lidos do arquivo: `eos_token_id` e,
+    /// quando o modelo separa os dois, `eot_token_id`.
+    pub eos: Vec<u32>,
+    /// Os mesmos ids escritos como tokens, que é a forma que a geração observa
+    /// como sequência de parada. Vêm do vocabulário do próprio arquivo, não de
+    /// uma lista de marcadores supostos.
+    pub paradas: Vec<String>,
+}
+
+fn inteiro(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Option<u32> {
+    match metadata.get(chave) {
+        Some(gguf_file::Value::U32(v)) => Some(*v),
+        Some(gguf_file::Value::U64(v)) => u32::try_from(*v).ok(),
+        Some(gguf_file::Value::I32(v)) if *v >= 0 => Some(*v as u32),
+        _ => None,
+    }
+}
+
+fn lista_de_textos<'a>(
+    metadata: &'a HashMap<String, gguf_file::Value>,
+    chave: &str,
+) -> Option<&'a [gguf_file::Value]> {
+    match metadata.get(chave) {
+        Some(gguf_file::Value::Array(itens)) => Some(itens),
+        _ => None,
+    }
+}
+
+/// O que o arquivo diz sobre como falar com o modelo: template, fins de
+/// resposta e os tokens que os nomeiam. Um arquivo sem vocabulário escrito nele
+/// devolve as partes que tem — quem chama decide o que fazer com a ausência.
+fn vocabulario(
+    metadata: &HashMap<String, gguf_file::Value>,
+) -> (Option<String>, Vec<u32>, Vec<String>) {
+    let template = match metadata.get("tokenizer.chat_template") {
+        Some(gguf_file::Value::String(t)) if !t.is_empty() => Some(t.clone()),
+        _ => None,
+    };
+    let mut eos: Vec<u32> = Vec::new();
+    for chave in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
+        if let Some(id) = inteiro(metadata, chave) {
+            if !eos.contains(&id) {
+                eos.push(id);
+            }
+        }
+    }
+    let tokens = lista_de_textos(metadata, "tokenizer.ggml.tokens");
+    let paradas: Vec<String> = eos
+        .iter()
+        .filter_map(|id| tokens?.get(*id as usize))
+        .filter_map(|v| match v {
+            gguf_file::Value::String(t) if !t.is_empty() => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    (template, eos, paradas)
 }
 
 fn numero(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Result<u64> {
@@ -175,6 +237,7 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         .unwrap_or_else(|| comprimento.checked_div(cabecas).unwrap_or(comprimento));
     let (camada, fixo) = por_camada(&cabecalho.tensor_infos, camadas);
     let pesos_total = camada.iter().sum::<u64>() + fixo;
+    let (template, eos, paradas) = vocabulario(md);
     Ok(Ficha {
         arquivo: caminho.display().to_string(),
         arquitetura,
@@ -185,6 +248,9 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         // 2 = K e V; 2 bytes = o f16 do flash attention.
         kv_por_token: 2 * camadas as u64 * cabecas_kv * dimensao * 2,
         janela_maxima: numero(md, &chave("context_length")).unwrap_or(0) as usize,
+        template,
+        eos,
+        paradas,
     })
 }
 
@@ -294,6 +360,9 @@ mod testes {
             fixo: 2136 * 1024 * 1024 - 40 * 20 * 1024 * 1024,
             kv_por_token: 2 * 40 * 8 * 64 * 2,
             janela_maxima: 131072,
+            template: None,
+            eos: vec![100257],
+            paradas: vec!["<|im_end|>".to_string()],
         }
     }
 
@@ -505,5 +574,100 @@ mod testes {
             json(&Alojamento::SoSistema { pesos: 2240, kv: 335 }),
             r#"{"tipo":"soSistema","pesos":2240,"kv":335}"#
         );
+    }
+
+    /// Um GGUF mínimo escrito byte a byte, com os metadados que a ficha lê. O
+    /// parser é o do candle, então o que o teste exercita é a nossa leitura de
+    /// vocabulário — template, fins de resposta e os tokens que os nomeiam.
+    fn gguf_de_vocabulario(caminho: &Path, com_eot: bool) {
+        const STR: u32 = 8;
+        const U32: u32 = 4;
+        const ARR: u32 = 9;
+
+        fn texto(s: &str) -> Vec<u8> {
+            let mut v = (s.len() as u64).to_le_bytes().to_vec();
+            v.extend_from_slice(s.as_bytes());
+            v
+        }
+        fn par(chave: &str, tipo: u32, valor: Vec<u8>) -> Vec<u8> {
+            let mut v = texto(chave);
+            v.extend_from_slice(&tipo.to_le_bytes());
+            v.extend_from_slice(&valor);
+            v
+        }
+        fn u32_bytes(v: u32) -> Vec<u8> {
+            v.to_le_bytes().to_vec()
+        }
+        fn array_de_textos(itens: &[&str]) -> Vec<u8> {
+            let mut v = STR.to_le_bytes().to_vec();
+            v.extend_from_slice(&(itens.len() as u64).to_le_bytes());
+            for item in itens {
+                v.extend_from_slice(&texto(item));
+            }
+            v
+        }
+
+        let mut corpo: Vec<u8> = Vec::new();
+        for bytes in [
+            par("general.architecture", STR, texto("qwen35")),
+            par("qwen35.block_count", U32, u32_bytes(2)),
+            par("qwen35.embedding_length", U32, u32_bytes(64)),
+            par("qwen35.attention.head_count", U32, u32_bytes(4)),
+            par("qwen35.attention.head_count_kv", U32, u32_bytes(1)),
+            par("qwen35.attention.key_length", U32, u32_bytes(16)),
+            par("qwen35.context_length", U32, u32_bytes(262_144)),
+            par("tokenizer.chat_template", STR, texto("{{ messages }}")),
+            par("tokenizer.ggml.tokens", ARR, array_de_textos(&["<unk>", "<bos>", "<|im_end|>", "<|im_start|>"])),
+            par("tokenizer.ggml.eos_token_id", U32, u32_bytes(2)),
+        ] {
+            corpo.extend_from_slice(&bytes);
+        }
+        let pares = 10 + usize::from(com_eot);
+        if com_eot {
+            corpo.extend_from_slice(&par(
+                "tokenizer.ggml.eot_token_id",
+                U32,
+                u32_bytes(3),
+            ));
+        }
+
+        let mut arquivo: Vec<u8> = b"GGUF".to_vec();
+        arquivo.extend_from_slice(&3u32.to_le_bytes());
+        arquivo.extend_from_slice(&0u64.to_le_bytes());
+        arquivo.extend_from_slice(&(pares as u64).to_le_bytes());
+        arquivo.extend_from_slice(&corpo);
+        std::fs::write(caminho, arquivo).unwrap();
+    }
+
+    #[test]
+    fn a_ficha_le_template_eos_e_paradas_do_gguf() {
+        let dir = std::env::temp_dir().join(format!("aether-aloj-vocab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caminho = dir.join("mini.gguf");
+
+        gguf_de_vocabulario(&caminho, true);
+        let ficha = fichar(&caminho).unwrap();
+        assert_eq!(ficha.arquitetura, "qwen35");
+        assert_eq!(ficha.janela_maxima, 262_144);
+        assert_eq!(ficha.template.as_deref(), Some("{{ messages }}"));
+        assert_eq!(ficha.eos, vec![2, 3]);
+        // O que a geração observa como parada é o token escrito, lido do
+        // vocabulário do arquivo — não um marcador copiado de outro modelo.
+        assert_eq!(ficha.paradas, vec!["<|im_end|>", "<|im_start|>"]);
+
+        // Sem o eot declarado fica só o eos: nada é inventado.
+        gguf_de_vocabulario(&caminho, false);
+        let ficha = fichar(&caminho).unwrap();
+        assert_eq!(ficha.eos, vec![2]);
+        assert_eq!(ficha.paradas, vec!["<|im_end|>"]);
+
+        // Um arquivo sem template publicado não faz a ficha mentir sobre ele: o
+        // chamador recua para o chat_template.jinja baixado.
+        let vazio = dir.join("sem-template.gguf");
+        std::fs::write(&vazio, b"GGUF").unwrap();
+        assert!(fichar(&vazio).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

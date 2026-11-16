@@ -640,7 +640,7 @@
     "arquiteturaNaoGranite": "a arquitetura GGUF \"{arquitetura}\" não é granite; este motor não a executa",
     "falhaCarregarTensores": "falha ao carregar os tensores do modelo",
     "falhaAbrirTokenizador": "não abri o tokenizador {caminho}: {detalhe}",
-    "semEosDeclarado": "generation_config.json não declara eos_token_id; não vou inventar um",
+    "semEosDeclarado": "nenhum fim de resposta declarado — nem no generation_config.json nem no arquivo GGUF; não vou inventar um",
     "nadaParaInferir": "prompt vazio: nada para inferir",
     "promptForaDaJanela": "prompt de {tokens} tokens não cabe na janela de {janela}",
     "jsonInvalidoEm": "JSON inválido em {caminho}: {detalhe}",

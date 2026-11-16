@@ -394,6 +394,9 @@ mod tests {
             fixo: 2136 * MIB - 40 * 20 * MIB,
             kv_por_token: 2 * 40 * 8 * 64 * 2,
             janela_maxima: 131_072,
+            template: None,
+            eos: vec![100257],
+            paradas: vec!["<|im_end|>".to_string()],
         }
     }
 
@@ -407,6 +410,9 @@ mod tests {
             fixo: 5099 * MIB - 40 * 116 * MIB,
             kv_por_token: 2 * 40 * 8 * 128 * 2,
             janela_maxima: 131_072,
+            template: None,
+            eos: vec![100257],
+            paradas: vec!["<|im_end|>".to_string()],
         }
     }
 
