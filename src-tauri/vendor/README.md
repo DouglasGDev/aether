@@ -57,3 +57,17 @@ cargo:warning=vendor/llama-cpp/lib não tem llama.dll: a inferência local não 
 ```
 
 Depois do build, confira se elas apareceram em `src-tauri/target/debug/`.
+
+O `tauri.conf.json` lista cada uma dessas DLLs em `bundle.resources` para que o
+instalador as leve. Essa lista é literal, e o `tauri-build` aborta o build quando
+um caminho não existe — o que quebraria o clone limpo. O build script resolve
+isto antes de chamar o `tauri-build`: cada recurso que não está no disco vira uma
+remoção na override de config, e o build segue sem ele.
+
+```
+cargo:warning=sem 22 recurso(s) vendorizado(s): o aplicativo compila e abre, mas o instalador não os leva. Veja vendor/README.md.
+```
+
+Ou seja: sem os binários, `cargo check`, `cargo test` e `cargo tauri dev` funcionam
+normalmente; só o `npm run tauri build` produz um instalador incompleto. Coloque as
+DLLs nos dois diretórios acima antes de empacotar, e o aviso desaparece.

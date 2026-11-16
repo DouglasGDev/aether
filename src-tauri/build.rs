@@ -44,8 +44,94 @@ fn main() {
 
     publica_sherpa();
     publica_ggml();
+    ignora_recursos_ausentes();
 
     tauri_build::build()
+}
+
+/// O `tauri-build` aborta o build quando um caminho de `bundle.resources` não
+/// existe no disco. As DLLs do motor e do sherpa são binários de terceiros, do
+/// tamanho de um instalador, e não vêm no repositório — sem isto, quem clona o
+/// projeto nem compila antes de seguir o passo do `vendor/README.md`.
+///
+/// Cada recurso ausente vira uma remoção no remendo de merge que o `tauri-build`
+/// aplica por cima do `tauri.conf.json` quando `TAURI_CONFIG` está definido
+/// (RFC 7396: valor `null` tira a chave). Com todas as DLLs no lugar o remendo é
+/// vazio e o instalador leva exatamente os mesmos arquivos de sempre.
+fn ignora_recursos_ausentes() {
+    let raiz = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Ok(texto) = std::fs::read_to_string(raiz.join("tauri.conf.json")) else {
+        return;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&texto) else {
+        return;
+    };
+    let Some(recursos) = config
+        .get("bundle")
+        .and_then(|b| b.get("resources"))
+        .and_then(|r| r.as_object())
+    else {
+        return;
+    };
+    // Os caminhos do config são relativos à raiz do pacote, mesmo lugar de onde
+    // o `tauri-build` os resolve.
+    let faltando: Vec<&String> = recursos
+        .keys()
+        .filter(|chave| !raiz.join(chave).exists())
+        .collect();
+    if faltando.is_empty() {
+        return;
+    }
+
+    let mut remocoes = serde_json::Map::new();
+    for chave in &faltando {
+        remocoes.insert((*chave).clone(), serde_json::Value::Null);
+    }
+    let remendo = serde_json::json!({ "bundle": { "resources": remocoes } });
+
+    // A CLI também escreve em `TAURI_CONFIG` (`--config`); o remendo se soma ao
+    // que já está lá, não substitui a override de quem builda.
+    let mut efetivo = match std::env::var("TAURI_CONFIG") {
+        Ok(texto) => match serde_json::from_str::<serde_json::Value>(&texto) {
+            Ok(valor) => valor,
+            // Override que não é JSON válido: reclamar daqui é o `tauri-build`,
+            // que conhece a flag que a produziu. Deixamos a dele intacta.
+            Err(_) => return,
+        },
+        Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    fundir(&mut efetivo, remendo);
+    println!(
+        "cargo:warning=sem {} recurso(s) vendorizado(s): o aplicativo compila e abre, mas o instalador não os leva. Veja vendor/README.md.",
+        faltando.len()
+    );
+    // Edição 2024 trata `set_var` como inseguro; aqui o build script ainda é um
+    // único fluxo de execução e nada mais leu o ambiente.
+    unsafe { std::env::set_var("TAURI_CONFIG", efetivo.to_string()) };
+}
+
+/// Merge RFC 7396: objetos se fundem chave a chave, `null` remove.
+fn fundir(destino: &mut serde_json::Value, fonte: serde_json::Value) {
+    let novo = match fonte {
+        serde_json::Value::Object(novo) => novo,
+        outro => {
+            *destino = outro;
+            return;
+        }
+    };
+    let Some(base) = destino.as_object_mut() else {
+        *destino = serde_json::Value::Object(novo);
+        return;
+    };
+    for (chave, valor) in novo {
+        if valor.is_null() {
+            base.remove(&chave);
+        } else if let Some(deja) = base.get_mut(&chave) {
+            fundir(deja, valor);
+        } else {
+            base.insert(chave, valor);
+        }
+    }
 }
 
 /// A pasta de onde o executável roda.
