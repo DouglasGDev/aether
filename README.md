@@ -13,10 +13,10 @@ inferência é parte deste repositório, e o aplicativo é o dono da placa.
 | Caminho | O que executa | Quando |
 | --- | --- | --- |
 | GPU | llama.cpp pelo backend **Vulkan** | sempre que existe placa Vulkan registrada |
-| CPU | implementação própria em candle (`src/ai/granite.rs`) | máquina sem GPU, ou quando a placa recusa a carga |
+| CPU | implementação própria em candle (`src-tauri/src/ai/granite.rs`) | máquina sem GPU, ou quando a placa recusa a carga |
 
 Vulkan é a porta única para NVIDIA, AMD e Intel — não há SDK de fabricante no
-meio. Antes de carregar qualquer modelo, `src/ai/alojamento.rs` lê a VRAM livre
+meio. Antes de carregar qualquer modelo, `src-tauri/src/ai/alojamento.rs` lê a VRAM livre
 e decide entre carga inteira na placa, camada a camada dividida com a RAM, ou só
 sistema; o veredito vira `n_gpu_layers` e é conferido contra o delta real de
 VRAM que a carga produz.
