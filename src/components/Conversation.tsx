@@ -10,6 +10,7 @@ import {
 import { useIdioma, useT } from "../lib/i18n";
 import type { Choice, Medicao, ToolInfo, Vista } from "../lib/types";
 import { Icon } from "./Icon";
+import { RichText } from "./RichText";
 import { ToolCard } from "./ToolCard";
 
 export interface ToolRun {
@@ -159,7 +160,7 @@ export function Conversation({ turns, aguardando }: Props) {
 
             {turn.text !== "" && (
               <div className="talk-text">
-                {turn.text}
+                <RichText text={turn.text} />
                 {turn.streaming && <span className="talk-caret" />}
               </div>
             )}

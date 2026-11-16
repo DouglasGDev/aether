@@ -1597,6 +1597,236 @@ button.small {
   overflow-wrap: anywhere;
 }
 
+/* ── O markdown da resposta ────────────────────────────────────────────
+   O modelo escreve markdown porque foi treinado assim. Antes disto a tela
+   mostrava os marcadores ("**negrito**", "-", "```") em vez do que eles
+   significam. Os tamanhos são todos contidos na bolha: um h1 do modelo não é
+   o título da janela. */
+.talk-text p {
+  margin: 0 0 8px;
+}
+
+.talk-text > :last-child {
+  margin-bottom: 0;
+}
+
+.rich-titulo {
+  margin: 12px 0 5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.rich-titulo-1 {
+  font-size: 17px;
+}
+
+.rich-titulo-2 {
+  font-size: 16px;
+}
+
+.rich-titulo-3 {
+  font-size: 15px;
+}
+
+.rich-titulo-4,
+.rich-titulo-5,
+.rich-titulo-6 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.talk-text ul,
+.talk-text ol {
+  margin: 0 0 8px;
+  padding-left: 22px;
+}
+
+.talk-text li {
+  margin: 2px 0;
+}
+
+.talk-text li > p {
+  margin: 0;
+}
+
+.talk-text strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.talk-text em {
+  font-style: italic;
+}
+
+.talk-text del {
+  color: var(--muted);
+}
+
+.rich-inline {
+  padding: 1px 5px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: rgba(4, 8, 14, 0.6);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+  color: #b9c6de;
+}
+
+.talk-text blockquote {
+  margin: 0 0 8px;
+  padding-left: 11px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--muted);
+}
+
+.talk-text hr {
+  margin: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.rich-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Endereço que não é http(s): fica legível, mas não vira âncora clicável. */
+.rich-endereco {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.rich-caixa {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+}
+
+.rich-caixa.marcada {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.rich-tabela-pasta {
+  margin: 0 0 8px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+
+.rich-tabela {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.rich-tabela th,
+.rich-tabela td {
+  padding: 6px 10px;
+  text-align: left;
+  white-space: normal;
+  border-bottom: 1px solid var(--line);
+}
+
+.rich-tabela th {
+  color: var(--muted);
+  font-weight: 600;
+  background: rgba(4, 8, 14, 0.4);
+}
+
+.rich-tabela tr:last-child td {
+  border-bottom: 0;
+}
+
+/* Bloco de código cercado: cabeçalho com a linguagem, a conta de linhas e as
+   ações. A faixa é própria, então o código aqui não usa o rótulo em ::after
+   que o cartão de ferramenta já desenha — duas etiquetas iguais no mesmo bloco. */
+.rich-bloco {
+  margin: 0 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(4, 8, 14, 0.72);
+  overflow: hidden;
+}
+
+.rich-bloco-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(12, 17, 27, 0.95);
+}
+
+.rich-bloco-linguagem {
+  padding: 2px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.rich-bloco-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rich-bloco-acoes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.rich-bloco-botao {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.rich-bloco-botao:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.rich-bloco-botao .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.rich-bloco-codigo {
+  margin: 0;
+  padding: 9px 11px;
+  overflow: auto;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #a8b4cc;
+  white-space: pre;
+  tab-size: 2;
+}
+
 .talk-caret {
   display: inline-block;
   width: 7px;
