@@ -81,6 +81,40 @@ pub fn registro(dlls: &[PathBuf]) -> Result<Vec<InfoDevice>> {
     Ok(ggml.devices())
 }
 
+#[cfg(test)]
+mod reload {
+    use super::*;
+
+    fn pastas_teste() -> Vec<PathBuf> {
+        let mut pastas = Vec::new();
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            pastas.push(PathBuf::from(local).join("ai.aether.core").join("runtime"));
+        }
+        pastas.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("vendor")
+                .join("llama-cpp")
+                .join("lib"),
+        );
+        pastas
+    }
+
+    /// Sem o pin em `ffi::segurar_no_processo`, a segunda abertura abortava o
+    /// processo com `GGML_ASSERT(prev != ggml_uncaught_exception)` /
+    /// `0xC0000409` — o mesmo crash do `cargo tauri dev` ao medir a placa e
+    /// em seguida carregar o modelo.
+    #[test]
+    fn abrir_soltar_abrir_nao_aborta() {
+        let pastas = pastas_teste();
+        if registro(&pastas).is_err() {
+            eprintln!("sem runtime ggml: nada a conferir");
+            return;
+        }
+        registro(&pastas).expect("segunda abertura");
+        registro(&pastas).expect("terceira abertura");
+    }
+}
+
 /// O motor: pesos, contexto e o lote de ids reaproveitado a cada passo.
 pub struct Motor {
     ggml: Ggml,

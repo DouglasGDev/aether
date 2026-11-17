@@ -20,6 +20,7 @@ use crate::idiomas::tr;
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub type Token = c_int;
 pub type DeviceBruto = *mut c_void;
@@ -242,6 +243,35 @@ fn abrir_biblioteca(caminho: &Path) -> Result<Library, libloading::Error> {
     unsafe { Library::new(caminho) }
 }
 
+/// Mantém as três DLLs mapeadas pelo resto do processo.
+///
+/// A `ggml-base.dll` da release b12387 instala um `std::set_terminate` no
+/// carregamento. Esse slot é do processo, não do módulo: quando o último
+/// `FreeLibrary` a descarrega, o ponteiro fica apontando para o endereço
+/// antigo. O próximo `LoadLibrary` — comum aqui, porque `capacidade` abre e
+/// solta antes de `Motor::novo` abrir de novo — vê
+/// `prev == ggml_uncaught_exception` e aborta com `GGML_ASSERT` /
+/// `STATUS_STACK_BUFFER_OVERRUN` (`0xC0000409`). Ver
+/// [ggml-org/llama.cpp#15752](https://github.com/ggml-org/llama.cpp/issues/15752).
+///
+/// Um handle a mais deixa o contador acima de zero quando o `Ggml` da chamada
+/// cai, e o assert deixa de ser alcançável.
+fn segurar_no_processo(llama: &Path, registro: &Path, base: &Path) {
+    struct Pin {
+        _llama: Library,
+        _registro: Library,
+        _base: Library,
+    }
+    static PIN: OnceLock<Pin> = OnceLock::new();
+    let _ = PIN.get_or_init(|| Pin {
+        // Acabamos de abrir os mesmos caminhos nesta chamada: falhar aqui
+        // seria o carregador do Windows mudando de ideia no meio do caminho.
+        _llama: abrir_biblioteca(llama).expect("llama.dll já abriu nesta chamada"),
+        _registro: abrir_biblioteca(registro).expect("ggml.dll já abriu nesta chamada"),
+        _base: abrir_biblioteca(base).expect("ggml-base.dll já abriu nesta chamada"),
+    });
+}
+
 fn simbolo<T: Copy>(lib: &Library, nome: &str) -> Result<T, String> {
     unsafe { lib.get::<T>(nome) }
         .map(|f| *f)
@@ -272,6 +302,9 @@ impl Ggml {
             let llama = abrir(&caminhos[0])?;
             let registro = abrir(&caminhos[1])?;
             let base = abrir(&caminhos[2])?;
+            // Antes de qualquer `Drop` de `Ggml`: sem isto, a próxima abertura
+            // no mesmo processo aborta no assert do terminate handler.
+            segurar_no_processo(&caminhos[0], &caminhos[1], &caminhos[2]);
             let ggml = Ggml {
                 versao: simbolo(&llama, "llama_version")?,
                 init_backend: simbolo(&llama, "llama_backend_init")?,

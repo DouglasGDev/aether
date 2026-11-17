@@ -26,6 +26,8 @@ fn dlls() -> Vec<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Mesmo cinto do `aether`: ver `src/main.rs` e llama.cpp#15752.
+    unsafe { std::env::set_var("GGML_NO_BACKTRACE", "1") };
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("uso: engine-probe <dir> <arquivo.gguf> [contexto] [max_tokens] [prompt]");
