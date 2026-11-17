@@ -36,7 +36,6 @@
   },
   "app": {
     "modelos": "Modelos",
-    "novaConversa": "Nova conversa",
     "servidores": "Servidores",
     "grafo": "Ver as ligações",
     "orbe": "Voltar ao núcleo",
@@ -51,6 +50,7 @@
     "enviar": "Enviar",
     "parar": "Parar",
     "voz": "Voz",
+    "bancada": "Bancada",
     "ajusteFino": "Ajuste fino"
   },
   "voz": {
@@ -114,6 +114,7 @@
     "sinais": "Sinais",
     "aguardando": "Aguardando sua decisão",
     "tokens": "{saida} tokens de saída · {entrada} de entrada",
+    "reaproveitados": "{n} de entrada reaproveitados",
     "foraDeContexto": "{n} mensagens antigas ficaram fora desta resposta",
     "codigoLinhas": "{n} linhas",
     "codigoSemLinguagem": "código",
@@ -143,7 +144,6 @@
   },
   "servidores": {
     "titulo": "Servidores",
-    "adicionar": "Adicionar servidor",
     "remover": "Remover {nome}",
     "identificador": "Identificador",
     "nome": "Nome",
@@ -531,6 +531,131 @@
     "cabecalho": "Ferramentas disponíveis (chame pelo nome qualificado):",
     "omitidas": "[{n} outras ferramentas omitidas para caber no orçamento de contexto; peça a lista de ferramentas de um servidor específico.]"
   },
+  "conversas": {
+    "titulo": "Conversas",
+    "nova": "Nova conversa",
+    "semTitulo": "Sem título",
+    "vazia": "Nenhuma conversa salva",
+    "mensagens": "{n} mensagens",
+    "renomear": "Renomear",
+    "apagar": "Apagar {nome}",
+    "abrir": "Abrir {nome}",
+    "mostrar": "Mostrar conversas",
+    "esconder": "Esconder conversas",
+    "limpar": "Limpar esta conversa"
+  },
+  "runtime": {
+    "titulo": "Runtime nativo",
+    "instalar": "Instalar",
+    "cancelar": "Cancelar",
+    "conferir": "Conferir hashes",
+    "recarregar": "Recarregar",
+    "pronto": "Pronto",
+    "faltando": "Faltando",
+    "baixando": "Baixando",
+    "extraindo": "Extraindo",
+    "conferindo": "Conferindo",
+    "concluido": "Instalado",
+    "falhou": "Falhou",
+    "cancelado": "Cancelado",
+    "arquivos": "{n} arquivos",
+    "pasta": "Pasta",
+    "presente": "presente",
+    "ausente": "ausente",
+    "bate": "bate",
+    "diverge": "diverge",
+    "esperado": "esperado",
+    "medido": "medido",
+    "nadaFalta": "Nada falta",
+    "faltaRuntime": "Runtime nativo incompleto",
+    "conferido": "Hashes conferidos",
+    "naoConferido": "Hashes não conferem"
+  },
+  "bancada": {
+    "titulo": "Bancada",
+    "rodar": "Rodar a bancada",
+    "cancelar": "Parar",
+    "aprovado": "aprovado",
+    "reprovado": "reprovado",
+    "naoRodado": "não rodou",
+    "executando": "Rodando",
+    "caso": {
+      "placa": "Motor na placa",
+      "runtime": "Bibliotecas do runtime",
+      "esquecer": "Esquecer ao trocar de conversa",
+      "prefixo": "Reaproveitar o prefixo",
+      "parada": "Parada da resposta",
+      "fluxo": "Texto em fluxo"
+    },
+    "cancelado": "a bancada foi parada antes deste caso",
+    "semModelo": "nenhum modelo completo em disco para rodar este caso",
+    "casoDesconhecido": "a bancada não conhece o caso {id}",
+    "textoQuebrado": "a resposta veio com caractere de troca",
+    "respostaVazia": "a resposta veio vazia",
+    "enchimento": "Linha de enchimento da bancada, sem sentido para a conversa.",
+    "motor": {
+      "placa": "placa",
+      "processador": "processador"
+    },
+    "placa": {
+      "nenhuma": "nenhuma placa detectada",
+      "semMotivo": "a placa não disse por que recusou"
+    },
+    "previsao": {
+      "inteira": "inteira na placa",
+      "dividida": "{camadas} de {total} camadas na placa",
+      "sistema": "só no sistema"
+    },
+    "runtime": {
+      "faltando": "faltam bibliotecas: {lista}",
+      "hashDivergente": "o conteúdo não bate com a soma desta versão: {lista}"
+    },
+    "esquecer": {
+      "divergiu": "depois de esquecer a resposta foi outra: {antes} / {depois}",
+      "naoEsqueceu": "o prefill reaproveitou o cache da conversa anterior"
+    },
+    "prefixo": {
+      "soNaPlaca": "o cache de prefixo é do motor em placa; o processador recalcula tudo",
+      "cacheVelho": "a primeira rodada já veio com {n} tokens do cache de outra conversa",
+      "naoReaproveitou": "reaproveitou {reaproveitados} de {historico} tokens de entrada",
+      "semRecorte": "a rodada divergente não recortou o cache: reaproveitou {reaproveitados} de {ocupadas}",
+      "alemDoPonto": "a rodada divergente reaproveitou além do ponto em que o histórico muda: {reaproveitados} de {ocupadas} células",
+      "recorteFeito": "recortado pela memória",
+      "recorteRecusado": "recusado pela memória do modelo",
+      "recorteNada": "nada a recortar",
+      "divergiu": "poupar o prefixo mudou a resposta: {comCache} / {semCache}",
+      "naoAcelerou": "o prefill com cache levou {comCache} ms contra {semCache} ms sem ele"
+    },
+    "parada": {
+      "vazou": "o marcador de conversa apareceu na resposta",
+      "noTeto": "a resposta cortou no teto de tokens, não no fim da frase"
+    },
+    "fluxo": {
+      "divergiu": "o texto em fluxo não é a resposta final"
+    },
+    "medida": {
+      "motor": "motor",
+      "placa": "placa",
+      "cedido": "VRAM cedida (MB)",
+      "previsao": "alojamento previsto",
+      "bibliotecas": "bibliotecas",
+      "enchimento": "tokens do enchimento",
+      "cacheOcupado": "células de cache ocupadas",
+      "naoMedido": "não medido",
+      "reaproveitados": "reaproveitados",
+      "prompt": "tokens de entrada",
+      "recorte": "recorte",
+      "recorteDecisao": "decisão do recorte",
+      "prefill": "prefill (ms)",
+      "vezes": "mais rápido",
+      "poupados": "poupados (ms)",
+      "paradasDoModelo": "paradas do modelo",
+      "motivo": "motivo da parada",
+      "gerados": "tokens gerados",
+      "caracteres": "caracteres",
+      "velocidade": "tokens/s"
+    }
+  },
   "erros": {
     "pedidoVazio": "pedido vazio",
     "turnoEmAndamento": "já há um turno em andamento",
@@ -719,9 +844,22 @@
     "vozArquivoNaoVeio": "não consegui baixar {arquivo}",
     "vozSemTamanhoNoCatalogo": "o catálogo não declara o tamanho de {arquivo}",
     "vozFalhaPasta": "não consegui criar a pasta {pasta}",
-    "vozSemSystemRoot": "não encontrei a pasta do Windows para usar o extrator",
-    "vozSemTar": "não encontrei o tar do Windows em {caminho}",
-    "vozExtracaoFalhou": "não consegui extrair {caminho}: {detalhe}",
+    "semSystemRoot": "não encontrei a pasta do Windows para usar o extrator",
+    "semTar": "não encontrei o tar do Windows em {caminho}",
+    "extracaoFalhou": "não consegui extrair {caminho}: {detalhe}",
+    "runtimeEmCurso": "já há uma instalação de runtime em curso",
+    "runtimeNadaEmCurso": "não há instalação de runtime em curso",
+    "nadaEmCurso": "não há nada em curso para parar",
+    "runtimeOperacaoNaoTerminou": "a conferência do runtime não terminou: {detalhe}",
+    "runtimePacoteDesconhecido": "não conheço o pacote de runtime {ids}",
+    "runtimePacote": "não baixei o runtime {nome}",
+    "runtimeArquivoForaDoPacote": "{nome} não está no pacote {pacote}",
+    "runtimeHashDiverge": "{nome} não é o binário conferido: esperado {esperado}, medido {medido}",
+    "falhaSerializar": "não serializei {caminho}: {detalhe}",
+    "conversaIdInvalido": "id de conversa inválido: {id}",
+    "conversaDesconhecida": "não conheço a conversa {id}",
+    "conversaTituloVazio": "o título da conversa está vazio",
+    "runtimeFalhaMover": "não movi {origem} para {destino}: {detalhe}",
     "vozExtracaoNaoTerminou": "a extração não terminou: {detalhe}",
     "vozFaltouArquivo": "faltaram arquivos depois do download: {arquivos}",
     "vozNaoApagouCache": "não consegui apagar o pacote baixado {caminho}",

@@ -61,6 +61,13 @@ pub enum StopReason {
 pub struct Generation {
     pub text: String,
     pub prompt_tokens: usize,
+    /// Quantos tokens do prompt já estavam no KV cache e não foram calculados
+    /// nesta rodada. É a medida do reaproveitamento: zero é um prefill inteiro.
+    pub reused_tokens: usize,
+    /// A rodada pediu um recorte do cache — porque o histórico diverge no meio —
+    /// e a memória do modelo **recusou**. Não é o mesmo que `reused_tokens == 0`:
+    /// zero pode ser um bug nosso, e isto é a resposta que a biblioteca deu.
+    pub recorte_recusado: bool,
     pub generated_tokens: usize,
     pub prompt_ms: u64,
     pub decode_ms: u64,
@@ -75,11 +82,15 @@ impl Generation {
         self.generated_tokens as f64 * 1000.0 / self.decode_ms as f64
     }
 
+    /// Tokens por segundo do que foi de fato calculado. O prefixo reaproveitado
+    /// não passou pela placa nesta rodada: contá-lo aqui faria a medida dizer que
+    /// o prefill acelerou sem nada ter mudado no motor.
     pub fn prefill_tokens_per_second(&self) -> f64 {
         if self.prompt_ms == 0 {
             return 0.0;
         }
-        self.prompt_tokens as f64 * 1000.0 / self.prompt_ms as f64
+        let calculados = self.prompt_tokens.saturating_sub(self.reused_tokens);
+        calculados as f64 * 1000.0 / self.prompt_ms as f64
     }
 }
 
@@ -160,6 +171,24 @@ impl Motor {
                 let logits = model.forward(&input, *pos)?.squeeze(0)?;
                 *pos += tokens.len();
                 Ok(logits)
+            }
+        }
+    }
+
+    /// Prefila o prompt do turno e diz quantos tokens não precisaram de conta.
+    /// Na placa o começo que o cache já tem é reaproveitado; no candle não há
+    /// recorte parcial de cache, então o turno prefila inteiro — e o zero é a
+    /// medida honesta disso, não um reaproveitamento que não aconteceu.
+    fn passo_prompt(&mut self, tokens: &[u32]) -> Result<(Tensor, usize, bool)> {
+        match self {
+            Motor::Gpu { motor } => {
+                let (logits, reaproveitados, recusado) = motor.passo_com_prefixo(tokens)?;
+                let n = logits.len();
+                Ok((Tensor::from_vec(logits, (n,), &Device::Cpu)?, reaproveitados, recusado))
+            }
+            Motor::Cpu { .. } => {
+                self.limpar();
+                Ok((self.passo(tokens)?, 0, false))
             }
         }
     }
@@ -418,6 +447,23 @@ impl Engine {
         self.motor.limpar();
     }
 
+    /// Células do KV ocupadas agora, ou `None` onde não há o que contar. É o
+    /// número que a bancada confere depois de um `reset`: o caminho de CPU
+    /// (candle) não publica essa contagem, e dizer zero ali seria medir o que a
+    /// biblioteca não disse.
+    pub fn cache_ocupado(&self) -> Option<usize> {
+        match &self.motor {
+            Motor::Gpu { motor } => Some(motor.ocupadas()),
+            Motor::Cpu { .. } => None,
+        }
+    }
+
+    /// Se a conta está na placa. A regra do produto é placa primeiro; a bancada
+    /// pergunta se foi a placa que rodou, e o recorte de prefixo só existe lá.
+    pub fn na_placa(&self) -> bool {
+        matches!(self.motor, Motor::Gpu { .. })
+    }
+
     /// Gera a continuação de `prompt_tokens`, emitindo texto por `emit`.
     pub fn generate(
         &mut self,
@@ -440,8 +486,6 @@ impl Engine {
                 ]
             ));
         }
-        self.motor.limpar();
-
         let sampling = match (params.top_k, params.top_p) {
             (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature: params.temperature },
             (Some(k), None) => Sampling::TopK { k, temperature: params.temperature },
@@ -456,7 +500,7 @@ impl Engine {
         let mut text = String::new();
 
         let prefill_start = Instant::now();
-        let logits = self.motor.passo(prompt_tokens)?;
+        let (logits, reused_tokens, recorte_recusado) = self.motor.passo_prompt(prompt_tokens)?;
         let prompt_ms = prefill_start.elapsed().as_millis() as u64;
 
         let mut next = logits_processor.sample(&logits)?;
@@ -516,6 +560,8 @@ impl Engine {
         Ok(Generation {
             text,
             prompt_tokens: prompt_tokens.len(),
+            reused_tokens,
+            recorte_recusado,
             generated_tokens: generated,
             prompt_ms,
             decode_ms,
@@ -663,6 +709,8 @@ mod tests {
         let g = Generation {
             text: String::new(),
             prompt_tokens: 10,
+            reused_tokens: 0,
+            recorte_recusado: false,
             generated_tokens: 0,
             prompt_ms: 0,
             decode_ms: 0,
@@ -677,6 +725,8 @@ mod tests {
         let g = Generation {
             text: "x".into(),
             prompt_tokens: 100,
+            reused_tokens: 0,
+            recorte_recusado: false,
             generated_tokens: 50,
             prompt_ms: 500,
             decode_ms: 2000,
@@ -684,6 +734,24 @@ mod tests {
         };
         assert_eq!(g.decode_tokens_per_second(), 25.0);
         assert_eq!(g.prefill_tokens_per_second(), 200.0);
+    }
+
+    #[test]
+    fn o_prefixo_reaproveitado_nao_conta_como_prefill() {
+        // 100 tokens de prompt, 90 já no cache: a placa calculou 10 em 500 ms.
+        // Contar os 100 diria 200 t/s — uma velocidade que ninguém mediu.
+        let g = Generation {
+            text: "x".into(),
+            prompt_tokens: 100,
+            reused_tokens: 90,
+            recorte_recusado: false,
+            generated_tokens: 50,
+            prompt_ms: 500,
+            decode_ms: 2000,
+            stop: StopReason::Eos,
+        };
+        assert_eq!(g.prefill_tokens_per_second(), 20.0);
+        assert_eq!(g.decode_tokens_per_second(), 25.0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::ai::router::{self, Choice, Request};
 use crate::ai::session::{self, SessionEvent, TurnConfig, TurnOutcome};
 use crate::ai::{Alvo, ChatMessage, ToolCall, ToolSpec};
 use crate::connectors::Connector;
+use crate::conversas;
 use crate::idiomas::{self, tr};
 use crate::ligacoes;
 use crate::local::{self, pastas::Pastas};
@@ -15,15 +16,16 @@ use crate::mcp::instalador::{self, ServidorEvent};
 use crate::mcp::manager::McpManager;
 use crate::mcp::tool::ToolInfo;
 use crate::permissions::{AgentMode, ToolEffect};
+use crate::runtime;
 use crate::state::{AiRuntime, AppState};
 use crate::voz::{self, Ajustes, EstadoVoz, VozEvento};
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 fn report(error: anyhow::Error) -> String {
     format!("{error:#}")
@@ -464,6 +466,9 @@ pub struct AiStatus {
     pub busy: bool,
     pub turns: usize,
     pub downloading: Vec<String>,
+    /// O runtime nativo: sem ele o modelo baixa e não carrega. A tela mostra o
+    /// que falta em vez de deixar o usuário descobrir no erro do motor.
+    pub runtime: Vec<runtime::EstadoPacote>,
 }
 
 #[tauri::command]
@@ -478,6 +483,7 @@ pub fn ai_status(state: State<'_, AppState>) -> AiStatus {
         busy: ai.is_busy(),
         turns: ai.history.lock().expect("histórico envenenado").len(),
         downloading: ai.downloading(),
+        runtime: runtime::estado(&ai.dlls),
     }
 }
 
@@ -623,14 +629,85 @@ pub fn chat_history(state: State<'_, AppState>) -> Vec<ChatMessage> {
 }
 
 #[tauri::command]
-pub fn chat_reset(state: State<'_, AppState>) {
+pub fn chat_reset(state: State<'_, AppState>) -> Result<(), String> {
     state.ai.request_cancel();
     state.ai.history.lock().expect("histórico envenenado").clear();
+    // O arquivo tem de dizer o mesmo que o buffer vivo: uma conversa limpa na
+    // tela e cheia no disco voltaria cheia no próximo arranque.
+    if let Some(id) = state.conversas.estado().ativa {
+        state.conversas.gravar(&id, &[]).map_err(report)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn chat_cancel(state: State<'_, AppState>) {
     state.ai.request_cancel();
+}
+
+// ─── Conversas salvas ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn conversas_listar(state: State<'_, AppState>) -> conversas::Estado {
+    state.conversas.estado()
+}
+
+/// Uma conversa nova. Se a ativa ainda não tem mensagem, ela já é nova: criar
+/// outra deixaria uma vazia na lista a cada clique.
+#[tauri::command]
+pub fn conversa_nova(state: State<'_, AppState>) -> Result<conversas::Estado, String> {
+    if state.ai.is_busy() {
+        return Err(tr("erros.turnoEmAndamento", &[]));
+    }
+    let estado = state.conversas.estado();
+    let vazia = estado
+        .ativa
+        .as_ref()
+        .and_then(|id| estado.conversas.iter().find(|f| &f.id == id))
+        .map(|f| f.mensagens == 0)
+        .unwrap_or(false);
+    if !vazia {
+        state.conversas.criar().map_err(report)?;
+    }
+    state.ai.history.lock().expect("histórico envenenado").clear();
+    state.ai.esquecer();
+    Ok(state.conversas.estado())
+}
+
+/// Troca a conversa ativa: o histórico do arquivo entra no buffer vivo e o
+/// motor esquece o KV, porque o cache da conversa anterior não é prefixo desta.
+#[tauri::command]
+pub fn conversa_abrir(state: State<'_, AppState>, id: String) -> Result<Vec<ChatMessage>, String> {
+    if state.ai.is_busy() {
+        return Err(tr("erros.turnoEmAndamento", &[]));
+    }
+    let mensagens = state.conversas.abrir(&id).map_err(report)?;
+    *state.ai.history.lock().expect("histórico envenenado") = mensagens.clone();
+    state.ai.esquecer();
+    Ok(mensagens)
+}
+
+#[tauri::command]
+pub fn conversa_renomear(
+    state: State<'_, AppState>,
+    id: String,
+    titulo: String,
+) -> Result<conversas::Ficha, String> {
+    state.conversas.renomear(&id, &titulo).map_err(report)
+}
+
+#[tauri::command]
+pub fn conversa_apagar(state: State<'_, AppState>, id: String) -> Result<conversas::Estado, String> {
+    if state.ai.is_busy() {
+        return Err(tr("erros.turnoEmAndamento", &[]));
+    }
+    let era_ativa = state.conversas.estado().ativa.as_deref() == Some(id.as_str());
+    state.conversas.apagar(&id).map_err(report)?;
+    if era_ativa {
+        state.ai.history.lock().expect("histórico envenenado").clear();
+        state.ai.esquecer();
+    }
+    Ok(state.conversas.estado())
 }
 
 /// Texto que o modelo recebe de uma ferramenta. Só o conteúdo textual: imagem e
@@ -667,14 +744,34 @@ pub async fn chat_send(
     let manager = Arc::clone(&state.manager);
     let memoria = Arc::clone(&state.memoria);
     let pastas = Arc::clone(&state.pastas);
+    let conversas = Arc::clone(&state.conversas);
     if !ai.begin() {
         return Err(tr("erros.turnoEmAndamento", &[]));
     }
+    // A conversa tem de existir antes do turno: é nela que este histórico fica,
+    // e um pedido sem conversa seria um pedido perdido ao fechar a janela.
+    let id = match conversas.garantir() {
+        Ok(id) => id,
+        Err(erro) => {
+            ai.end();
+            return Err(report(erro));
+        }
+    };
     let done = Arc::clone(&ai);
     let voz = Arc::clone(&state.voz);
     let app_fala = app.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        run_chat_turn(&app, &ai, &manager, &memoria, &pastas, &text)
+        let resultado = run_chat_turn(&app, &ai, &manager, &memoria, &pastas, &text);
+        // Grava mesmo quando o turno falhou: o que o modelo já disse e as
+        // ferramentas que já rodaram aconteceram, e a conversa é o registro
+        // disso. O lock do histórico é tomado e largado antes do das conversas.
+        let mensagens = ai.history.lock().expect("histórico envenenado").clone();
+        match (resultado, conversas.gravar(&id, &mensagens)) {
+            (Ok(desfecho), Ok(_)) => Ok(desfecho),
+            // A causa do turno vem primeiro: ela é o que a pessoa precisa ver.
+            (Err(erro), _) => Err(erro),
+            (Ok(_), Err(erro)) => Err(report(erro)),
+        }
     })
     .await;
     done.end();
@@ -1331,4 +1428,143 @@ pub async fn adaptador_apagar(
         .await
         .map_err(|e| tr("erros.adaptadorOperacaoNaoTerminou", &[("detalhe", &e.to_string())]))?
         .map_err(report)
+}
+// ─── Runtime nativo ───────────────────────────────────────────────────────────
+
+/// O que está instalado e o que falta, nas pastas que o carregador procura. É
+/// presença, não conteúdo: a conferência de hash é `runtime_verificar`, porque
+/// ler 46 MB a cada consulta de estado prenderia a interface.
+#[tauri::command]
+pub fn runtime_estado(state: State<'_, AppState>) -> Vec<runtime::EstadoPacote> {
+    runtime::estado(&state.ai.dlls)
+}
+
+/// Confere o conteúdo de cada DLL contra o SHA256SUMS.txt versionado. Roda fora
+/// da thread da janela: são dezenas de megabytes de hash.
+#[tauri::command]
+pub async fn runtime_verificar(state: State<'_, AppState>) -> Result<Vec<runtime::Veredito>, String> {
+    let dlls = state.ai.dlls.clone();
+    tauri::async_runtime::spawn_blocking(move || runtime::verificar(&dlls))
+        .await
+        .map_err(|e| tr("erros.runtimeOperacaoNaoTerminou", &[("detalhe", &e.to_string())]))
+}
+
+/// Instala o que falta e devolve imediatamente: o progresso chega por evento, e
+/// a UI não pode ficar presa num invoke de 46 MB.
+#[tauri::command]
+pub async fn runtime_instalar(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let cancel = {
+        let mut job = state.runtime_job.lock().expect("runtime envenenado");
+        if job.is_some() {
+            return Err(tr("erros.runtimeEmCurso", &[]));
+        }
+        let novo = Arc::new(AtomicBool::new(false));
+        *job = Some(Arc::clone(&novo));
+        novo
+    };
+    let destino = state.runtime_dir.clone();
+    tauri::async_runtime::spawn(async move {
+        let emit = {
+            let app = app.clone();
+            move |evento: runtime::Evento| {
+                let _ = app.emit("runtime-evento", &evento);
+            }
+        };
+        let _ = runtime::instalar(&destino, &ids, &cancel, emit).await;
+        // O slot tem de ser devolvido mesmo quando a instalação falha: sem isto
+        // a segunda tentativa diria "já em curso" para sempre.
+        let estado = app.state::<AppState>();
+        *estado.runtime_job.lock().expect("runtime envenenado") = None;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn runtime_cancelar(state: State<'_, AppState>) -> Result<(), String> {
+    let job = state.runtime_job.lock().expect("runtime envenenado");
+    match job.as_ref() {
+        Some(cancel) => {
+            cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err(tr("erros.runtimeNadaEmCurso", &[])),
+    }
+}
+
+// ─── Bancada ──────────────────────────────────────────────────────────────────
+
+/// Os casos da suíte, para a tela desenhar a lista antes de a primeira medida
+/// existir. Um caso que ainda não rodou não é um caso aprovado.
+#[tauri::command]
+pub fn bancada_casos() -> Vec<&'static str> {
+    crate::bancada::CASOS.to_vec()
+}
+
+/// O modelo que a bancada vai usar: o fixado pelo dono, senão o que já está em
+/// memória, senão o menor que a máquina tem inteiro. É a ordem do turno de
+/// conversa sem o roteador por meio — a bancada mede um modelo, não uma escolha.
+fn bancada_spec(ai: &AiRuntime) -> Option<&'static ModelSpec> {
+    let fixo = ai.ajustes().modelo;
+    let fixo = fixo.trim();
+    if !fixo.is_empty() {
+        if let Some(spec) = catalog::find(fixo) {
+            if catalog::status(&ai.models_root, spec).complete {
+                return Some(spec);
+            }
+        }
+    }
+    if let Some(id) = ai.loaded_id() {
+        if let Some(spec) = catalog::find(&id) {
+            if catalog::status(&ai.models_root, spec).complete {
+                return Some(spec);
+            }
+        }
+    }
+    catalog::CATALOG
+        .iter()
+        .filter(|m| m.genero != crate::ai::catalog::Genero::Embeddings)
+        .filter(|m| catalog::status(&ai.models_root, m).complete)
+        .min_by_key(|m| m.weights_bytes)
+}
+
+/// Roda a suíte e devolve na hora: as medidas chegam por evento, uma por caso,
+/// porque a bancada gera texto de verdade e isso leva segundos.
+#[tauri::command]
+pub async fn bancada_rodar(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let ai = Arc::clone(&state.ai);
+    if !ai.begin() {
+        return Err(tr("erros.turnoEmAndamento", &[]));
+    }
+    let spec = bancada_spec(&ai);
+    let cancel = Arc::clone(&ai.cancel);
+    let feito = Arc::clone(&ai);
+    let resultado = tauri::async_runtime::spawn_blocking(move || {
+        let emit = {
+            let app = app.clone();
+            move |evento: crate::bancada::Evento| {
+                let _ = app.emit("bancada-evento", &evento);
+            }
+        };
+        crate::bancada::rodar(&ai, spec, &cancel, emit)
+    })
+    .await;
+    feito.end();
+    resultado
+        .map_err(|e| tr("erros.turnoNaoTerminou", &[("detalhe", &e.to_string())]))?;
+    Ok(())
+}
+
+/// A bancada toma o motor como um turno toma, então é o mesmo cancelador que a
+/// para: `ai.cancel`. Não há segundo interruptor a divergir do primeiro.
+#[tauri::command]
+pub fn bancada_cancelar(state: State<'_, AppState>) -> Result<(), String> {
+    if !state.ai.is_busy() {
+        return Err(tr("erros.nadaEmCurso", &[]));
+    }
+    state.ai.request_cancel();
+    Ok(())
 }

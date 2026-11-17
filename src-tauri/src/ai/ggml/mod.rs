@@ -101,6 +101,13 @@ pub struct Motor {
     /// aberto: é RAM da placa derivada dos pesos do base, e por isso o dono é o
     /// motor, nunca uma tabela global.
     adaptadores: Vec<(PathBuf, *mut c_void)>,
+    /// Os ids que estão de fato no KV cache, na ordem das posições `0..n`. É a
+    /// conta que decide quanto do prompt seguinte já foi calculado: sem ela,
+    /// "reaproveitar o prefixo" seria um chute sobre o que a placa guardou.
+    /// Guarda o prompt **e** o que foi gerado, porque as células da resposta
+    /// também ocupam posição — esquecê-las aqui deixaria o rabo do cache antigo
+    /// vivo depois do recorte, e a posição automática continuaria depois dele.
+    cached: Vec<Token>,
     buf: Vec<Token>,
 }
 
@@ -121,6 +128,14 @@ fn obsoletos(carregados: &[&PathBuf], pedidos: &[(PathBuf, f32)]) -> Vec<usize> 
     (0..carregados.len())
         .filter(|i| !pedidos.iter().any(|(p, _)| p == carregados[*i]))
         .collect()
+}
+
+/// Quantos ids do começo de `prompt` já estão no cache, na mesma ordem. O último
+/// token nunca entra na conta: sem decodificá-lo não há logits de onde amostrar,
+/// e um prompt que é prefixo inteiro do cache devolveria um lote vazio.
+fn prefixo_comum(cached: &[Token], prompt: &[Token]) -> usize {
+    let k = cached.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    k.min(prompt.len().saturating_sub(1))
 }
 
 /// `modelo` e `contexto` só são usados pela thread que detém o `Engine`, e o
@@ -176,6 +191,7 @@ impl Motor {
             n_batch,
             janela: janela_real,
             adaptadores: Vec::new(),
+            cached: Vec::new(),
             buf: Vec::new(),
         })
     }
@@ -213,14 +229,71 @@ impl Motor {
         }
         self.buf = buf;
         match falha {
-            Some(e) => bail!(e),
-            None => Ok(logits),
+            Some(e) => {
+                // Um lote que falhou no meio deixou células que ninguém sabe
+                // quais são. O cache é esquecido inteiro: o próximo prompt
+                // prefila do zero em vez de continuar sobre estado incerto.
+                self.cached.clear();
+                self.ggml.limpar_cache(self.contexto);
+                bail!(e)
+            }
+            None => {
+                self.cached.extend(tokens.iter().map(|t| *t as Token));
+                Ok(logits)
+            }
         }
+    }
+
+    /// Prefila `tokens` reaproveitando o começo que o cache já tem, e devolve os
+    /// logits da última posição junto de quantos tokens não precisaram de conta e
+    /// de se a memória do modelo **recusou** o recorte que este código pediu.
+    ///
+    /// O prefixo é medido contra `cached`, não suposto: o prompt da rodada
+    /// seguinte de uma ferramenta é o da anterior mais o resultado dela, e é só
+    /// esse começo que a placa já calculou. Da divergência em diante o cache é
+    /// recortado — célula de uma resposta que não continua aqui não é prefixo de
+    /// nada — e o resto entra como lote novo, nas posições que a biblioteca
+    /// continua contando a partir do que sobrou.
+    ///
+    /// A recusa não é deste código e precisa voltar como medida: num modelo
+    /// híbrido com estado recorrente a metade recorrente da memória só desfaz
+    /// dentro dos instantâneos do último lote, então o recorte pedido devolve
+    /// `false`, o cache é esquecido inteiro e a rodada prefila do zero. Dizer
+    /// "reaproveitei 0" sem essa diferença é não saber se quem errou fomos nós.
+    pub fn passo_com_prefixo(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, usize, bool)> {
+        if tokens.is_empty() {
+            return Ok((Vec::new(), 0, false));
+        }
+        let ids: Vec<Token> = tokens.iter().map(|t| *t as Token).collect();
+        let mut k = prefixo_comum(&self.cached, &ids);
+        let mut recusado = false;
+        if k < self.cached.len() {
+            if self.ggml.apagar_de(self.contexto, k) {
+                self.cached.truncate(k);
+            } else {
+                // A biblioteca recusou o recorte. Esquecer tudo custa um prefill
+                // inteiro, e é o preço honesto de não saber o que sobrou.
+                self.limpar();
+                k = 0;
+                recusado = true;
+            }
+        }
+        let logits = self.passo(&tokens[k..])?;
+        Ok((logits, k, recusado))
     }
 
     /// Esquece a conversa: posições e KV cache voltam ao estado de modelo novo.
     pub fn limpar(&mut self) {
+        self.cached.clear();
         self.ggml.limpar_cache(self.contexto);
+    }
+
+    /// Quantas células do cache estão ocupadas, pela conta que este código
+    /// mantém. É o número que a bancada confere depois de um "esquecer": zero é
+    /// a prova de que a conversa anterior não vai ser lida como prefixo da
+    /// próxima.
+    pub fn ocupadas(&self) -> usize {
+        self.cached.len()
     }
 
     /// Põe `pedidos` sobre os pesos do modelo em memória, com a força de cada
@@ -590,5 +663,30 @@ mod tests {
         // mudança de força sem reler o disco.
         let mesmos = vec![(a.clone(), 0.8f32), (b.clone(), 1.0)];
         assert!(obsoletos(&carregados, &mesmos).is_empty());
+    }
+
+    /// O reaproveitamento é uma conta sobre ids, e é aqui que ela existe sem
+    /// placa. Errar para mais é continuar a conversa errada; errar para menos é
+    /// pagar de novo o prefill que esta tarefa inteira quer deixar de pagar.
+    #[test]
+    fn o_prefixo_e_o_comeco_igual_ate_a_primeira_divergencia() {
+        // A rodada seguinte: o mesmo histórico, mais o resultado da ferramenta.
+        assert_eq!(prefixo_comum(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5, 6, 7]), 5);
+        // O histórico mudou no meio: nada depois disso é prefixo.
+        assert_eq!(prefixo_comum(&[1, 2, 3, 9], &[1, 2, 3, 4, 5]), 3);
+        // Conversa nova: o cache é de outra, e o prompt prefila inteiro.
+        assert_eq!(prefixo_comum(&[8, 9], &[1, 2, 3]), 0);
+        assert_eq!(prefixo_comum(&[], &[1, 2, 3]), 0);
+    }
+
+    #[test]
+    fn o_ultimo_token_do_prompt_sempre_entra_no_lote() {
+        // Sem ele não há logits de onde amostrar: um prompt que o cache já tem
+        // inteiro devolveria um lote vazio e a geração morreria sem resposta.
+        assert_eq!(prefixo_comum(&[1, 2, 3], &[1, 2, 3]), 2);
+        // Prompt mais curto que o cache: o rabo é recortado, o último fica.
+        assert_eq!(prefixo_comum(&[1, 2, 3, 4, 5], &[1, 2]), 1);
+        assert_eq!(prefixo_comum(&[1, 2, 3], &[7]), 0);
+        assert_eq!(prefixo_comum(&[1, 2, 3], &[]), 0);
     }
 }

@@ -37,7 +37,7 @@ pub fn system_prompt() -> String {
 
 /// O template fecha o turno com este marcador; gerar além dele é começar a
 /// falar pelo usuário.
-const TURN_MARKER: &str = concat!("<", "|im_start|>");
+pub(crate) const TURN_MARKER: &str = concat!("<", "|im_start|>");
 /// O bloco de raciocínio do Granite 4.2, lido do `chat_template.jinja` do
 /// fabricante. Com o nome errado na frente, o pensamento nunca aparece na tela e
 /// a resposta sai vazia: é ele que marca onde a resposta começa.
@@ -122,6 +122,9 @@ pub enum SessionEvent {
 #[serde(rename_all = "camelCase")]
 pub struct Medicao {
     pub prompt_tokens: usize,
+    /// Quantos tokens do prompt o KV cache já tinha e não foram calculados de
+    /// novo. É o número que diz, em tokens, o que o reaproveitamento poupou.
+    pub reused_tokens: usize,
     pub generated_tokens: usize,
     pub prompt_ms: u64,
     pub decode_ms: u64,
@@ -142,6 +145,7 @@ impl Medicao {
     /// o usuário viu.
     fn novo(
         prompt_tokens: usize,
+        reused_tokens: usize,
         generated_tokens: usize,
         prompt_ms: u64,
         decode_ms: u64,
@@ -150,6 +154,7 @@ impl Medicao {
     ) -> Self {
         Self {
             prompt_tokens,
+            reused_tokens,
             generated_tokens,
             prompt_ms,
             decode_ms,
@@ -159,7 +164,7 @@ impl Medicao {
                 0.0
             },
             prefill_tokens_por_segundo: if prompt_ms > 0 {
-                prompt_tokens as f64 * 1000.0 / prompt_ms as f64
+                prompt_tokens.saturating_sub(reused_tokens) as f64 * 1000.0 / prompt_ms as f64
             } else {
                 0.0
             },
@@ -455,6 +460,7 @@ pub fn run_turn(
     // rede de segurança. Sem teto nenhum, a ferramenta diria o que faltou.
     let mut continuacoes = 0usize;
     let mut prompt_tokens = 0usize;
+    let mut reused_tokens = 0usize;
     let mut generated_tokens = 0usize;
     let mut prompt_ms = 0u64;
     let mut decode_ms = 0u64;
@@ -528,6 +534,7 @@ pub fn run_turn(
         };
 
         prompt_tokens += generation.prompt_tokens;
+        reused_tokens += generation.reused_tokens;
         generated_tokens += generation.generated_tokens;
         prompt_ms += generation.prompt_ms;
         decode_ms += generation.decode_ms;
@@ -602,6 +609,7 @@ pub fn run_turn(
             push(history, ChatMessage::new("assistant", raw.clone()));
             let medicao = Medicao::novo(
                 prompt_tokens,
+                reused_tokens,
                 generated_tokens,
                 prompt_ms,
                 decode_ms,

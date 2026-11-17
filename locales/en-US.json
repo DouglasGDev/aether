@@ -36,7 +36,6 @@
   },
   "app": {
     "modelos": "Models",
-    "novaConversa": "New conversation",
     "servidores": "Servers",
     "grafo": "Show the wiring",
     "orbe": "Back to the core",
@@ -51,6 +50,7 @@
     "enviar": "Send",
     "parar": "Stop",
     "voz": "Voice",
+    "bancada": "Workbench",
     "ajusteFino": "Fine tuning"
   },
   "voz": {
@@ -114,6 +114,7 @@
     "sinais": "Signals",
     "aguardando": "Waiting for your decision",
     "tokens": "{saida} output tokens · {entrada} input",
+    "reaproveitados": "{n} input tokens reused",
     "foraDeContexto": "{n} old messages were left out of this reply",
     "codigoLinhas": "{n} lines",
     "codigoSemLinguagem": "code",
@@ -143,7 +144,6 @@
   },
   "servidores": {
     "titulo": "Servers",
-    "adicionar": "Add server",
     "remover": "Remove {nome}",
     "identificador": "Identifier",
     "nome": "Name",
@@ -531,6 +531,131 @@
     "cabecalho": "Available tools (call by qualified name):",
     "omitidas": "[{n} further tools omitted to fit the context budget; ask to list tools for a specific connector.]"
   },
+  "conversas": {
+    "titulo": "Chats",
+    "nova": "New chat",
+    "semTitulo": "Untitled",
+    "vazia": "No saved chats",
+    "mensagens": "{n} messages",
+    "renomear": "Rename",
+    "apagar": "Delete {nome}",
+    "abrir": "Open {nome}",
+    "mostrar": "Show chats",
+    "esconder": "Hide chats",
+    "limpar": "Clear this chat"
+  },
+  "runtime": {
+    "titulo": "Native runtime",
+    "instalar": "Install",
+    "cancelar": "Cancel",
+    "conferir": "Check hashes",
+    "recarregar": "Reload",
+    "pronto": "Ready",
+    "faltando": "Missing",
+    "baixando": "Downloading",
+    "extraindo": "Extracting",
+    "conferindo": "Checking",
+    "concluido": "Installed",
+    "falhou": "Failed",
+    "cancelado": "Cancelled",
+    "arquivos": "{n} files",
+    "pasta": "Folder",
+    "presente": "present",
+    "ausente": "absent",
+    "bate": "matches",
+    "diverge": "differs",
+    "esperado": "expected",
+    "medido": "measured",
+    "nadaFalta": "Nothing missing",
+    "faltaRuntime": "Native runtime incomplete",
+    "conferido": "Hashes match",
+    "naoConferido": "Hashes do not match"
+  },
+  "bancada": {
+    "titulo": "Workbench",
+    "rodar": "Run the bench",
+    "cancelar": "Stop",
+    "aprovado": "passed",
+    "reprovado": "failed",
+    "naoRodado": "did not run",
+    "executando": "Running",
+    "caso": {
+      "placa": "Engine on the card",
+      "runtime": "Runtime libraries",
+      "esquecer": "Forgetting between chats",
+      "prefixo": "Reusing the prefix",
+      "parada": "Where the answer stops",
+      "fluxo": "Streaming text"
+    },
+    "cancelado": "the bench was stopped before this case",
+    "semModelo": "no complete model on disk to run this case",
+    "casoDesconhecido": "the bench does not know the case {id}",
+    "textoQuebrado": "the answer came back with a replacement character",
+    "respostaVazia": "the answer came back empty",
+    "enchimento": "Bench filler line, meaningless to the conversation.",
+    "motor": {
+      "placa": "graphics card",
+      "processador": "processor"
+    },
+    "placa": {
+      "nenhuma": "no graphics card detected",
+      "semMotivo": "the card did not say why it refused"
+    },
+    "previsao": {
+      "inteira": "whole model on the card",
+      "dividida": "{camadas} of {total} layers on the card",
+      "sistema": "system memory only"
+    },
+    "runtime": {
+      "faltando": "libraries missing: {lista}",
+      "hashDivergente": "the content does not match this version's sums: {lista}"
+    },
+    "esquecer": {
+      "divergiu": "after forgetting the answer was different: {antes} / {depois}",
+      "naoEsqueceu": "the prefill reused the cache of the previous conversation"
+    },
+    "prefixo": {
+      "soNaPlaca": "prefix caching belongs to the card engine; the processor recomputes everything",
+      "cacheVelho": "the first round already came with {n} tokens from another conversation's cache",
+      "naoReaproveitou": "reused {reaproveitados} of {historico} input tokens",
+      "semRecorte": "the divergent round did not trim the cache: reused {reaproveitados} of {ocupadas}",
+      "alemDoPonto": "the divergent round reused past the point where the history changes: {reaproveitados} of {ocupadas} cells",
+      "recorteFeito": "trimmed by the memory",
+      "recorteRecusado": "refused by the model memory",
+      "recorteNada": "nothing to trim",
+      "divergiu": "saving the prefix changed the answer: {comCache} / {semCache}",
+      "naoAcelerou": "the cached prefill took {comCache} ms against {semCache} ms without it"
+    },
+    "parada": {
+      "vazou": "the conversation marker leaked into the answer",
+      "noTeto": "the answer cut at the token ceiling, not at the end of the sentence"
+    },
+    "fluxo": {
+      "divergiu": "the streamed text is not the final answer"
+    },
+    "medida": {
+      "motor": "engine",
+      "placa": "graphics card",
+      "cedido": "VRAM given up (MB)",
+      "previsao": "predicted placement",
+      "bibliotecas": "libraries",
+      "enchimento": "filler tokens",
+      "cacheOcupado": "cache cells in use",
+      "naoMedido": "not measured",
+      "reaproveitados": "reused",
+      "prompt": "input tokens",
+      "recorte": "trim",
+      "recorteDecisao": "trim decision",
+      "prefill": "prefill (ms)",
+      "vezes": "faster",
+      "poupados": "saved (ms)",
+      "paradasDoModelo": "model stop sequences",
+      "motivo": "reason it stopped",
+      "gerados": "tokens generated",
+      "caracteres": "characters",
+      "velocidade": "tokens/s"
+    }
+  },
   "erros": {
     "pedidoVazio": "empty request",
     "turnoEmAndamento": "a turn is already running",
@@ -719,9 +844,22 @@
     "vozArquivoNaoVeio": "could not download {arquivo}",
     "vozSemTamanhoNoCatalogo": "the catalog does not declare the size of {arquivo}",
     "vozFalhaPasta": "could not create the folder {pasta}",
-    "vozSemSystemRoot": "could not find the Windows folder to run the extractor",
-    "vozSemTar": "the Windows tar was not found in {caminho}",
-    "vozExtracaoFalhou": "could not extract {caminho}: {detalhe}",
+    "semSystemRoot": "could not find the Windows folder to run the extractor",
+    "semTar": "the Windows tar was not found in {caminho}",
+    "extracaoFalhou": "could not extract {caminho}: {detalhe}",
+    "runtimeEmCurso": "a runtime installation is already running",
+    "runtimeNadaEmCurso": "no runtime installation is running",
+    "nadaEmCurso": "nothing is running to stop",
+    "runtimeOperacaoNaoTerminou": "the runtime check did not finish: {detalhe}",
+    "runtimePacoteDesconhecido": "unknown runtime package {ids}",
+    "runtimePacote": "could not download the {nome} runtime",
+    "runtimeArquivoForaDoPacote": "{nome} is not inside the {pacote} package",
+    "runtimeHashDiverge": "{nome} is not the checked binary: expected {esperado}, measured {medido}",
+    "falhaSerializar": "could not serialize {caminho}: {detalhe}",
+    "conversaIdInvalido": "invalid chat id: {id}",
+    "conversaDesconhecida": "unknown chat {id}",
+    "conversaTituloVazio": "the chat title is empty",
+    "runtimeFalhaMover": "could not move {origem} to {destino}: {detalhe}",
     "vozExtracaoNaoTerminou": "the extraction did not finish: {detalhe}",
     "vozFaltouArquivo": "files were missing after the download: {arquivos}",
     "vozNaoApagouCache": "could not delete the downloaded package {caminho}",

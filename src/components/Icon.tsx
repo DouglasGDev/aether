@@ -40,6 +40,10 @@ const PATHS: Record<string, string> = {
   copiar: "M9 9.5h9.5V19H9V9.5ZM15.5 9.5V5H6v9.5h3",
   camadas:
     "M12 3 3.5 7.2 12 11.4l8.5-4.2L12 3ZM3.5 12 12 16.2l8.5-4.2M3.5 16.8 12 21l8.5-4.2",
+  conversa:
+    "M4 4.5h16v11.5H10.5L6 19.5v-3.5H4V4.5ZM8 8.5h8M8 12h5",
+  bancada:
+    "M5 3.5h14v17H5v-17Zm3 4.5 1.8 1.8 3.2-3.3m-5 6.5 1.8 1.8 3.2-3.3",
 };
 
 interface Props {

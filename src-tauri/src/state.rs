@@ -36,6 +36,17 @@ pub struct AppState {
     /// A voz do aplicativo: fala, escuta e as escolhas de `voz.json`. Vive atrás
     /// de um Arc porque a thread de fala e os comandos a leem ao mesmo tempo.
     pub voz: Arc<crate::voz::MotorVoz>,
+    /// Onde o aplicativo instala as DLLs que baixou. Entra na lista de procura
+    /// do carregador (`pastas_de_dll`), então o que é instalado aqui é o que o
+    /// motor abre no próximo carregamento — sem reiniciar o aplicativo.
+    pub runtime_dir: PathBuf,
+    /// O cancelador da instalação de runtime em curso, se houver. Um pacote por
+    /// vez: dois downloads escreveriam no mesmo `.part`.
+    pub runtime_job: Mutex<Option<Arc<AtomicBool>>>,
+    /// As conversas salvas: uma por arquivo, com um índice leve ao lado. O
+    /// buffer vivo (`AiRuntime::history`) é o da conversa ativa, e é ele que o
+    /// turno grava aqui quando termina.
+    pub conversas: Arc<crate::conversas::Conversas>,
 }
 
 /// Um modelo carregado: pesos, template e a ficha do catálogo que o escolheu.
@@ -319,6 +330,16 @@ impl AiRuntime {
 
     pub fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Manda o motor em memória esquecer o KV. Quem troca de conversa carrega
+    /// outro histórico: o cache da conversa anterior não é prefixo desta, e
+    /// deixá-lo ali seria o modelo continuando a conversa errada. Sem modelo
+    /// carregado não há o que esquecer.
+    pub fn esquecer(&self) {
+        if let Some(carregado) = self.loaded.lock().expect("motor envenenado").as_mut() {
+            carregado.engine.reset();
+        }
     }
 
     /// Os candidatos do roteador, cada um com o cabeçalho do próprio arquivo

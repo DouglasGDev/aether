@@ -180,6 +180,11 @@ pub struct Ggml {
     ler_agrupamento: unsafe extern "C" fn(*const c_void) -> c_int,
     memoria: unsafe extern "C" fn(*const c_void) -> *mut c_void,
     memoria_limpar: unsafe extern "C" fn(*mut c_void, bool),
+    /// `llama_memory_seq_rm(mem, llama_seq_id, llama_pos p0, llama_pos p1)`. Os
+    /// três inteiros são `int32_t` nesta build — medido no cabeçalho da release
+    /// (`typedef int32_t llama_pos;`), e não um detalhe de gosto: declará-los
+    /// como `int64_t` faria a biblioteca ler os bits errados da pilha.
+    memoria_seq_rm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int) -> bool,
     lote_de_um: unsafe extern "C" fn(*mut Token, c_int) -> Lote,
     decodificar: unsafe extern "C" fn(*mut c_void, Lote) -> c_int,
     codificar: unsafe extern "C" fn(*mut c_void, Lote) -> c_int,
@@ -286,6 +291,7 @@ impl Ggml {
                 ler_agrupamento: simbolo(&llama, "llama_pooling_type")?,
                 memoria: simbolo(&llama, "llama_get_memory")?,
                 memoria_limpar: simbolo(&llama, "llama_memory_clear")?,
+                memoria_seq_rm: simbolo(&llama, "llama_memory_seq_rm")?,
                 lote_de_um: simbolo(&llama, "llama_batch_get_one")?,
                 decodificar: simbolo(&llama, "llama_decode")?,
                 codificar: simbolo(&llama, "llama_encode")?,
@@ -576,6 +582,33 @@ impl Ggml {
         // memory slot". Os buffers em si não precisam de zeragem: o que decide
         // o aproveitamento de uma célula é o metadado, que aqui volta a vazio.
         unsafe { (self.memoria_limpar)(memoria, false) };
+    }
+
+    /// Apaga da posição `p0` em diante e guarda o prefixo `[0, p0)`. É o recorte
+    /// que deixa o começo de um prompt ser reaproveitado: o que vem depois da
+    /// divergência é de uma resposta que não continua nesta rodada.
+    ///
+    /// `false` é "este pedaço não pôde ser removido". Não é um acidente nem uma
+    /// recusa a tentar: é o que a release documenta ("Returns false if a partial
+    /// sequence cannot be removed") e o que foi medido nesta máquina com um
+    /// modelo híbrido de estado recorrente (`qwen35.ssm.*`) — a metade
+    /// recorrente da memória só desfaz o estado dentro dos instantâneos do
+    /// último lote, e um recorte 47 células atrás está fora deles. Quem chama
+    /// tem de esquecer tudo e prefilar do zero: seguir com um cache cujo
+    /// conteúdo ninguém sabe é continuar a conversa errada.
+    ///
+    /// O `seq_id` é 0 e não -1 pelo mesmo motivo medido em `limpar_cache`: esta
+    /// build tem `n_seq_max = 1` e rejeita o "qualquer sequência" do cabeçalho.
+    /// `p1 = -1` é o "até o fim" que o cabeçalho documenta.
+    ///
+    /// # Segurança
+    /// Invariante do chamador: `ctx` é um contexto vivo deste processo.
+    pub fn apagar_de(&self, ctx: *mut c_void, p0: usize) -> bool {
+        let memoria = unsafe { (self.memoria)(ctx) };
+        if memoria.is_null() {
+            return false;
+        }
+        unsafe { (self.memoria_seq_rm)(memoria, 0, p0 as c_int, -1) }
     }
 
     /// Carrega o GGUF de um adaptador **contra o modelo** que já está em

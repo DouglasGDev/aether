@@ -256,6 +256,75 @@ export interface AjustesGeracao {
   rodadas: number;
 }
 
+/// Um pacote do runtime nativo — as DLLs de que o motor e a voz dependem — nas
+/// pastas que o carregador procura. `completo` exige UMA pasta com o conjunto
+/// inteiro: a ggml.dll abre os próprios backends da pasta de onde foi carregada.
+export interface RuntimePacote {
+  id: string;
+  nome: string;
+  completo: boolean;
+  /// A pasta que atendeu ao conjunto, ou `null` quando nenhuma atendeu.
+  pasta: string | null;
+  faltando: string[];
+  arquivos: string[];
+  /// Tamanho exato do pacote oficial, conferido no fim do download.
+  bytesPacote: number;
+}
+
+/// Um arquivo conferido contra o SHA256SUMS.txt versionado. Presença não é
+/// integridade: `bateu` só é verdadeiro quando o hash medido é o esperado.
+export interface RuntimeConferido {
+  nome: string;
+  presente: boolean;
+  bateu: boolean;
+  medido: string;
+  esperado: string;
+}
+
+export interface RuntimeVeredito {
+  id: string;
+  conferido: boolean;
+  arquivos: RuntimeConferido[];
+}
+
+export type RuntimeEvento =
+  | { type: "iniciou"; id: string; totalBytes: number }
+  | {
+      type: "progresso";
+      id: string;
+      doneBytes: number;
+      totalBytes: number;
+      bytesPorSegundo: number;
+    }
+  | { type: "extraindo"; id: string }
+  | { type: "conferindo"; id: string }
+  | { type: "concluiu"; id: string }
+  | { type: "falhou"; id: string; erro: string }
+  | { type: "cancelou"; id: string };
+
+/// O veredito de um caso da bancada. `naoRodado` não é meio aprovado: é o caso
+/// que não tinha como rodar nesta máquina.
+export type BancadaEstado = "aprovado" | "reprovado" | "naoRodado";
+
+export interface BancadaMedida {
+  /// Chave de i18n: o motor devolve o valor, a tela traduz o rótulo.
+  rotulo: string;
+  valor: string;
+}
+
+export interface BancadaResultado {
+  id: string;
+  estado: BancadaEstado;
+  medidas: BancadaMedida[];
+  detalhe: string | null;
+  ms: number;
+}
+
+export type BancadaEvento =
+  | { type: "iniciou"; total: number; modelo: string | null }
+  | { type: "caso"; id: string }
+  | ({ type: "resultado" } & BancadaResultado);
+
 export interface AiStatus {
   models: ModelStatus[];
   loaded: string | null;
@@ -266,6 +335,7 @@ export interface AiStatus {
   busy: boolean;
   turns: number;
   downloading: string[];
+  runtime: RuntimePacote[];
 }
 
 export type ModelEvent =
@@ -302,9 +372,28 @@ export interface ChatMessage {
   tool_calls?: ToolCall[];
 }
 
+/// A ficha de uma conversa salva: o que a lista mostra. O histórico fica no
+/// arquivo dela e só entra na tela quando a conversa é aberta.
+export interface FichaConversa {
+  id: string;
+  /// Vazio até o primeiro pedido — ou até a pessoa nomear.
+  titulo: string;
+  criada: number;
+  atualizada: number;
+  mensagens: number;
+}
+
+export interface EstadoConversas {
+  ativa: string | null;
+  conversas: FichaConversa[];
+}
+
 /// O que o turno mediu. Vem do motor, soma das rodadas.
 export interface Medicao {
   promptTokens: number;
+  /// Tokens do prompt que o KV cache já tinha: não passaram pela placa nesta
+  /// rodada. Zero é um prefill inteiro.
+  reusedTokens: number;
   generatedTokens: number;
   promptMs: number;
   decodeMs: number;

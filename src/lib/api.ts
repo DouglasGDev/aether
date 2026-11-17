@@ -7,14 +7,17 @@ import type {
   AjustesGeracao,
   AjustesMemoria,
   AjustesVoz,
+  BancadaEvento,
   CallToolResult,
   ChatEvent,
   ChatMessage,
   Connector,
   EstadoAdaptadores,
+  EstadoConversas,
   EstadoLigacoes,
   EstadoMemoria,
   EstadoVoz,
+  FichaConversa,
   GrantedFolder,
   McpEvent,
   MemoriaEvento,
@@ -24,6 +27,9 @@ import type {
   Plano,
   Posicao,
   RespostaMemoria,
+  RuntimeEvento,
+  RuntimePacote,
+  RuntimeVeredito,
   ServerEvent,
   ServidorCatalogo,
   ToolInfo,
@@ -72,6 +78,12 @@ export const api = {
   chatReset: () => invoke<void>("chat_reset"),
   chatCancel: () => invoke<void>("chat_cancel"),
   chatSend: (text: string) => invoke<TurnOutcome>("chat_send", { text }),
+  conversasListar: () => invoke<EstadoConversas>("conversas_listar"),
+  conversaNova: () => invoke<EstadoConversas>("conversa_nova"),
+  conversaAbrir: (id: string) => invoke<ChatMessage[]>("conversa_abrir", { id }),
+  conversaRenomear: (id: string, titulo: string) =>
+    invoke<FichaConversa>("conversa_renomear", { id, titulo }),
+  conversaApagar: (id: string) => invoke<EstadoConversas>("conversa_apagar", { id }),
   grantedFolders: () => invoke<GrantedFolder[]>("granted_folders"),
   grantFolder: (caminho: string) =>
     invoke<GrantedFolder[]>("grant_folder", { caminho }),
@@ -118,6 +130,13 @@ export const api = {
     invoke<EstadoAdaptadores>("adaptador_adicionar", { caminho }),
   adaptadorApagar: (caminho: string) =>
     invoke<EstadoAdaptadores>("adaptador_apagar", { caminho }),
+  runtimeEstado: () => invoke<RuntimePacote[]>("runtime_estado"),
+  runtimeVerificar: () => invoke<RuntimeVeredito[]>("runtime_verificar"),
+  runtimeInstalar: (ids: string[]) => invoke<void>("runtime_instalar", { ids }),
+  runtimeCancelar: () => invoke<void>("runtime_cancelar"),
+  bancadaCasos: () => invoke<string[]>("bancada_casos"),
+  bancadaRodar: () => invoke<void>("bancada_rodar"),
+  bancadaParar: () => invoke<void>("bancada_cancelar"),
 };
 
 export function onVozEvent(
@@ -160,6 +179,22 @@ export function onMemoriaEvent(
   handler: (event: MemoriaEvento) => void,
 ): Promise<UnlistenFn> {
   return listen<MemoriaEvento>("memoria-evento", (event) =>
+    handler(event.payload),
+  );
+}
+
+export function onRuntimeEvent(
+  handler: (event: RuntimeEvento) => void,
+): Promise<UnlistenFn> {
+  return listen<RuntimeEvento>("runtime-evento", (event) =>
+    handler(event.payload),
+  );
+}
+
+export function onBancadaEvent(
+  handler: (event: BancadaEvento) => void,
+): Promise<UnlistenFn> {
+  return listen<BancadaEvento>("bancada-evento", (event) =>
     handler(event.payload),
   );
 }

@@ -103,6 +103,17 @@ export function data(milissegundos: number, idioma: string): string {
   }).format(new Date(milissegundos));
 }
 
+/// A data de uma conversa na lista: cabe numa linha estreita. O valor completo
+/// continua disponível no `title` da linha.
+export function dataCurta(milissegundos: number, idioma: string): string {
+  return new Intl.DateTimeFormat(idioma, {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(milissegundos));
+}
+
 /// Duração de comando: abaixo de um segundo o valor cru em milissegundos é mais
 /// útil que "0,0 s".
 export function duracao(ms: number, idioma: string): string {

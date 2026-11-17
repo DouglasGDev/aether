@@ -8,7 +8,7 @@ import {
   toolTitle,
 } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
-import type { Choice, Medicao, ToolInfo, Vista } from "../lib/types";
+import type { ChatMessage, Choice, Medicao, ToolInfo, Vista } from "../lib/types";
 import { Icon } from "./Icon";
 import { RichText } from "./RichText";
 import { ToolCard } from "./ToolCard";
@@ -50,6 +50,23 @@ export function emptyTurn(role: Turn["role"]): Turn {
     medicao: null,
     memoria: null,
   };
+}
+
+/// O histórico do núcleo como a conversa desenha. Só o que a pessoa pediu e o
+/// que o modelo respondeu: o prompt de sistema não é turno, e o resultado de
+/// uma ferramenta passada não tem veredito gravado — dizer que ela está
+/// "executando" agora seria inventar um estado que não existe.
+export function turnsDe(history: ChatMessage[]): Turn[] {
+  return history
+    .filter(
+      (entry) =>
+        (entry.role === "user" || entry.role === "assistant") &&
+        entry.content.trim() !== "",
+    )
+    .map((entry) => ({
+      ...emptyTurn(entry.role === "user" ? "user" : "assistant"),
+      text: entry.content,
+    }));
 }
 
 interface Props {
@@ -173,6 +190,13 @@ export function Conversation({ turns, aguardando }: Props) {
                     entrada: inteiro(turn.medicao.promptTokens, idioma),
                   })}
                 </span>
+                {turn.medicao.reusedTokens > 0 && (
+                  <span>
+                    {t("conversa.reaproveitados", {
+                      n: inteiro(turn.medicao.reusedTokens, idioma),
+                    })}
+                  </span>
+                )}
                 <span>
                   {t("conversa.ritmo", {
                     n: numero(turn.medicao.tokensPorSegundo, idioma, 1),

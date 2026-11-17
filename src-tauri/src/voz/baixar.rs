@@ -172,10 +172,11 @@ pub async fn baixar(
     Ok(())
 }
 
-/// Descompacta o pacote do sherpa na raiz dos modelos de voz. O `tar` do
-/// Windows lê `.tar.bz2` e repõe os trezentos e setenta e oito arquivos com os
-/// nomes que o modelo espera.
-fn extrair(archive: &Path, raiz: &Path) -> anyhow::Result<()> {
+/// Descompacta um pacote na raiz pedida. O `tar` que o Windows traz lê os dois
+/// formatos de que o aplicativo depende — o `.tar.bz2` do sherpa, que repõe os
+/// trezentos e setenta e oito arquivos com os nomes que o modelo espera, e o
+/// `.zip` do llama.cpp, de onde o runtime nativo tira as DLLs.
+pub(crate) fn extrair(archive: &Path, raiz: &Path) -> anyhow::Result<()> {
     let tar = caminho_do_tar()?;
     let mut programa = Command::new(&tar);
     programa
@@ -192,11 +193,11 @@ fn extrair(archive: &Path, raiz: &Path) -> anyhow::Result<()> {
     }
     let saida = programa
         .output()
-        .with_context(|| tr("erros.vozSemTar", &[("caminho", &tar.display().to_string())]))?;
+        .with_context(|| tr("erros.semTar", &[("caminho", &tar.display().to_string())]))?;
     if !saida.status.success() {
         let motivo = String::from_utf8_lossy(&saida.stderr).trim().to_string();
         bail!(tr(
-            "erros.vozExtracaoFalhou",
+            "erros.extracaoFalhou",
             &[
                 ("caminho", &archive.display().to_string()),
                 ("detalhe", motivo.as_str())
@@ -206,12 +207,12 @@ fn extrair(archive: &Path, raiz: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn caminho_do_tar() -> anyhow::Result<PathBuf> {
+pub(crate) fn caminho_do_tar() -> anyhow::Result<PathBuf> {
     let system_root =
-        std::env::var_os("SystemRoot").ok_or_else(|| anyhow!(tr("erros.vozSemSystemRoot", &[])))?;
+        std::env::var_os("SystemRoot").ok_or_else(|| anyhow!(tr("erros.semSystemRoot", &[])))?;
     let tar = Path::new(&system_root).join("System32").join("tar.exe");
     if !tar.is_file() {
-        bail!(tr("erros.vozSemTar", &[("caminho", &tar.display().to_string())]));
+        bail!(tr("erros.semTar", &[("caminho", &tar.display().to_string())]));
     }
     Ok(tar)
 }

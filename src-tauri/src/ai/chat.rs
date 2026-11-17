@@ -7,10 +7,10 @@ use crate::idiomas::tr;
 use anyhow::{Context, Result};
 use minijinja::value::{Kwargs, Serde};
 use minijinja::{Environment, Value};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -24,7 +24,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: serde_json::Value,

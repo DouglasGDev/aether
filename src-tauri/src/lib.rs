@@ -1,12 +1,15 @@
 pub mod ai;
+pub mod bancada;
 pub mod commands;
 pub mod config;
 pub mod connectors;
+pub mod conversas;
 pub mod idiomas;
 pub mod ligacoes;
 pub mod local;
 pub mod mcp;
 pub mod permissions;
+pub mod runtime;
 pub mod state;
 pub mod voz;
 
@@ -35,6 +38,7 @@ pub fn run() {
             // A mesma lista serve os dois motores nativos: é ao lado do
             // executável que `build.rs` publica a ggml e a sherpa-onnx.
             let dlls = pastas_de_dll(app);
+            let runtime_dir = runtime::pasta(&app.path().app_local_data_dir()?);
             let geracao_path = app.path().app_config_dir()?.join("geracao.json");
             let adaptadores_path = app.path().app_config_dir()?.join("adaptadores.json");
             let ai = Arc::new(state::AiRuntime::new(
@@ -42,6 +46,9 @@ pub fn run() {
                 dlls.clone(),
                 geracao_path,
                 adaptadores_path,
+            ));
+            let conversas = Arc::new(conversas::Conversas::novo(
+                app.path().app_config_dir()?.join("conversas"),
             ));
             let servidores_root = app.path().app_local_data_dir()?.join("mcp-servers");
             let ligacoes_path = app.path().app_config_dir()?.join("ligacoes.json");
@@ -86,6 +93,9 @@ pub fn run() {
                 instalacoes: mcp::instalador::Instalacoes::novo(),
                 ligacoes_path,
                 voz,
+                runtime_dir,
+                runtime_job: Mutex::new(None),
+                conversas,
             });
 
             let handle = app.handle().clone();
@@ -158,6 +168,11 @@ pub fn run() {
             commands::chat_reset,
             commands::chat_cancel,
             commands::chat_send,
+            commands::conversas_listar,
+            commands::conversa_nova,
+            commands::conversa_abrir,
+            commands::conversa_renomear,
+            commands::conversa_apagar,
             commands::voz_estado,
             commands::voz_medidor,
             commands::voz_ajustar,
@@ -180,6 +195,13 @@ pub fn run() {
             commands::adaptadores_ajustar,
             commands::adaptador_adicionar,
             commands::adaptador_apagar,
+            commands::runtime_estado,
+            commands::runtime_verificar,
+            commands::runtime_instalar,
+            commands::runtime_cancelar,
+            commands::bancada_casos,
+            commands::bancada_rodar,
+            commands::bancada_cancelar,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aether");
@@ -190,12 +212,20 @@ pub fn run() {
 /// o `build.rs` as publica, que é como o `cargo tauri dev` e o instalador as
 /// distribui, e na pasta de recursos do pacote. A ordem importa — a primeira que
 /// existir vence, e é dela que o `onnxruntime.dll` tem de vir junto.
+///
+/// A pasta do runtime baixado pelo aplicativo entra no meio: num PC onde o
+/// instalador não levou as DLLs, é ela que atende, e o conjunto tem de estar
+/// inteiro numa pasta só — a `ggml.dll` carrega os próprios backends da pasta de
+/// onde foi aberta.
 fn pastas_de_dll(app: &tauri::App) -> Vec<PathBuf> {
     let mut pastas = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(pai) = exe.parent() {
             pastas.push(pai.to_path_buf());
         }
+    }
+    if let Ok(dados) = app.path().app_local_data_dir() {
+        pastas.push(runtime::pasta(&dados));
     }
     if let Ok(recursos) = app.path().resource_dir() {
         pastas.push(recursos);

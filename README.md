@@ -21,7 +21,12 @@ e decide entre carga inteira na placa, camada a camada dividida com a RAM, ou s�
 sistema; o veredito vira `n_gpu_layers` e é conferido contra o delta real de
 VRAM que a carga produz.
 
-Os binários do llama.cpp e do sherpa-onnx não estão no repositório. Veja
+Os binários do llama.cpp e do sherpa-onnx não estão no repositório: são 46 MB de
+pacotes de outros projetos. **O aplicativo instala o runtime sozinho** — a tela
+*Runtime nativo* baixa o pacote oficial da revisão presa, confere o SHA256 de
+cada arquivo contra o `SHA256SUMS.txt` versionado e só então põe tudo em
+`%LOCALAPPDATA%` do aplicativo, numa pasta que o carregador procura. Nada é
+movido se um hash divergir. Veja
 [`src-tauri/vendor/README.md`](src-tauri/vendor/README.md).
 
 ## O que ele faz
@@ -55,11 +60,40 @@ Os binários do llama.cpp e do sherpa-onnx não estão no repositório. Veja
   vetorial com fusão), peças com sobreposição e piso de similaridade. A injeção
   automática e a ferramenta `buscar_memoria` obedecem ao mesmo fio do grafo.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
+- **Conversas salvas** — várias conversas no disco, com barra lateral: criar,
+  trocar, renomear e apagar (com confirmação em dois cliques). Trocar de conversa
+  esquece o KV: a conversa seguinte não herda o estado da anterior. O índice e as
+  mensagens ficam em `%APPDATA%\ai.aether.core\conversas` e voltam onde estavam
+  depois de fechar e abrir o aplicativo.
+- **Bancada** — uma suíte de seis casos que roda dentro do aplicativo, contra o
+  modelo carregado e a placa real, e mede cada um: motor na placa, bibliotecas do
+  runtime, esquecimento do KV entre conversas, reaproveitamento do prefixo, parada
+  da resposta e texto em fluxo. Cada caso traz suas medidas e um veredito
+  aprovado/reprovado; nenhum caso é aprovado por suposição — ele aprova o que o
+  motor devolveu naquela rodada. A bancada não começa com um turno de conversa em
+  curso, e o botão *Parar* dela usa o mesmo interruptor de cancelamento do chat.
 - **Grafo** — a tela de ligações é a forma de editar a política (quais
   conectores, quais ferramentas, quais pastas). O desenho não é a política: o
   núcleo cobra `mcp.json` e `pastas.json` em cada chamada.
-- **Medidas visíveis** — tokens de entrada e saída, tokens/s de prefill e decode,
-  tempo no motor, motivo de parada e quantas mensagens ficaram fora da janela.
+- **Eficiência do KV** — o prompt de uma rodada de ferramenta é o da anterior mais
+  o resultado dela, e o cache só precisa continuar de onde o histórico muda. A
+  placa recorta as células depois da divergência (`llama_memory_seq_rm`, com a
+  recusa da memória tratada como medida, não como erro) e prefila o resto. Medido
+  na bancada, no mesmo aplicativo: 113 de 153 tokens de entrada reaproveitados,
+  prefill de 30 ms contra 67 ms com o cache esquecido. Numa conversa real, o
+  turno mostrou 2.034 dos 2.467 tokens de entrada já calculados — 433 tokens
+  novos.
+- **Medidas visíveis** — tokens de entrada e saída, quantos deles vieram do cache,
+  tokens/s de prefill e decode, tempo no motor, motivo de parada e quantas
+  mensagens ficaram fora da janela.
+- **Runtime nativo** — as DLLs de que o motor e a voz dependem não são um passo
+  manual: o aplicativo baixa o pacote oficial (llama.cpp b12387 Vulkan, 38.119.681
+  bytes; sherpa-onnx 1.13.8, 8.032.957 bytes), confere arquivo por arquivo contra
+  as somas versionadas e instala na pasta de dados. A tela mostra o que falta em
+  cada pasta procurada, o progresso real do download e o veredito de cada hash —
+  medido e esperado lado a lado. Um pacote incompleto acende uma faixa na janela
+  principal, porque num PC novo era exatamente aí que o download dos pesos
+  terminava e a inferência não abria.
 
 Todo texto da interface vem de `locales/pt-BR.json` e `locales/en-US.json`, e um
 teste de suíte exige que as duas línguas tenham exatamente as mesmas chaves e os
@@ -68,9 +102,10 @@ mesmos placeholders.
 ## Rodar
 
 Pré-requisitos: Windows 10+, Rust (stable), Node 20+ e WebView2 Runtime. As DLLs
-vendorizadas (link acima) não são pré-requisito para compilar — sem elas o build
-avisa e segue; elas são pré-requisito para a inferência rodar na placa e para o
-instalador levá-las.
+vendorizadas (link acima) não são pré-requisito para compilar nem para rodar: sem
+elas o build avisa e segue, e o aplicativo as instala pela tela *Runtime nativo*.
+Colocá-las em `src-tauri/vendor/*/lib/` antes de empacotar ainda é o que faz o
+instalador levá-las — aí o usuário não baixa nada na primeira execução.
 
 ```sh
 npm install
@@ -88,7 +123,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 355 testes
+cd src-tauri && cargo test --lib     # 392 testes
 npm run build                        # tsc + vite
 ```
 
@@ -105,13 +140,18 @@ Uma sonda separada carrega pesos reais e mede o motor:
 cd src-tauri && cargo run --bin engine-probe -- <pasta-do-modelo> <arquivo.gguf> [contexto] [max_tokens] [prompt]
 ```
 
+O mesmo conjunto de verificações, feito dentro do aplicativo e contra o modelo
+carregado, é a tela **Bancada** — seis casos, um veredito medido por caso.
+
 ## Estrutura
 
 ```
 src/                 interface React + TypeScript
-  components/        conversa, catálogo de modelos, conectores, grafo, memória, voz
+  components/        conversa, barra de conversas, catálogo de modelos, conectores,
+                     grafo, memória, voz, bancada
 src-tauri/src/       núcleo Rust
   ai/                motor, catálogo, download, alojamento, roteador, sessão, memória
+  bancada.rs         os seis casos medidos dentro do aplicativo
   mcp/               cliente MCP, catálogo instalável, gate de aprovação
   local/             ferramentas locais e contenção de pastas
   voz/               fala (Kokoro) e escuta (Whisper)
@@ -122,9 +162,10 @@ src-tauri/vendor/    cabeçalhos, licenças e somas dos binários de terceiros
 ## Estado em disco
 
 O aplicativo grava em `%APPDATA%\ai.aether.core` (ajustes, conectores,
-allowlists, pastas concedidas, grafo, voz, RAG) e em
-`%LOCALAPPDATA%\ai.aether.core\models` (pesos e índice). Nenhum desses arquivos
-sai da máquina.
+allowlists, pastas concedidas, grafo, voz, RAG), em
+`%APPDATA%\ai.aether.core\conversas` (o índice e as mensagens de cada conversa) e
+em `%LOCALAPPDATA%\ai.aether.core\models` (pesos, índice e os pacotes de runtime
+instalados). Nenhum desses arquivos sai da máquina.
 
 ## Limites conhecidos
 
@@ -137,6 +178,13 @@ sai da máquina.
 - O caminho de CPU executa só granite, porque é uma implementação própria em
   candle. Numa máquina sem GPU, as outras famílias do catálogo não carregam, e o
   aplicativo diz qual arquitetura pediu o quê em vez de falhar mudo.
+- Recortar o KV no meio do histórico depende do tipo de memória do modelo. Num
+  híbrido com estado recorrente — o Ornith 1.5 9B é um — a metade recorrente só
+  desfaz dentro dos instantâneos do último lote, e `llama_memory_seq_rm` devolve
+  `false` para um recorte no meio (medido na bancada: 136 células → recusa → 0
+  reaproveitados). Nesses modelos a rodada divergente prefila inteira, como faz o
+  llama.cpp; o reaproveitamento do prefixo puro continua valendo. Num modelo de
+  atenção pura (Granite 4.2 3B) o recorte acontece e é medido.
 - Adaptadores LoRA/QLoRA por turno estão em construção; o que existe hoje é o
   catálogo GGUF, o roteador e a montagem de contexto.
 - Janela e teto de tokens são escalas do usuário. Quando o pedido não cabe nem

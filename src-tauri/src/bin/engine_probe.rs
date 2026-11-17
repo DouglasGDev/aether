@@ -2,7 +2,7 @@
 //!
 //! uso: engine-probe <dir-do-modelo> <arquivo.gguf> [contexto] [max_tokens] [prompt]
 
-use aether_lib::ai::{ChatMessage, ChatTemplate, Emission, Engine, SamplingParams, ToolSpec};
+use aether_lib::ai::{ChatMessage, ChatTemplate, Emission, Engine, Generation, SamplingParams, ToolSpec};
 use anyhow::Context;
 use std::io::Write;
 use std::path::PathBuf;
@@ -83,6 +83,12 @@ fn main() -> anyhow::Result<()> {
     // recarregar nada. É a miniatura do segundo turno de uma conversa real.
     if let Some(path) = prompt.strip_prefix("esquecer:") {
         return dois_turnos(&dir, &weights, context, max_tokens, path);
+    }
+    // O reaproveitamento do prefixo do KV, medido contra o defeito que ele
+    // corrige: dois braços, um com o cache vivo entre rodadas e outro esquecendo
+    // tudo antes de cada geração.
+    if let Some(path) = prompt.strip_prefix("prefixo:") {
+        return prefixo_reutilizado(&dir, &weights, context, max_tokens, path);
     }
     // O veredito de alojamento previsto, contra o delta de VRAM que a carga real
     // produz. `alojar:` traz as janelas separadas por vírgula.
@@ -1299,4 +1305,204 @@ fn dois_turnos(
             std::process::exit(1);
         }
     }
+}
+
+/// O prefixo do KV reaproveitado entre rodadas, medido contra o defeito.
+///
+/// Dois braços exclusivos sobre a mesma janela carregada: o braço A deixa o
+/// cache viver de uma rodada para a outra (o produto), o braço B esquece tudo
+/// antes de cada geração (o comportamento anterior, que re-prefilava o histórico
+/// inteiro a cada rodada de ferramenta). A amostragem é argmax, então os dois
+/// braços têm de devolver o mesmo texto: se o recorte do cache mudasse a
+/// resposta, o tempo poupado seria mentira. O que se compara é o prefill da
+/// segunda rodada, que nos dois braços já encontra a placa quente.
+///
+/// A segunda rodada é a de uma ferramenta de verdade: o prompt da primeira, mais
+/// a resposta do modelo, mais o resultado que voltou. É esse começo igual que a
+/// placa já calculou e que não precisa calcular outra vez.
+fn prefixo_reutilizado(
+    dir: &PathBuf,
+    weights: &str,
+    context: usize,
+    max_tokens: usize,
+    path: &str,
+) -> anyhow::Result<()> {
+    let mut engine = Engine::load("ggml", dir, weights, context, &dlls())?;
+    let acelerador = engine.acelerador();
+    println!(
+        "carga: {} | backend={} dispositivo={:?} janela={}",
+        weights, acelerador.tipo, acelerador.dispositivo, engine.context()
+    );
+    if acelerador.tipo != "gpu" {
+        eprintln!("prefixo: o recorte de cache é do caminho ggml; no candle o prefill é inteiro");
+        std::process::exit(2);
+    }
+
+    let base = std::fs::read_to_string(path).context("falha ao ler o prompt")?;
+    let janela = engine.context();
+    let alvo = janela.saturating_sub(2 * max_tokens + 256).max(64);
+    let mut historico = String::new();
+    let mut blocos = 0usize;
+    while engine.count_tokens(&historico)? < alvo {
+        historico.push_str(base.trim_end());
+        historico.push('\n');
+        blocos += 1;
+    }
+    let pergunta1 = format!("{historico}\nPergunta: qual é a capital do Brasil?");
+    println!(
+        "histórico: {} blocos de {} bytes = {} tokens (alvo {}, janela {})",
+        blocos, base.len(), engine.count_tokens(&historico)?, alvo, janela
+    );
+
+    let params = SamplingParams { max_tokens, temperature: 0.0, ..SamplingParams::default() };
+    let stop = [concat!("<", "|im_start|>").to_string()];
+    let cancel = AtomicBool::new(false);
+
+    let ids_de = |engine: &Engine, texto: &str| -> anyhow::Result<Vec<u32>> {
+        Ok(engine
+            .tokenizer()
+            .encode(texto, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .get_ids()
+            .to_vec())
+    };
+    let medir = |engine: &mut Engine, ids: &[u32], rotulo: &str| -> anyhow::Result<Generation> {
+        let g = engine.generate(ids, &params, &stop, &cancel, |_| {})?;
+        println!(
+            "{rotulo}: prompt={} reaproveitados={} calculados={} em {}ms ({:.1} t/s) | gerados={} em {}ms ({:.2} t/s) | parada={:?} | resposta={:?}{}",
+            g.prompt_tokens,
+            g.reused_tokens,
+            g.prompt_tokens - g.reused_tokens,
+            g.prompt_ms,
+            g.prefill_tokens_per_second(),
+            g.generated_tokens,
+            g.decode_ms,
+            g.decode_tokens_per_second(),
+            g.stop,
+            g.text.chars().take(80).collect::<String>(),
+            if g.text.contains('\u{fffd}') { " | TEM CARACTERE DE SUBSTITUIÇÃO" } else { "" },
+        );
+        Ok(g)
+    };
+    let cabe = |ids: &[u32], rodada: usize| -> anyhow::Result<()> {
+        if ids.len() + max_tokens >= janela {
+            anyhow::bail!(
+                "a rodada {rodada} não cabe: {} tokens + {} gerados numa janela de {}",
+                ids.len(), max_tokens, janela
+            );
+        }
+        Ok(())
+    };
+
+    let ids1 = ids_de(&engine, &pergunta1)?;
+    cabe(&ids1, 1)?;
+    println!("\n=== braço A: o cache vive entre as rodadas ===");
+    let a1 = medir(&mut engine, &ids1, "A rodada 1")?;
+    let pergunta2 = format!(
+        "{pergunta1}{}\nResultado da ferramenta: arquivo gravado.\nPergunta: e a capital da França?",
+        a1.text
+    );
+    let ids2 = ids_de(&engine, &pergunta2)?;
+    cabe(&ids2, 2)?;
+    let a2 = medir(&mut engine, &ids2, "A rodada 2")?;
+    // Lido do motor, não calculado por fora: o que a rodada 3 pode reaproveitar
+    // são as células que ele mesmo declara ocupadas. Somar ids + gerados seria
+    // o meu palpite sobre o KV, e um palpite não serve de régua.
+    let cache_apos_2 = engine.cache_ocupado().unwrap_or(ids2.len() + a2.generated_tokens);
+    // A rodada que diverge no meio do histórico: o resultado da ferramenta é
+    // outro. Aqui o cache tem de ser recortado a partir da divergência — é o
+    // caminho do `seq_rm`, e sem ele a posição automática continuaria depois do
+    // rabo velho. A rodada 2 sozinha não prova isso: ela é prefixo inteiro do
+    // cache e nenhum recorte acontece.
+    let pergunta3 = format!(
+        "{pergunta1}{}\nResultado da ferramenta: ERRO, pasta não concedida.\nPergunta: e a capital do Japão?",
+        a1.text
+    );
+    let ids3 = ids_de(&engine, &pergunta3)?;
+    cabe(&ids3, 3)?;
+    let a3 = medir(&mut engine, &ids3, "A rodada 3 (diverge)")?;
+
+    println!("\n=== braço B: esquece tudo antes de cada rodada (o defeito) ===");
+    engine.reset();
+    let b1 = medir(&mut engine, &ids1, "B rodada 1")?;
+    engine.reset();
+    let b2 = medir(&mut engine, &ids2, "B rodada 2")?;
+    engine.reset();
+    let b3 = medir(&mut engine, &ids3, "B rodada 3 (diverge)")?;
+
+    let mut falhas: Vec<String> = Vec::new();
+    let curta = |t: &str| t.chars().take(60).collect::<String>();
+    if a1.reused_tokens != 0 {
+        falhas.push(format!("a primeira rodada reaproveitou {} tokens de antes da carga", a1.reused_tokens));
+    }
+    for (n, a, b) in [(1usize, &a1, &b1), (2, &a2, &b2), (3, &a3, &b3)] {
+        if a.text != b.text {
+            falhas.push(format!(
+                "A RODADA {n} DIVERGIU entre os braços: o cache mudou a resposta. A={:?} B={:?}",
+                curta(&a.text), curta(&b.text)
+            ));
+        }
+        if a.text.contains('\u{fffd}') || b.text.contains('\u{fffd}') {
+            falhas.push(format!("a rodada {n} tem caractere de substituição"));
+        }
+        if b.reused_tokens != 0 {
+            falhas.push(format!("o braço B reaproveitou {} tokens na rodada {n}: ele não é o defeito", b.reused_tokens));
+        }
+    }
+    if a2.reused_tokens < ids1.len() / 2 {
+        falhas.push(format!(
+            "o braço A reaproveitou {} de {} tokens do histórico: não é o prefixo que está sendo poupado",
+            a2.reused_tokens, ids1.len()
+        ));
+    }
+    if a3.reused_tokens >= cache_apos_2 {
+        falhas.push(format!(
+            "a rodada 3 reaproveitou além do ponto de divergência: {} de {} células ocupadas",
+            a3.reused_tokens, cache_apos_2
+        ));
+    } else if !a3.recorte_recusado && a3.reused_tokens == 0 {
+        falhas.push(format!(
+            "a rodada 3 não recortou o cache: reaproveitou {} de {} células que estavam ocupadas",
+            a3.reused_tokens, cache_apos_2
+        ));
+    }
+    for (n, a, b) in [(2usize, &a2, &b2), (3, &a3, &b3)] {
+        // A rodada 3 só tem de ser mais rápida se o recorte aconteceu. Quando a
+        // memória do modelo recusa o recorte — um híbrido com estado recorrente
+        // só desfaz dentro dos instantâneos do último lote — os dois braços
+        // prefila tudo e a igualdade é o resultado correto, não um defeito.
+        if a.recorte_recusado && n == 3 {
+            println!("rodada 3: a memória recusou o recorte (devolveu false) → prefill inteiro nos dois braços");
+            continue;
+        }
+        if a.prompt_ms >= b.prompt_ms {
+            falhas.push(format!(
+                "o prefill da rodada {n} não acelerou: A={}ms B={}ms", a.prompt_ms, b.prompt_ms
+            ));
+        }
+    }
+
+    println!("\n=== veredito ===");
+    for (n, ids, a, b) in [(2usize, &ids2, &a2, &b2), (3, &ids3, &a3, &b3)] {
+        println!(
+            "rodada {n}: {} tokens de prompt | A reaproveitou {} e calculou {} em {}ms | B calculou {} em {}ms | {:.2}x | {}ms poupados",
+            ids.len(),
+            a.reused_tokens,
+            a.prompt_tokens - a.reused_tokens,
+            a.prompt_ms,
+            b.prompt_tokens - b.reused_tokens,
+            b.prompt_ms,
+            b.prompt_ms as f64 / a.prompt_ms.max(1) as f64,
+            b.prompt_ms.saturating_sub(a.prompt_ms),
+        );
+    }
+    println!("recorte da rodada 3: {} células ocupadas, prefixo guardado até {}", cache_apos_2, a3.reused_tokens);
+    if !falhas.is_empty() {
+        for f in &falhas {
+            eprintln!("prefixo: FALHOU — {f}");
+        }
+        std::process::exit(1);
+    }
+    println!("prefixo: OK — mesma resposta nos dois braços, prefill menor, e o braço do defeito medido ao lado");
+    Ok(())
 }

@@ -36,6 +36,9 @@ encoding_rs = "0.8"
 cpal = "0.18.2"
 ringbuf = "0.6.0"
 libloading = "0.9.1"
+# O instalador de runtime confere cada DLL contra o SHA256SUMS.txt versionado
+# antes de pô-la no lugar: sem isto o aplicativo carregaria binário não conferido.
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
