@@ -464,6 +464,10 @@
     "infoSistema": {
       "titulo": "System information",
       "descricao": "Shows the operating system, processor, memory, and disk space. Read-only."
+    },
+    "criarMcpLocal": {
+      "titulo": "Open a local MCP connection",
+      "descricao": "Publishes the Aether tools as an MCP server on the app local address and connects Aether itself to it. Nothing listens outside the machine, and every call goes through approval."
     }
   },
   "argumentos": {
@@ -592,6 +596,7 @@
     "caso": {
       "placa": "Engine on the card",
       "runtime": "Runtime libraries",
+      "mcp": "Local MCP connection",
       "esquecer": "Forgetting between chats",
       "prefixo": "Reusing the prefix",
       "parada": "Where the answer stops",
@@ -620,6 +625,12 @@
     "runtime": {
       "faltando": "libraries missing: {lista}",
       "hashDivergente": "the content does not match this version's sums: {lista}"
+    },
+    "mcp": {
+      "semPonte": "the bench could not talk to the running app",
+      "semResposta": "the published port did not answer",
+      "abriuSemSegredo": "an unkeyed request got in: the port answered {status}",
+      "anuncioFalso": "the client received {anunciadas} of {esperadas} tools"
     },
     "esquecer": {
       "divergiu": "after forgetting the answer was different: {antes} / {depois}",
@@ -673,7 +684,11 @@
       "velocidade": "tokens/s",
       "janela": "engine window",
       "limite": "prompt limit",
-      "dobras": "folds made"
+      "dobras": "folds made",
+      "porta": "port",
+      "anunciadas": "tools announced",
+      "catalogo": "catalogue tools",
+      "semSegredo": "unguarded request"
     }
   },
   "erros": {
@@ -914,6 +929,23 @@
     "adaptadorForaDaPasta": "{caminho} is not a file of the adapters folder",
     "adaptadorNaoApagou": "could not delete {caminho}",
     "adaptadorOperacaoNaoTerminou": "the adapter operation did not finish: {detalhe}",
-    "turnoEmAndamentoAdaptador": "a turn is running; wait for it to finish to change adapters"
+    "turnoEmAndamentoAdaptador": "a turn is running; wait for it to finish to change adapters",
+    "servidorMcpOuvir": "could not listen on the loopback adapter: {detalhe}",
+    "servidorMcpPorta": "could not read the MCP server port",
+    "servidorMcpParar": "the MCP server did not stop",
+    "servidorMcpToken": "could not draw the MCP server token: {detalhe}"
+  },
+  "servidorMcp": {
+    "nome": "Aether (local MCP)",
+    "descricao": "The Aether tools themselves — files, terminal, memory and system — served over the MCP protocol on a local address.",
+    "instrucoes": "This server is the Aether tool set itself. Every call goes through the app permission gate: whatever the machine owner does not approve does not run.",
+    "publicada": "MCP connection open at {url} with {ferramentas} tools.",
+    "estado": "Local MCP connection",
+    "servindo": "Serving",
+    "parada": "Stopped",
+    "abrir": "Open connection",
+    "fechar": "Close connection",
+    "endereco": "Address",
+    "token": "Token"
   }
 }

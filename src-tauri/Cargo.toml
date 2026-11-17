@@ -20,8 +20,22 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-rmcp = { version = "3.10", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.10", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "transport-streamable-http-server"] }
 tokio = { version = "1.53.3", features = ["full"] }
+# O servidor MCP que o próprio aplicativo publica fala Streamable HTTP na placa
+# de retorno. `hyper` é quem aceita a conexão TCP e fala HTTP/1.1; o serviço do
+# rmcp chega como um `tower_service::Service`, que é o traço que o hyper serve.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower-service = "0.3"
+http-body-util = "0.1"
+bytes = "1"
+# O cancelador do laço de aceitação: fechar o servidor é mandar o laço sair e
+# esperar a tarefa, não abandonar a porta aberta com um token solto por aí.
+tokio-util = "0.7"
+# O token do servidor é aleatório de verdade, e vem do gerador do sistema: um
+# endpoint que escreve arquivos na máquina não pode ser adivinhado por vizinho.
+getrandom = "0.4"
 anyhow = "1.0.104"
 http = "1.5.0"
 candle = { package = "candle-core", version = "0.11.1" }

@@ -122,6 +122,14 @@ export interface ServidorCatalogo {
   ferramentas: number;
 }
 
+/** O servidor MCP que o próprio aplicativo publica, lido do `Publicador`. */
+export interface ServidorMcpEstado {
+  ativa: boolean;
+  url: string;
+  porta: number;
+  ferramentas: number;
+}
+
 export type ServerEvent =
   | { type: "iniciou"; id: string; instalando: boolean }
   | { type: "linha"; id: string; texto: string }

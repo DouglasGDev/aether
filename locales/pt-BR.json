@@ -464,6 +464,10 @@
     "infoSistema": {
       "titulo": "Informações do sistema",
       "descricao": "Mostra o sistema operacional, o processador, a memória e o espaço em disco. Apenas leitura."
+    },
+    "criarMcpLocal": {
+      "titulo": "Abrir conexão MCP local",
+      "descricao": "Publica as ferramentas do Aether como um servidor MCP no endereço local do aplicativo e conecta o próprio Aether nele. Nada escuta fora da máquina, e cada chamada passa pela aprovação."
     }
   },
   "argumentos": {
@@ -592,6 +596,7 @@
     "caso": {
       "placa": "Motor na placa",
       "runtime": "Bibliotecas do runtime",
+      "mcp": "Conexão MCP local",
       "esquecer": "Esquecer ao trocar de conversa",
       "prefixo": "Reaproveitar o prefixo",
       "parada": "Parada da resposta",
@@ -620,6 +625,12 @@
     "runtime": {
       "faltando": "faltam bibliotecas: {lista}",
       "hashDivergente": "o conteúdo não bate com a soma desta versão: {lista}"
+    },
+    "mcp": {
+      "semPonte": "a bancada não conseguiu falar com a aplicação",
+      "semResposta": "a porta publicada não respondeu",
+      "abriuSemSegredo": "um pedido sem token entrou: a porta respondeu {status}",
+      "anuncioFalso": "o cliente recebeu {anunciadas} ferramentas de {esperadas}"
     },
     "esquecer": {
       "divergiu": "depois de esquecer a resposta foi outra: {antes} / {depois}",
@@ -673,7 +684,11 @@
       "velocidade": "tokens/s",
       "janela": "janela do motor",
       "limite": "limite do prompt",
-      "dobras": "dobras feitas"
+      "dobras": "dobras feitas",
+      "porta": "porta",
+      "anunciadas": "ferramentas anunciadas",
+      "catalogo": "ferramentas do catálogo",
+      "semSegredo": "pedido sem token"
     }
   },
   "erros": {
@@ -914,6 +929,23 @@
     "adaptadorForaDaPasta": "{caminho} não é um arquivo da pasta dos adaptadores",
     "adaptadorNaoApagou": "não consegui apagar {caminho}",
     "adaptadorOperacaoNaoTerminou": "a operação do adaptador não terminou: {detalhe}",
-    "turnoEmAndamentoAdaptador": "há um turno em andamento; espere terminar para mexer nos adaptadores"
+    "turnoEmAndamentoAdaptador": "há um turno em andamento; espere terminar para mexer nos adaptadores",
+    "servidorMcpOuvir": "não foi possível ouvir a placa de retorno: {detalhe}",
+    "servidorMcpPorta": "não foi possível ler a porta do servidor MCP",
+    "servidorMcpParar": "o servidor MCP não parou",
+    "servidorMcpToken": "não foi possível sortear o token do servidor MCP: {detalhe}"
+  },
+  "servidorMcp": {
+    "nome": "Aether (MCP local)",
+    "descricao": "As ferramentas do próprio Aether — arquivos, terminal, memória e sistema — servidas pelo protocolo MCP num endereço local.",
+    "instrucoes": "Este servidor são as ferramentas do próprio Aether. Cada chamada passa pelo gate de permissões do aplicativo: o que o dono da máquina não aprova não roda.",
+    "publicada": "Conexão MCP aberta em {url} com {ferramentas} ferramentas.",
+    "estado": "Conexão MCP local",
+    "servindo": "Servindo",
+    "parada": "Parada",
+    "abrir": "Abrir conexão",
+    "fechar": "Fechar conexão",
+    "endereco": "Endereço",
+    "token": "Token"
   }
 }

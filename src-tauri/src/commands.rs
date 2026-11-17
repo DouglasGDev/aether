@@ -14,7 +14,7 @@ use crate::local::{self, pastas::Pastas};
 use crate::mcp::catalog::CatalogBudget;
 use crate::mcp::instalador::{self, ServidorEvent};
 use crate::mcp::manager::McpManager;
-use crate::mcp::tool::ToolInfo;
+use crate::mcp::{servidor, tool::ToolInfo};
 use crate::permissions::{AgentMode, ToolEffect};
 use crate::runtime;
 use crate::state::{AiRuntime, AppState};
@@ -49,7 +49,7 @@ pub fn list_connectors(state: State<'_, AppState>) -> Vec<Connector> {
 
 #[tauri::command]
 pub fn save_connector(state: State<'_, AppState>, connector: Connector) -> Result<(), String> {
-    if connector.id == local::CONECTOR {
+    if connector.id == local::CONECTOR || connector.id == servidor::CONECTOR {
         return Err(tr("erros.conectorReservado", &[("id", &connector.id)]));
     }
     let mut config = state.config.lock().expect("config lock poisoned");
@@ -64,6 +64,11 @@ pub fn save_connector(state: State<'_, AppState>, connector: Connector) -> Resul
 pub async fn remove_connector(state: State<'_, AppState>, id: String) -> Result<(), String> {
     if id == local::CONECTOR {
         return Err(tr("erros.conectorReservado", &[("id", &id)]));
+    }
+    // Feito pelo aplicativo, o servidor publicado se desliga — não se apaga por
+    // fora: a porta e o token continuam vivos até alguém fechar.
+    if id == servidor::CONECTOR {
+        state.manager.despublicar().await.map_err(report)?;
     }
     if state.manager.connected_ids().contains(&id) {
         state.manager.disconnect(&id).await.map_err(report)?;
@@ -427,6 +432,34 @@ pub async fn mcp_uninstall(
     state.manager.replace_registry(registry);
     let _ = app.emit("server-event", ServidorEvent::Removeu { id });
     Ok(())
+}
+
+/// O estado do servidor MCP que o próprio aplicativo publica. Não levanta nada:
+/// é o que a tela lê a cada aberto.
+#[tauri::command]
+pub fn mcp_servidor_estado(state: State<'_, AppState>) -> servidor::Estado {
+    state.manager.estado_servidor()
+}
+
+/// Abrir a conexão pela tela é o mesmo caminho da ferramenta do agente: o
+/// gerente publica, cadastra no `mcp.json` e conecta o cliente do aplicativo.
+#[tauri::command]
+pub async fn mcp_servidor_publicar(
+    state: State<'_, AppState>,
+) -> Result<servidor::Estado, String> {
+    state.manager.publicar().await.map_err(report)
+}
+
+#[tauri::command]
+pub async fn mcp_servidor_fechar(state: State<'_, AppState>) -> Result<bool, String> {
+    state.manager.despublicar().await.map_err(report)
+}
+
+/// O token se copia, não se escreve na tela. Sem esta leitura não há como
+/// apontar um cliente externo para o endereço publicado.
+#[tauri::command]
+pub fn mcp_servidor_token(state: State<'_, AppState>) -> Option<String> {
+    state.manager.token_servidor()
 }
 
 /// Trocar o idioma remonta o cadastro e o catálogo embutido: o nome e a
@@ -1555,6 +1588,7 @@ pub async fn bancada_rodar(app: AppHandle, state: State<'_, AppState>) -> Result
     let spec = bancada_spec(&ai);
     let cancel = Arc::clone(&ai.cancel);
     let feito = Arc::clone(&ai);
+    let gerente = Arc::clone(&state.manager);
     let resultado = tauri::async_runtime::spawn_blocking(move || {
         let emit = {
             let app = app.clone();
@@ -1562,7 +1596,7 @@ pub async fn bancada_rodar(app: AppHandle, state: State<'_, AppState>) -> Result
                 let _ = app.emit("bancada-evento", &evento);
             }
         };
-        crate::bancada::rodar(&ai, spec, &cancel, emit)
+        crate::bancada::rodar(&ai, &gerente, spec, &cancel, emit)
     })
     .await;
     feito.end();

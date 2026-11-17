@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, message, onServerEvent } from "../lib/api";
 import { useIdioma, useT } from "../lib/i18n";
-import type { Connector, ServerEvent, ServidorCatalogo } from "../lib/types";
+import type {
+  Connector,
+  ServerEvent,
+  ServidorCatalogo,
+  ServidorMcpEstado,
+} from "../lib/types";
 import { ConnectorForm } from "./ConnectorForm";
 import { Icon } from "./Icon";
 
@@ -25,8 +30,13 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
   const [obras, setObras] = useState<Record<string, Obra>>({});
   const [falhas, setFalhas] = useState<Record<string, string>>({});
   const [erro, setErro] = useState<string | null>(null);
+  const [estadoServidor, setEstadoServidor] = useState<ServidorMcpEstado | null>(null);
+  const [token, setToken] = useState<string | null>(null);
   // Um clique por servidor: o npm não aceita duas escritas na mesma árvore.
   const ocupado = useRef<Set<string>>(new Set());
+  // Abrir a conexão escreve no mcp.json e levanta um ouvinte: dois cliques
+  // ao mesmo tempo pediriam duas portas para a mesma conexão.
+  const publicando = useRef(false);
 
   const recarregar = useCallback(async () => {
     try {
@@ -36,9 +46,20 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
     }
   }, []);
 
+  const recarregarServidor = useCallback(async () => {
+    try {
+      const estado = await api.mcpServidorEstado();
+      setEstadoServidor(estado);
+      setToken(estado.ativa ? await api.mcpServidorToken() : null);
+    } catch (cause) {
+      setErro(message(cause));
+    }
+  }, []);
+
   useEffect(() => {
     void recarregar();
-  }, [recarregar, idioma]);
+    void recarregarServidor();
+  }, [recarregar, recarregarServidor, idioma]);
 
   useEffect(() => {
     let desfeita = false;
@@ -125,6 +146,22 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
     setErro(null);
     const obtido = await api.mcpInstallCancel(servidor.id).catch(() => false);
     if (!obtido) setErro(t("servidores.nadaParaCancelar", { nome: servidor.nome }));
+  };
+
+  const alternar = async () => {
+    if (publicando.current) return;
+    publicando.current = true;
+    setErro(null);
+    try {
+      if (estadoServidor?.ativa) await api.mcpServidorFechar();
+      else await api.mcpServidorPublicar();
+    } catch (cause) {
+      setErro(message(cause));
+    } finally {
+      publicando.current = false;
+      await recarregarServidor();
+      onSaved();
+    }
   };
 
   // O conector embutido não é um servidor que o usuário cadastrou, e os do
@@ -264,6 +301,42 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
           })}
         </ul>
 
+        <p className="sheet-sep">{t("servidorMcp.estado")}</p>
+        <ul className="server-rows">
+          <li className="server-row server-catalogo">
+            <span className="server-name">{t("servidorMcp.nome")}</span>
+            <div className="server-marcas">
+              <span
+                className={`server-chip${estadoServidor?.ativa ? " ok" : ""}`}
+              >
+                {t(estadoServidor?.ativa ? "servidorMcp.servindo" : "servidorMcp.parada")}
+              </span>
+              {estadoServidor && (
+                <span className="server-chip">
+                  {t("servidores.ferramentas", { n: estadoServidor.ferramentas })}
+                </span>
+              )}
+            </div>
+            {estadoServidor?.ativa && (
+              <>
+                <Copiavel rotulo={t("servidorMcp.endereco")} valor={estadoServidor.url} />
+                {token && (
+                  <Copiavel rotulo={t("servidorMcp.token")} valor={token} oculto />
+                )}
+              </>
+            )}
+            <div className="server-acoes">
+              <button
+                type="button"
+                className={estadoServidor?.ativa ? "ghost small" : "primary small"}
+                onClick={() => void alternar()}
+              >
+                {t(estadoServidor?.ativa ? "servidorMcp.fechar" : "servidorMcp.abrir")}
+              </button>
+            </div>
+          </li>
+        </ul>
+
         {erro && <p className="sheet-error">{erro}</p>}
 
         {manuais.length > 0 && (
@@ -288,6 +361,59 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
         )}
         <ConnectorForm onSaved={onSaved} />
       </div>
+    </div>
+  );
+}
+
+/** Um valor que se cola, não se digita: o endereço e o segredo saem do
+    aplicativo exatamente como um cliente externo precisa recebê-los. O segredo
+    fica mascarado na tela — copiar é o único caminho dele sair daqui. */
+function Copiavel({
+  rotulo,
+  valor,
+  oculto = false,
+}: {
+  rotulo: string;
+  valor: string;
+  oculto?: boolean;
+}) {
+  const t = useT();
+  const podeCopiar =
+    typeof navigator !== "undefined" &&
+    typeof navigator.clipboard?.writeText === "function";
+  const [estado, setEstado] = useState<"nenhum" | "copiado" | "falhou">("nenhum");
+
+  async function copiar() {
+    try {
+      await navigator.clipboard.writeText(valor);
+      setEstado("copiado");
+    } catch {
+      // A recusa é do ambiente, não um sucesso disfarçado.
+      setEstado("falhou");
+    }
+  }
+
+  return (
+    <div className="server-valor">
+      <span className="server-valor-rotulo">{rotulo}</span>
+      <code className="server-valor-texto">
+        {oculto ? "•".repeat(Math.min(valor.length, 24)) : valor}
+      </code>
+      {podeCopiar && (
+        <button
+          type="button"
+          className="ghost small"
+          onClick={() => void copiar()}
+          title={t("conversa.copiar")}
+        >
+          <Icon name={estado === "copiado" ? "check" : "copiar"} />
+          {estado === "copiado"
+            ? t("conversa.copiado")
+            : estado === "falhou"
+              ? t("conversa.copiarFalhou")
+              : t("conversa.copiar")}
+        </button>
+      )}
     </div>
   );
 }

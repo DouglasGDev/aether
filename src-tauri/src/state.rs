@@ -1,7 +1,7 @@
 use crate::ai::catalog::{self, ModelSpec};
 use crate::ai::geracao;
 use crate::ai::{ChatMessage, ChatTemplate, Engine, adaptadores};
-use crate::config::McpConfig;
+use crate::config::{McpConfig, Segredos};
 use crate::local::pastas::Pastas;
 use crate::mcp::instalador::Instalacoes;
 use crate::mcp::manager::McpManager;
@@ -14,8 +14,13 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 pub struct AppState {
     pub manager: Arc<McpManager>,
     pub gate: Arc<Mutex<PermissionGate>>,
-    pub config: Mutex<McpConfig>,
-    pub config_path: PathBuf,
+    /// Arc porque publicar o servidor MCP é escrito aqui e no gerente: um segundo
+    /// `McpConfig` em memória deixaria o `mcp.json` com duas verdades.
+    pub config: Arc<Mutex<McpConfig>>,
+    pub config_path: Arc<PathBuf>,
+    /// O que só existe enquanto o aplicativo está de pé. O token do servidor MCP
+    /// publicado entra aqui e nunca no `mcp.json`, que guarda `${AETHER_MCP_TOKEN}`.
+    pub segredos: Arc<Segredos>,
     pub ai: Arc<AiRuntime>,
     /// As pastas que o usuário concedeu. Compartilhadas com o gerente: é ele
     /// quem entrega uma cópia a cada ferramenta local no momento da chamada.

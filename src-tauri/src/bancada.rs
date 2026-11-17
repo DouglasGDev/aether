@@ -14,9 +14,10 @@
 //! pequeno e o prompt do aplicativo, não uma carga arbitrária.
 
 use serde::Serialize;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::MutexGuard;
-use std::time::Instant;
+use std::sync::{Arc, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::ai::alojamento::Capacidade;
 use crate::ai::catalog::ModelSpec;
@@ -24,11 +25,17 @@ use crate::ai::compactacao::{self, Resumo};
 use crate::ai::session::{encaixe, Encaixe, TURN_MARKER, system_prompt};
 use crate::ai::{ChatMessage, ChatTemplate, Emission, Engine, Generation, SamplingParams, StopReason, TurnConfig};
 use crate::idiomas::{self, tr};
+use crate::mcp::{McpManager, servidor};
 use crate::runtime;
 use crate::state::{AiRuntime, LoadedModel};
 
 /// Os casos da suíte, na ordem em que a tela os mostra.
-pub const CASOS: &[&str] = &["placa", "runtime", "esquecer", "prefixo", "parada", "fluxo", "dobrar"];
+pub const CASOS: &[&str] = &["placa", "runtime", "mcp", "esquecer", "prefixo", "parada", "fluxo", "dobrar"];
+
+/// Quanto a bancada espera uma resposta crua da porta publicada antes de dizer
+/// que ela não respondeu. Um handshake local leva milissegundos; dez segundos já
+/// é a porta mudando de assunto.
+const ESPERA_PORTA: Duration = Duration::from_secs(10);
 
 /// As dobras que `caso_dobrar` tem permissão para fazer antes de dar o caso por
 /// reprovado. A conversa montada dobra em duas; o resto é folga.
@@ -295,6 +302,109 @@ fn caso_runtime(ai: &AiRuntime, inicio: Instant) -> Resultado {
         );
     }
     veredito("runtime", Estado::Aprovado, medidas, None, inicio)
+}
+
+/// A bancada roda num fio de bloqueio e a conexão MCP só se mede esperando.
+/// Emendar os dois pela runtime do próprio aplicativo é o que faz o caso medir a
+/// mesma ligação que o botão da tela e a ferramenta do agente usam: as tarefas do
+/// cliente continuam vivas na runtime do aplicativo quando o caso acaba, em vez
+/// de morrerem junto com uma runtime emprestada.
+fn na_runtime_aplicativo<T, F>(fut: F) -> anyhow::Result<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| anyhow::anyhow!(t("bancada.mcp.semPonte")))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    handle.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().map_err(|_| anyhow::anyhow!(t("bancada.mcp.semPonte")))
+}
+
+/// Um POST cru, sem cabeçalho de autenticação, direto na porta publicada. O que
+/// ela responde é a prova de que o segredo é cobrado antes de qualquer
+/// ferramenta — não uma opinião sobre o código que faz a cobrança.
+async fn porta_sem_token(porta: u16) -> anyhow::Result<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let corpo = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"bancada","version":"0"}}}"#;
+    let pedido = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{porta}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{corpo}",
+        corpo.len()
+    );
+    let mut fluxo = tokio::net::TcpStream::connect(("127.0.0.1", porta)).await?;
+    fluxo.write_all(pedido.as_bytes()).await?;
+    let mut resposta = Vec::new();
+    fluxo.read_to_end(&mut resposta).await?;
+    let texto = String::from_utf8_lossy(&resposta);
+    let linha = texto.split_once("\r\n").map(|(c, _)| c).unwrap_or_default();
+    linha
+        .split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!(t("bancada.mcp.semResposta")))
+}
+
+/// A conexão MCP local só vale se um cliente de verdade entra na porta e traz o
+/// catálogo de volta. O caso publica pelo gerente — o mesmo caminho da tela e do
+/// agente — e lê o que saiu da fiação: quantas ferramentas o cliente anunciou de
+/// volta e o que a porta diz a quem chega sem segredo. Rodar uma ferramenta aqui
+/// dependeria de o dono da máquina aprovar aquele instante, e a bancada não pede
+/// favor a ninguém: o que ela mede é a conexão. O que o caso abriu, o caso fecha.
+async fn medir_mcp(gerente: &McpManager, antes: bool) -> anyhow::Result<(Vec<Medida>, Option<String>)> {
+    let aberto = gerente.publicar().await?;
+    let esperadas = crate::local::catalogo().len();
+    let anunciadas = gerente.anunciadas(servidor::CONECTOR).len();
+    let recusado = match tokio::time::timeout(ESPERA_PORTA, porta_sem_token(aberto.porta)).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(t("bancada.mcp.semResposta")),
+    };
+    if !antes {
+        gerente.despublicar().await.ok();
+    }
+    let medidas = vec![
+        medida("bancada.medida.porta", aberto.porta.to_string()),
+        medida("bancada.medida.anunciadas", inteiro(anunciadas)),
+        medida("bancada.medida.catalogo", inteiro(esperadas)),
+        medida(
+            "bancada.medida.semSegredo",
+            match &recusado {
+                Ok(status) => status.to_string(),
+                Err(_) => t("bancada.mcp.semResposta"),
+            },
+        ),
+    ];
+    let motivo = match &recusado {
+        Err(texto) => Some(texto.clone()),
+        // 401 é o que a placa dá para um estranho: qualquer outra linha de
+        // status, inclusive um 200, é a porta aberta sem segredo.
+        Ok(status) if *status != 401 => Some(tr(
+            "bancada.mcp.abriuSemSegredo",
+            &[("status", &status.to_string())],
+        )),
+        Ok(_) if esperadas == 0 || anunciadas != esperadas => Some(tr(
+            "bancada.mcp.anuncioFalso",
+            &[("anunciadas", &inteiro(anunciadas)), ("esperadas", &inteiro(esperadas))],
+        )),
+        Ok(_) => None,
+    };
+    Ok((medidas, motivo))
+}
+
+fn caso_mcp(gerente: &Arc<McpManager>, inicio: Instant) -> Resultado {
+    let antes = gerente.estado_servidor().ativa;
+    let feito = na_runtime_aplicativo({
+        let gerente = Arc::clone(gerente);
+        async move { medir_mcp(&gerente, antes).await }
+    })
+    .flatten();
+    match feito {
+        Err(e) => quebrou("mcp", &e.to_string(), inicio),
+        Ok((medidas, Some(motivo))) => veredito("mcp", Estado::Reprovado, medidas, Some(motivo), inicio),
+        Ok((medidas, None)) => veredito("mcp", Estado::Aprovado, medidas, None, inicio),
+    }
 }
 
 /// Trocar de conversa tem de esquecer a conversa anterior. O caso enche o cache
@@ -682,19 +792,27 @@ fn caso_dobrar(
 /// para o mesmo KV cache.
 pub fn rodar(
     ai: &AiRuntime,
+    gerente: &Arc<McpManager>,
     spec: Option<&'static ModelSpec>,
     cancel: &AtomicBool,
     mut emit: impl FnMut(Evento),
 ) -> Vec<Resultado> {
     emit(Evento::Iniciou { total: CASOS.len(), modelo: spec.map(|s| s.display.to_string()) });
     let capacidade = if spec.is_some() { crate::ai::alojamento::capacidade(&ai.dlls).ok().flatten() } else { None };
-    // O `runtime` corre à parte: ele confere arquivos em disco e não pede motor.
-    let outros = || CASOS.iter().filter(|id| **id != "runtime");
+    // `runtime` confere arquivos em disco e `mcp` fala com a própria aplicação:
+    // nenhum dos dois pede motor, e nenhum dos dois espera pesos na placa.
+    let outros = || CASOS.iter().filter(|id| **id != "runtime" && **id != "mcp");
 
     let mut resultados = Vec::new();
     let inicio = Instant::now();
     emit(Evento::Caso { id: "runtime".to_string() });
     let r = caso_runtime(ai, inicio);
+    emit(Evento::Resultado(r.clone()));
+    resultados.push(r);
+
+    let inicio = Instant::now();
+    emit(Evento::Caso { id: "mcp".to_string() });
+    let r = caso_mcp(gerente, inicio);
     emit(Evento::Resultado(r.clone()));
     resultados.push(r);
 

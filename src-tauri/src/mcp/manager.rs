@@ -1,10 +1,13 @@
-use super::approval::{ApprovalBroker, ApprovalOutcome, ApprovalRequest, wait_for_decision};
+use super::approval::{ApprovalBroker, ApprovalRequest};
 use super::catalog::{CatalogBudget, CatalogEntry, render};
+use super::execucao::{Execucao, resultado_local};
+use super::servidor::{self, Publicador};
 use super::tool::ToolInfo;
+use crate::config::{McpConfig, Segredos};
 use crate::connectors::{ConnectorKind, DesktopOs, McpEntry, Registry, ToolMeta, parse_qualified_name};
 use crate::idiomas::tr;
 use crate::local::{self, pastas::Pastas};
-use crate::permissions::{Decision, PendingApproval, PermissionGate, ToolEffect};
+use crate::permissions::{PermissionGate, ToolEffect};
 use anyhow::{Context, Result, anyhow, bail};
 use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
@@ -14,8 +17,9 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -51,10 +55,12 @@ enum ConnectionCommand {
 
 /// Um servidor MCP é um processo separado, com um canal de comandos. O conector
 /// embutido é o próprio aplicativo: não há canal, e a chamada roda aqui dentro.
-/// Os dois passam pelo mesmo gate e pela mesma fila de aprovação.
+/// O servidor que o aplicativo publica é um terceiro caso: há canal e há rede,
+/// mas a outra ponta somos nós — e é lá que o gate decide, uma única vez.
 #[derive(Clone)]
 enum Canal {
     Remoto(mpsc::Sender<ConnectionCommand>),
+    Publicado(mpsc::Sender<ConnectionCommand>),
     Local,
 }
 
@@ -69,25 +75,32 @@ struct Connection {
 
 pub struct McpManager {
     registry: RwLock<Registry>,
-    gate: Arc<Mutex<PermissionGate>>,
-    approvals: Arc<ApprovalBroker>,
+    /// O único lugar onde um efeito é decidido e executado. O laço de conversa e
+    /// o servidor publicado chegam por portas diferentes e passam por aqui.
+    execucao: Arc<Execucao>,
     connections: RwLock<HashMap<String, Connection>>,
     events: broadcast::Sender<McpEvent>,
-    next_id: AtomicU64,
-    pastas: Arc<RwLock<Pastas>>,
-    /// A memória do assistente. Compartilhada com o estado pelo mesmo motivo das
-    /// pastas: `buscar_memoria` é uma ferramenta local, e uma ferramenta local
-    /// executa numa tarefa bloqueante que não pode prender o runtime.
-    memoria: Arc<crate::ai::memoria::Custodio>,
+    /// O servidor MCP das próprias ferramentas do Aether. Publicar é decisão do
+    /// agente, e quem tem o cadastro, o arquivo e o cliente é o gerente.
+    publicador: Arc<Publicador>,
+    config: Arc<Mutex<McpConfig>>,
+    config_path: Arc<PathBuf>,
+    /// O token do servidor publicado, que nunca vai para o disco.
+    segredos: Arc<Segredos>,
 }
 
 /// As ferramentas que o próprio aplicativo sabe executar, na ordem do catálogo.
 /// Sem filtro aqui: a allowlist é aplicada na leitura, por `permitidas`.
 fn ferramentas_locais() -> Vec<ToolInfo> {
-    local::catalogo()
+    let mut ferramentas: Vec<ToolInfo> = local::catalogo()
         .iter()
         .map(|f| ToolInfo::local(local::CONECTOR, f))
-        .collect()
+        .collect();
+    // Abrir a conexão MCP é uma ferramenta como as outras: o agente pede, o
+    // gerente publica. Ela só existe no conector embutido — dentro do servidor
+    // publicado a conexão já estaria de pé.
+    ferramentas.push(ToolInfo::local(local::CONECTOR, &servidor::ferramenta()));
+    ferramentas
 }
 
 /// O recorte da allowlist. Uma ferramenta que o servidor anunciou e o usuário
@@ -109,17 +122,22 @@ impl McpManager {
         gate: Arc<Mutex<PermissionGate>>,
         pastas: Arc<RwLock<Pastas>>,
         memoria: Arc<crate::ai::memoria::Custodio>,
+        config: Arc<Mutex<McpConfig>>,
+        config_path: Arc<PathBuf>,
+        segredos: Arc<Segredos>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
+        let execucao = Execucao::nova(gate, events.clone(), pastas, memoria);
+        let publicador = Arc::new(Publicador::novo(Arc::clone(&execucao)));
         Self {
             registry: RwLock::new(registry),
-            gate,
-            approvals: Arc::new(ApprovalBroker::new()),
+            execucao,
             connections: RwLock::new(HashMap::new()),
             events,
-            next_id: AtomicU64::new(1),
-            pastas,
-            memoria,
+            publicador,
+            config,
+            config_path,
+            segredos,
         }
     }
 
@@ -150,7 +168,7 @@ impl McpManager {
     }
 
     pub fn approvals(&self) -> Arc<ApprovalBroker> {
-        Arc::clone(&self.approvals)
+        self.execucao.aprovacoes()
     }
 
     pub fn registry_snapshot(&self) -> Registry {
@@ -176,13 +194,7 @@ impl McpManager {
     }
 
     fn pastas_concedidas(&self) -> Vec<String> {
-        self.pastas
-            .read()
-            .expect("pastas envenenadas")
-            .raizes
-            .iter()
-            .map(|r| r.display().to_string())
-            .collect()
+        self.execucao.pastas_concedidas()
     }
 
     /// O processo filho já nasceu com a lista de pastas na linha de comando,
@@ -305,9 +317,9 @@ impl McpManager {
             return Ok(tools);
         }
 
-        let connector = crate::config::resolve_connector(&stored).with_context(|| {
-            tr("erros.falhaResolverSegredos", &[("id", connector_id)])
-        })?;
+        let connector = crate::config::resolve_connector(&stored, &self.segredos).with_context(
+            || tr("erros.falhaResolverSegredos", &[("id", connector_id)]),
+        )?;
         let entry = connector.entry_on(DesktopOs::current()).ok_or_else(|| {
             anyhow!(tr("erros.servidorSemEntrada", &[("id", connector_id)]))
         })?;
@@ -341,16 +353,18 @@ impl McpManager {
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(run_connection(client, receiver));
 
+        // Ligarse ao servidor que o próprio aplicativo publica é uma ligação de
+        // rede como qualquer outra — com uma diferença: a outra ponta decide.
+        let canal = if connector_id == servidor::CONECTOR {
+            Canal::Publicado(sender)
+        } else {
+            Canal::Remoto(sender)
+        };
+
         self.connections
             .write()
             .expect("connections lock poisoned")
-            .insert(
-                connector_id.to_string(),
-                Connection {
-                    canal: Canal::Remoto(sender),
-                    anunciadas,
-                },
-            );
+            .insert(connector_id.to_string(), Connection { canal, anunciadas });
 
         let _ = self.events.send(McpEvent::ToolsDiscovered {
             connector_id: connector_id.to_string(),
@@ -363,12 +377,14 @@ impl McpManager {
     // it has to resume the waiter as denied rather than leave it parked.
     pub fn expire_approvals(&self) -> Vec<String> {
         let expired = self
-            .gate
+            .execucao
+            .gate()
             .lock()
             .expect("permission gate poisoned")
             .expire_pending(Instant::now());
+        let approvals = self.execucao.aprovacoes();
         for id in &expired {
-            self.approvals.resolve(id, false);
+            approvals.resolve(id, false);
             let _ = self.events.send(McpEvent::ApprovalSettled {
                 id: id.clone(),
                 approved: false,
@@ -388,14 +404,18 @@ impl McpManager {
         };
 
         // Revoke before the process dies, so no waiter can resume against it.
-        self.approvals.cancel_connector(connector_id);
-        self.gate
+        self.execucao.aprovacoes().cancel_connector(connector_id);
+        self.execucao
+            .gate()
             .lock()
             .expect("permission gate poisoned")
             .flush_connector(connector_id);
 
-        if let Canal::Remoto(sender) = connection.canal {
-            let _ = sender.send(ConnectionCommand::Shutdown).await;
+        match connection.canal {
+            Canal::Remoto(sender) | Canal::Publicado(sender) => {
+                let _ = sender.send(ConnectionCommand::Shutdown).await;
+            }
+            Canal::Local => {}
         }
         let _ = self.events.send(McpEvent::Disconnected {
             connector_id: connector_id.to_string(),
@@ -460,109 +480,126 @@ impl McpManager {
             (connection.canal.clone(), effect)
         };
 
-        let compound = arguments_contain_shell_compound(&arguments);
-        let decision = self.gate.lock().expect("permission gate poisoned").decide(
-            &meta.connector_id,
-            effect,
-            compound,
-        );
-
-        match decision {
-            Decision::Deny => bail!(tr(
-                "erros.negadaPeloModo",
-                &[("nome", qualified_name)]
-            )),
-            Decision::Allow => {}
-            Decision::Ask => {
-                let request = ApprovalRequest {
-                    id: format!("apr-{}", self.next_id.fetch_add(1, Ordering::Relaxed)),
-                    connector_id: meta.connector_id.clone(),
-                    tool: meta.tool.clone(),
-                    arguments: serde_json::Value::Object(arguments.clone()),
-                };
-                let receiver = self.approvals.register(&request);
-                self.gate
-                    .lock()
-                    .expect("permission gate poisoned")
-                    .insert_pending(
-                        request.id.clone(),
-                        PendingApproval {
-                            connector_id: request.connector_id.clone(),
-                            tool: request.tool.clone(),
-                            effect,
-                            compound,
-                            created_at: Instant::now(),
-                        },
-                    );
-                let _ = self.events.send(McpEvent::ApprovalRequested {
-                    request: request.clone(),
-                });
-
-                // The call is suspended here, not executed and rolled back.
-                let outcome = wait_for_decision(receiver).await;
-
-                self.gate
-                    .lock()
-                    .expect("permission gate poisoned")
-                    .resolve_pending(&request.id);
-                let _ = self.events.send(McpEvent::ApprovalSettled {
-                    id: request.id.clone(),
-                    approved: outcome.is_approved(),
-                });
-                match outcome {
-                    ApprovalOutcome::Approved => {}
-                    ApprovalOutcome::Denied => bail!(tr("erros.acaoNegada", &[])),
-                    ApprovalOutcome::Cancelled => {
-                        bail!(tr("erros.servidorCaiuNaAprovacao", &[]))
-                    }
-                }
-            }
-        }
-
         match canal {
             Canal::Local => {
-                // Uma cópia das pastas, nunca o lock atravessando o await: a
-                // concessão de uma pasta não pode ficar presa atrás de um comando.
-                let pastas = self.pastas.read().expect("pastas envenenadas").clone();
-                let memoria = Arc::clone(&self.memoria);
-                let nome = meta.tool.clone();
-                let argumentos = serde_json::Value::Object(arguments);
-                let saida = tokio::task::spawn_blocking(move || {
-                    local::executar(&nome, argumentos, &pastas, &memoria)
-                })
-                .await
-                .map_err(|e| anyhow!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])))??;
-
-                let mut resultado = CallToolResult::success(vec![ContentBlock::text(saida.texto)]);
-                // O cartão visual nasce do mesmo resultado que o texto do modelo.
-                resultado.structured_content = Some(saida.vista.para_json());
-                resultado.is_error = Some(saida.erro);
-                Ok(resultado)
+                // Publicar o servidor é trabalho do gerente, não de `local::executar`:
+                // só aqui existem o cadastro, o arquivo e o segredo do token. O gate
+                // decide antes, como decide para qualquer efeito que escreve.
+                if meta.tool == servidor::FERRAMENTA {
+                    self.execucao
+                        .aprovar(local::CONECTOR, &meta.tool, effect, &arguments)
+                        .await?;
+                    return Ok(resultado_publicado(&self.publicar().await?));
+                }
+                let saida = self
+                    .execucao
+                    .ferramenta(
+                        local::CONECTOR,
+                        &meta.tool,
+                        effect,
+                        serde_json::Value::Object(arguments),
+                    )
+                    .await?;
+                Ok(resultado_local(saida))
             }
             Canal::Remoto(sender) => {
-                let params =
-                    CallToolRequestParams::new(meta.tool.clone()).with_arguments(arguments);
-                let (reply_tx, reply_rx) = oneshot::channel();
-                sender
-                    .send(ConnectionCommand::Call {
-                        params,
-                        reply: reply_tx,
-                    })
-                    .await
-                    .map_err(|_| {
-                        anyhow!(tr("erros.servidorParou", &[("id", &meta.connector_id)]))
-                    })?;
-
-                reply_rx
-                    .await
-                    .map_err(|_| {
-                        anyhow!(tr("erros.servidorDerrubouChamada", &[("id", &meta.connector_id)]))
-                    })?
-                    .map_err(|e| {
-                        anyhow!(tr("erros.falhaChamarFerramenta", &[("detalhe", &e.to_string())]))
-                    })
+                // A ferramenta roda do outro lado, então a decisão tem de acontecer
+                // aqui: é o cliente que sabe o que o usuário permitiu.
+                self.execucao
+                    .aprovar(&meta.connector_id, &meta.tool, effect, &arguments)
+                    .await?;
+                self.enviar(sender, &meta, arguments).await
+            }
+            Canal::Publicado(sender) => {
+                // A outra ponta é o nosso próprio servidor, que passa pelo mesmo
+                // gate com o mesmo id de conector. Decidir aqui também seria
+                // pedir a mesma aprovação duas vezes.
+                self.enviar(sender, &meta, arguments).await
             }
         }
+    }
+
+    async fn enviar(
+        &self,
+        sender: mpsc::Sender<ConnectionCommand>,
+        meta: &ToolMeta,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<CallToolResult> {
+        let params = CallToolRequestParams::new(meta.tool.clone()).with_arguments(arguments);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(ConnectionCommand::Call {
+                params,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow!(tr("erros.servidorParou", &[("id", &meta.connector_id)])))?;
+
+        reply_rx
+            .await
+            .map_err(|_| anyhow!(tr("erros.servidorDerrubouChamada", &[("id", &meta.connector_id)])))?
+            .map_err(|e| {
+                anyhow!(tr("erros.falhaChamarFerramenta", &[("detalhe", &e.to_string())]))
+            })
+    }
+
+    /// Levanta o servidor MCP das ferramentas do Aether e o entra no cadastro,
+    /// no arquivo e nas ligações. É o único caminho que publica: a ferramenta do
+    /// agente e o comando da tela chegam aqui.
+    ///
+    /// O token vai para a memória (`Segredos`); o `mcp.json` guarda a referência
+    /// `${AETHER_MCP_TOKEN}`, nunca o valor. Reconectar vale porque a porta muda a
+    /// cada execução: o cliente velho aponta para uma porta que não existe mais.
+    pub async fn publicar(&self) -> Result<servidor::Estado> {
+        let (estado, token) = self.publicador.abrir().await?;
+        self.segredos.guardar(servidor::VARIAVEL_TOKEN, &token);
+
+        let registry = {
+            let mut config = self.config.lock().expect("config envenenada");
+            config.upsert(servidor::conector(&estado));
+            config.save(&self.config_path)?;
+            config.registry()?
+        };
+        self.replace_registry(registry);
+
+        // Uma ligação velha cai com a porta velha; sem isto o conector ficaria
+        // "conectado" apontando para um endereço que já não escuta.
+        if self
+            .connections
+            .read()
+            .expect("connections lock poisoned")
+            .contains_key(servidor::CONECTOR)
+        {
+            self.disconnect(servidor::CONECTOR).await.ok();
+        }
+        self.connect(servidor::CONECTOR).await?;
+        Ok(estado)
+    }
+
+    /// Derruba o servidor e esquece o segredo. O cadastro fica onde está: é o
+    /// conector de sempre, desconectado, pronto para publicar de novo.
+    pub async fn despublicar(&self) -> Result<bool> {
+        if self
+            .connections
+            .read()
+            .expect("connections lock poisoned")
+            .contains_key(servidor::CONECTOR)
+        {
+            self.disconnect(servidor::CONECTOR).await.ok();
+        }
+        let parada = self.publicador.fechar().await?;
+        if parada {
+            self.segredos.esquecer(servidor::VARIAVEL_TOKEN);
+        }
+        Ok(parada)
+    }
+
+    pub fn estado_servidor(&self) -> servidor::Estado {
+        self.publicador.estado()
+    }
+
+    pub fn token_servidor(&self) -> Option<String> {
+        self.publicador.token()
     }
 
     async fn dial(entry: &McpEntry) -> Result<Client> {
@@ -613,75 +650,59 @@ async fn run_connection(client: Client, mut receiver: mpsc::Receiver<ConnectionC
     let _ = client.cancel().await;
 }
 
-// Any string argument could reach a shell, so a pipe or substitution anywhere
-// revokes the benefit of a prefix-based session grant.
-fn arguments_contain_shell_compound(arguments: &serde_json::Map<String, serde_json::Value>) -> bool {
-    fn scan(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::String(text) => {
-                text.contains('|')
-                    || text.contains(';')
-                    || text.contains("&&")
-                    || text.contains("$(")
-                    || text.contains('`')
-                    || text.contains('>')
-            }
-            serde_json::Value::Array(items) => items.iter().any(scan),
-            serde_json::Value::Object(map) => map.values().any(scan),
-            _ => false,
-        }
-    }
-    arguments.values().any(scan)
+/// O cartão do `criar_mcp_local`: o que o agente precisa saber é onde a conexão
+/// está e quantas ferramentas ela atende. O token não vai aqui — ele se copia na
+/// tela, não se despeja no histórico do modelo.
+fn resultado_publicado(estado: &servidor::Estado) -> CallToolResult {
+    let texto = tr(
+        "servidorMcp.publicada",
+        &[
+            ("url", &estado.url),
+            ("ferramentas", &estado.ferramentas.to_string()),
+        ],
+    );
+    let mut resultado = CallToolResult::success(vec![ContentBlock::text(texto)]);
+    resultado.structured_content = Some(serde_json::json!({
+        "url": estado.url,
+        "porta": estado.porta,
+        "ferramentas": estado.ferramentas,
+    }));
+    resultado.is_error = Some(false);
+    resultado
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-        match value {
-            serde_json::Value::Object(map) => map,
-            _ => panic!("fixture must be an object"),
-        }
+    /// A ferramenta de publicar é do conector embutido. Dentro do servidor
+    /// publicado a conexão já estaria de pé; anunciá-la lá seria um convite para
+    /// abrir a porta outra vez.
+    #[test]
+    fn o_catalogo_embutido_ganha_a_ferramenta_de_publicar() {
+        let nomes: Vec<String> = ferramentas_locais()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(nomes.len(), local::catalogo().len() + 1);
+        assert!(nomes.contains(&servidor::FERRAMENTA.to_string()), "{nomes:?}");
     }
 
     #[test]
-    fn plain_arguments_are_not_compound() {
-        assert!(!arguments_contain_shell_compound(&map(
-            json!({ "path": "/tmp/file.txt" })
-        )));
-    }
-
-    #[test]
-    fn pipe_marks_arguments_compound() {
-        assert!(arguments_contain_shell_compound(&map(
-            json!({ "command": "cat a | grep b" })
-        )));
-    }
-
-    #[test]
-    fn substitution_marks_arguments_compound() {
-        assert!(arguments_contain_shell_compound(&map(
-            json!({ "command": "echo $(whoami)" })
-        )));
-        assert!(arguments_contain_shell_compound(&map(
-            json!({ "command": "echo `whoami`" })
-        )));
-    }
-
-    #[test]
-    fn compound_detection_recurses_into_nested_values() {
-        assert!(arguments_contain_shell_compound(&map(
-            json!({ "steps": [{ "run": "a && b" }] })
-        )));
-        assert!(!arguments_contain_shell_compound(&map(
-            json!({ "steps": [{ "run": "a" }], "count": 3, "flag": true })
-        )));
-    }
-
-    #[test]
-    fn empty_arguments_are_not_compound() {
-        assert!(!arguments_contain_shell_compound(&map(json!({}))));
+    fn o_resultado_da_publicacao_diz_onde_sem_dizer_o_segredo() {
+        let estado = servidor::Estado {
+            ativa: true,
+            url: "http://127.0.0.1:4599/mcp".to_string(),
+            porta: 4599,
+            ferramentas: 11,
+        };
+        let resultado = resultado_publicado(&estado);
+        let json = serde_json::to_string(&resultado.content).expect("o conteúdo serializa");
+        assert!(json.contains("4599"), "{json}");
+        assert!(!json.contains(servidor::VARIAVEL_TOKEN), "o token não vai no resultado");
+        assert_eq!(resultado.is_error, Some(false));
+        let vista = resultado.structured_content.expect("o cartão lê a vista");
+        assert_eq!(vista["porta"], serde_json::json!(4599));
+        assert_eq!(vista["ferramentas"], serde_json::json!(11));
     }
 }

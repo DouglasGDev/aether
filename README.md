@@ -53,9 +53,32 @@ movido se um hash divergir. Veja
   se ainda assim faltar um argumento obrigatório, a ferramenta recusa e diz o
   que faltou, em vez de criar um arquivo vazio com a cara de sucesso; uma
   chamada com nome que não existe devolve a lista dos nomes reais.
-- **Conector local** — 12 ferramentas de arquivo, terminal, código, memória e
-  sistema, dentro das pastas que a pessoa concedeu. Ele entra no mesmo cadastro,
-  na mesma allowlist e no mesmo gate que um servidor MCP de terceiros.
+- **Conector local** — 11 ferramentas de arquivo, terminal, código, memória e
+  sistema, dentro das pastas que a pessoa concedeu, mais `criar_mcp_local`, que
+  publica o servidor abaixo. Ele entra no mesmo cadastro, na mesma allowlist e no
+  mesmo gate que um servidor MCP de terceiros.
+- **Conexão MCP local** — o agente publica as próprias ferramentas num servidor
+  MCP real (Streamable HTTP) e conecta nele pelo mesmo cliente rmcp que usa para
+  um servidor de terceiros. Abrir a conexão é uma decisão, não uma configuração:
+  a tela de Servidores tem o botão, e a ferramenta `criar_mcp_local` faz o mesmo
+  caminho. O servidor escuta em `http://127.0.0.1:<porta>/mcp` numa porta efêmera
+  escolhida pelo sistema, e cobra `Authorization: Bearer <token>` — o token são 64
+  caracteres hexadecimais de 32 bytes aleatórios que existem só na memória do
+  aplicativo; o `mcp.json` guarda a referência `${AETHER_MCP_TOKEN}`, nunca o
+  valor. A versão do protocolo é a que o `initialize` do cliente negociar; um
+  cliente propondo `2026-07-28` recebeu `2025-11-25` desta build, sem id de
+  sessão. Para apontar um cliente externo, abra a conexão na tela de Servidores e
+  copie o endereço e o token de lá; o token muda a cada execução, assim como a
+  porta. Cada chamada que entra pela porta passa pelo mesmo gate de permissões do
+  laço de conversa, com o mesmo id de conector, e a recusa volta como erro de
+  ferramenta — o motivo é o mesmo que o chat mostra. Medido nesta máquina com um
+  cliente fora do aplicativo: sem o cabeçalho a porta respondeu `401`, com ele o
+  `initialize` respondeu `200` (`serverInfo.name = aether`), `tools/list` devolveu
+  as 11 ferramentas e um `tools/call` de `info_sistema` ficou parado até a pessoa
+  clicar *Aprovar* no cartão da tela — depois disso devolveu o sistema, a placa e
+  as pastas concedidas de verdade. O servidor anuncia as 11 ferramentas do
+  catálogo; `criar_mcp_local` não é anunciada por ele, porque publicar de dentro
+  de uma publicação seria outra porta para a mesma sala.
 - **Memória (RAG)** — índice das pastas concedidas com busca híbrida (BM25 +
   vetorial com fusão), peças com sobreposição e piso de similaridade. A injeção
   automática e a ferramenta `buscar_memoria` obedecem ao mesmo fio do grafo.
@@ -65,11 +88,11 @@ movido se um hash divergir. Veja
   esquece o KV: a conversa seguinte não herda o estado da anterior. O índice e as
   mensagens ficam em `%APPDATA%\ai.aether.core\conversas` e voltam onde estavam
   depois de fechar e abrir o aplicativo.
-- **Bancada** — uma suíte de sete casos que roda dentro do aplicativo, contra o
+- **Bancada** — uma suíte de oito casos que roda dentro do aplicativo, contra o
   modelo carregado e a placa real, e mede cada um: motor na placa, bibliotecas do
-  runtime, esquecimento do KV entre conversas, reaproveitamento do prefixo, parada
-  da resposta, texto em fluxo e compactação da conversa longa. Cada caso traz suas
-  medidas e um veredito
+  runtime, conexão MCP local, esquecimento do KV entre conversas, reaproveitamento
+  do prefixo, parada da resposta, texto em fluxo e compactação da conversa longa.
+  Cada caso traz suas medidas e um veredito
   aprovado/reprovado; nenhum caso é aprovado por suposição — ele aprova o que o
   motor devolveu naquela rodada. A bancada não começa com um turno de conversa em
   curso, e o botão *Parar* dela usa o mesmo interruptor de cancelamento do chat.
@@ -177,6 +200,11 @@ allowlists, pastas concedidas, grafo, voz, RAG), em
 `%APPDATA%\ai.aether.core\conversas` (o índice e as mensagens de cada conversa) e
 em `%LOCALAPPDATA%\ai.aether.core\models` (pesos, índice e os pacotes de runtime
 instalados). Nenhum desses arquivos sai da máquina.
+
+Segredo não vai para disco: o `mcp.json` guarda no máximo a referência
+`${AETHER_MCP_TOKEN}`, e o valor dela vive só na memória do aplicativo enquanto a
+conexão MCP local está aberta. Fechar o aplicativo, ou o botão da tela, esquece o
+token; reabrir a conexão gera outro.
 
 ## Limites conhecidos
 

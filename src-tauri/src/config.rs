@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -50,11 +51,14 @@ impl McpConfig {
         }
         // Um servidor do catálogo pertence ao aplicativo: o arquivo guarda o id
         // e o transporte, e o texto legível vem sempre dos idiomas. Sem isto,
-        // trocar de idioma deixaria o servidor instalado na língua antiga.
+        // trocar de idioma deixaria o servidor instalado na língua antiga. O
+        // servidor que o próprio Aether publica é o mesmo caso.
         for conector in servidores.iter_mut() {
             if let Some(pronto) = crate::mcp::instalador::pronto(&conector.id) {
                 conector.name = crate::mcp::instalador::nome(pronto);
                 conector.description = crate::mcp::instalador::descricao(pronto);
+            } else if conector.id == crate::mcp::servidor::CONECTOR {
+                crate::mcp::servidor::relocalizar(conector);
             }
         }
         Registry::new(servidores)
@@ -122,8 +126,44 @@ fn resolve_entry_with(entry: &McpEntry, lookup: &dyn Fn(&str) -> Option<String>)
 
 // Placeholders are resolved into a throwaway copy at connect time; the stored
 // config keeps ${VAR} so a secret is never written to disk in clear text.
-pub fn resolve_connector(connector: &Connector) -> Result<Connector> {
-    resolve_connector_with(connector, &|name| std::env::var(name).ok())
+pub fn resolve_connector(connector: &Connector, segredos: &Segredos) -> Result<Connector> {
+    resolve_connector_with(connector, &|name| {
+        segredos.obter(name).or_else(|| std::env::var(name).ok())
+    })
+}
+
+/// Um segredo que só existe enquanto o aplicativo está de pé. O token do
+/// servidor que o próprio Aether publica é sorteado a cada execução e o
+/// `mcp.json` guarda só `${AETHER_MCP_TOKEN}`: sem ele no ambiente — e pôr um
+/// segredo no ambiente do processo seria expô-lo a todo filho — a conexão só se
+/// resolve aqui dentro, onde ele nasceu.
+#[derive(Debug, Default)]
+pub struct Segredos {
+    valores: Mutex<HashMap<String, String>>,
+}
+
+impl Segredos {
+    pub fn guardar(&self, chave: &str, valor: &str) {
+        self.valores
+            .lock()
+            .expect("segredos envenenados")
+            .insert(chave.to_string(), valor.to_string());
+    }
+
+    pub fn esquecer(&self, chave: &str) {
+        self.valores
+            .lock()
+            .expect("segredos envenenados")
+            .remove(chave);
+    }
+
+    pub fn obter(&self, chave: &str) -> Option<String> {
+        self.valores
+            .lock()
+            .expect("segredos envenenados")
+            .get(chave)
+            .cloned()
+    }
 }
 
 fn resolve_connector_with(

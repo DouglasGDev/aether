@@ -28,9 +28,10 @@ use tokio::sync::broadcast::error::RecvError;
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let config_path = app.path().app_config_dir()?.join("mcp.json");
-            let config = McpConfig::load(&config_path)?;
-            let registry = config.registry()?;
+            let config_path = Arc::new(app.path().app_config_dir()?.join("mcp.json"));
+            let config = Arc::new(Mutex::new(McpConfig::load(&config_path)?));
+            let registry = config.lock().expect("config envenenada").registry()?;
+            let segredos = Arc::new(crate::config::Segredos::default());
             let gate = Arc::new(Mutex::new(PermissionGate::new(AgentMode::Default)));
             let pastas_path = app.path().app_config_dir()?.join("pastas.json");
             let pastas = Arc::new(RwLock::new(Pastas::carregar(&pastas_path)?));
@@ -66,6 +67,9 @@ pub fn run() {
                 Arc::clone(&gate),
                 Arc::clone(&pastas),
                 Arc::clone(&memoria),
+                Arc::clone(&config),
+                Arc::clone(&config_path),
+                Arc::clone(&segredos),
             ));
             // Os modelos de voz têm pasta própria dentro de `models`: apagar um
             // LLM não leva o Kokoro junto, e vice-versa.
@@ -83,8 +87,9 @@ pub fn run() {
             app.manage(AppState {
                 manager: Arc::clone(&manager),
                 gate,
-                config: Mutex::new(config),
+                config,
                 config_path,
+                segredos,
                 ai,
                 pastas,
                 pastas_path,
@@ -153,6 +158,10 @@ pub fn run() {
             commands::mcp_install,
             commands::mcp_install_cancel,
             commands::mcp_uninstall,
+            commands::mcp_servidor_estado,
+            commands::mcp_servidor_publicar,
+            commands::mcp_servidor_fechar,
+            commands::mcp_servidor_token,
             commands::ligacoes_obter,
             commands::ligacoes_aplicar,
             commands::ligacoes_layout,
