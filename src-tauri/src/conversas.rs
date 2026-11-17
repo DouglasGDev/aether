@@ -18,6 +18,7 @@
 //!   o KV, porque o cache da conversa anterior não é prefixo desta.
 
 use crate::ai::ChatMessage;
+use crate::ai::compactacao::Resumo;
 use crate::idiomas::tr;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,21 @@ pub struct Conversa {
     pub criada: u64,
     pub atualizada: u64,
     pub mensagens: Vec<ChatMessage>,
+    /// O que o modelo escreveu para não ter que ler: o resumo dos turnos que
+    /// saíram do prompt e o índice até onde ele cobre. `None` é a conversa lida
+    /// inteira. Guarda porque recompôr a cada turno seria cobrar da placa um
+    /// texto que ela já escreveu.
+    #[serde(default)]
+    pub resumo: Option<Resumo>,
+}
+
+/// O que abre uma conversa: o buffer vivo do motor e o resumo que pertence a
+/// ele. Trocar uma sem o outro é deixar o modelo lendo o começo de uma conversa
+/// que não é aquela.
+#[derive(Debug, Clone)]
+pub struct Aberta {
+    pub mensagens: Vec<ChatMessage>,
+    pub resumo: Option<Resumo>,
 }
 
 impl Conversa {
@@ -216,6 +232,7 @@ impl Conversas {
             criada: agora(),
             atualizada: agora(),
             mensagens: Vec::new(),
+            resumo: None,
         };
         gravar_json(&arquivo(&self.raiz, &conversa.id), &conversa)?;
         let ficha = conversa.ficha();
@@ -226,9 +243,9 @@ impl Conversas {
         Ok(ficha)
     }
 
-    /// Carrega as mensagens da conversa e a torna ativa. Quem chama põe o
-    /// resultado no buffer vivo e manda o motor esquecer o KV anterior.
-    pub fn abrir(&self, id: &str) -> Result<Vec<ChatMessage>> {
+    /// Carrega a conversa e a torna ativa. Quem chama põe as mensagens no buffer
+    /// vivo, o resumo no dele, e manda o motor esquecer o KV anterior.
+    pub fn abrir(&self, id: &str) -> Result<Aberta> {
         if !id_valido(id) {
             bail!(tr("erros.conversaIdInvalido", &[("id", id)]));
         }
@@ -241,7 +258,7 @@ impl Conversas {
         let mut indice = self.indice.lock().expect("conversas envenenadas");
         indice.ativa = Some(id.to_string());
         self.salvar_indice(&indice)?;
-        Ok(conversa.mensagens)
+        Ok(Aberta { mensagens: conversa.mensagens, resumo: conversa.resumo })
     }
 
     pub fn renomear(&self, id: &str, titulo: &str) -> Result<Ficha> {
@@ -270,7 +287,16 @@ impl Conversas {
     /// Grava o buffer vivo na conversa. O título automático acompanha o primeiro
     /// pedido enquanto ninguém nomeou a conversa: um nome escrito não é
     /// sobrescrito por turno, e um histórico limpo devolve o título ao vazio.
-    pub fn gravar(&self, id: &str, mensagens: &[ChatMessage]) -> Result<Ficha> {
+    ///
+    /// O resumo só fica quando ainda diz alguma verdade sobre estas mensagens:
+    /// um índice depois do fim do histórico esconderia do modelo uma conversa
+    /// que ele deveria ler inteira. Um histórico limpo leva o resumo junto.
+    pub fn gravar(
+        &self,
+        id: &str,
+        mensagens: &[ChatMessage],
+        resumo: Option<&Resumo>,
+    ) -> Result<Ficha> {
         if !id_valido(id) {
             bail!(tr("erros.conversaIdInvalido", &[("id", id)]));
         }
@@ -280,6 +306,7 @@ impl Conversas {
             conversa.titulo = titulo_de(mensagens);
         }
         conversa.mensagens = mensagens.to_vec();
+        conversa.resumo = resumo.filter(|r| r.ate <= mensagens.len()).cloned();
         conversa.atualizada = agora();
         gravar_json(&caminho, &conversa)?;
         let ficha = conversa.ficha();
@@ -354,7 +381,7 @@ mod testes {
     fn o_titulo_nasce_do_primeiro_pedido() {
         let conversas = temporaria("titulo");
         let ficha = conversas.criar().unwrap();
-        let gravada = conversas.gravar(&ficha.id, &pedido("crie uma página animada")).unwrap();
+        let gravada = conversas.gravar(&ficha.id, &pedido("crie uma página animada"), None).unwrap();
         assert_eq!(gravada.titulo, "crie uma página animada");
         assert_eq!(gravada.mensagens, 3);
         let _ = std::fs::remove_dir_all(&conversas.raiz);
@@ -365,7 +392,7 @@ mod testes {
         let conversas = temporaria("titulo-longo");
         let ficha = conversas.criar().unwrap();
         let longo = format!("{}\nsegunda linha", "a".repeat(120));
-        let gravada = conversas.gravar(&ficha.id, &pedido(&longo)).unwrap();
+        let gravada = conversas.gravar(&ficha.id, &pedido(&longo), None).unwrap();
         assert_eq!(gravada.titulo.chars().count(), 49);
         assert!(gravada.titulo.ends_with('…'));
         assert!(!gravada.titulo.contains('\n'));
@@ -377,7 +404,7 @@ mod testes {
         let conversas = temporaria("nome");
         let ficha = conversas.criar().unwrap();
         conversas.renomear(&ficha.id, "  Landing do cliente  ").unwrap();
-        let gravada = conversas.gravar(&ficha.id, &pedido("outro pedido")).unwrap();
+        let gravada = conversas.gravar(&ficha.id, &pedido("outro pedido"), None).unwrap();
         assert_eq!(gravada.titulo, "Landing do cliente");
         let _ = std::fs::remove_dir_all(&conversas.raiz);
     }
@@ -386,14 +413,14 @@ mod testes {
     fn limpar_o_historico_devolve_o_titulo_automatico_ao_vazio() {
         let conversas = temporaria("limpar");
         let ficha = conversas.criar().unwrap();
-        conversas.gravar(&ficha.id, &pedido("pedido que nomeou")).unwrap();
-        let limpa = conversas.gravar(&ficha.id, &[]).unwrap();
+        conversas.gravar(&ficha.id, &pedido("pedido que nomeou"), None).unwrap();
+        let limpa = conversas.gravar(&ficha.id, &[], None).unwrap();
         assert_eq!(limpa.titulo, "");
         assert_eq!(limpa.mensagens, 0);
         // O nome escrito sobrevive à limpeza: ele é da pessoa, não do histórico.
         conversas.renomear(&ficha.id, "Landing").unwrap();
-        conversas.gravar(&ficha.id, &pedido("outro")).unwrap();
-        assert_eq!(conversas.gravar(&ficha.id, &[]).unwrap().titulo, "Landing");
+        conversas.gravar(&ficha.id, &pedido("outro"), None).unwrap();
+        assert_eq!(conversas.gravar(&ficha.id, &[], None).unwrap().titulo, "Landing");
         let _ = std::fs::remove_dir_all(&conversas.raiz);
     }
 
@@ -411,11 +438,11 @@ mod testes {
             }]),
         });
         mensagens.push(ChatMessage::new("tool", "escrito"));
-        conversas.gravar(&ficha.id, &mensagens).unwrap();
+        conversas.gravar(&ficha.id, &mensagens, None).unwrap();
 
         // Outro dono, lendo do disco: é o que acontece ao reabrir o aplicativo.
         let reaberto = Conversas::novo(conversas.raiz.clone());
-        let lidas = reaberto.abrir(&ficha.id).unwrap();
+        let lidas = reaberto.abrir(&ficha.id).unwrap().mensagens;
         assert_eq!(lidas.len(), mensagens.len());
         let chamadas = lidas[3].tool_calls.as_ref().unwrap();
         assert_eq!(chamadas.len(), 1);
@@ -425,16 +452,80 @@ mod testes {
         let _ = std::fs::remove_dir_all(&conversas.raiz);
     }
 
+    /// O resumo é o texto que o modelo escreveu para não ter que reler os
+    /// turnos antigos. Perder isto no disco é cobrar da placa, turno após turno,
+    /// o resumo de uma conversa de vinte turnos.
+    #[test]
+    fn o_resumo_sobrevive_a_reabrir_a_conversa() {
+        let conversas = temporaria("resumo");
+        let ficha = conversas.criar().unwrap();
+        let resumo = Resumo { texto: "a pessoa pediu a página e ela foi criada".into(), ate: 2 };
+        conversas.gravar(&ficha.id, &pedido("crie a página"), Some(&resumo)).unwrap();
+
+        let reaberta = Conversas::novo(conversas.raiz.clone()).abrir(&ficha.id).unwrap();
+        assert_eq!(reaberta.resumo.as_ref(), Some(&resumo));
+        assert_eq!(reaberta.mensagens.len(), 3);
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// Índice depois do fim do histórico é resumo de mensagem que não existe:
+    /// ele esconderia do modelo a conversa que ele deveria ler inteira.
+    #[test]
+    fn um_resumo_fora_do_historico_nao_e_guardado() {
+        let conversas = temporaria("resumo-fora");
+        let ficha = conversas.criar().unwrap();
+        let fora = Resumo { texto: "cobria dez turnos".into(), ate: 9 };
+        conversas.gravar(&ficha.id, &pedido("oi"), Some(&fora)).unwrap();
+        assert_eq!(Conversas::novo(conversas.raiz.clone()).abrir(&ficha.id).unwrap().resumo, None);
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// Limpar o histórico é limpar o que ele cobria. Uma conversa vazia com
+    /// resumo na mão seria o modelo começando uma conversa nova lendo um texto
+    /// que ninguém escreveu nela.
+    #[test]
+    fn limpar_a_conversa_esquece_o_resumo() {
+        let conversas = temporaria("resumo-limpo");
+        let ficha = conversas.criar().unwrap();
+        let resumo = Resumo { texto: "o que aconteceu antes".into(), ate: 1 };
+        conversas.gravar(&ficha.id, &pedido("oi"), Some(&resumo)).unwrap();
+        conversas.gravar(&ficha.id, &[], None).unwrap();
+        let limpa = Conversas::novo(conversas.raiz.clone()).abrir(&ficha.id).unwrap();
+        assert_eq!(limpa.resumo, None);
+        assert!(limpa.mensagens.is_empty());
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// As conversas gravadas antes da compactação não têm a chave. Elas têm de
+    /// abrir como conversa lida inteira — não como arquivo inválido.
+    #[test]
+    fn uma_conversa_sem_a_chave_do_resumo_abre_normal() {
+        let conversas = temporaria("resumo-antiga");
+        let ficha = conversas.criar().unwrap();
+        conversas.gravar(&ficha.id, &pedido("oi"), None).unwrap();
+        let caminho = arquivo(&conversas.raiz, &ficha.id);
+        let velho: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&caminho).unwrap()).unwrap();
+        let mut sem_resumo = velho.as_object().unwrap().clone();
+        sem_resumo.remove("resumo");
+        std::fs::write(&caminho, serde_json::to_string(&sem_resumo).unwrap()).unwrap();
+
+        let aberta = Conversas::novo(conversas.raiz.clone()).abrir(&ficha.id).unwrap();
+        assert_eq!(aberta.resumo, None);
+        assert_eq!(aberta.mensagens.len(), 3);
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
     #[test]
     fn duas_conversas_nao_se_misturam() {
         let conversas = temporaria("duas");
         let a = conversas.criar().unwrap();
-        conversas.gravar(&a.id, &pedido("pedido da primeira")).unwrap();
+        conversas.gravar(&a.id, &pedido("pedido da primeira"), None).unwrap();
         let b = conversas.criar().unwrap();
-        conversas.gravar(&b.id, &pedido("pedido da segunda")).unwrap();
+        conversas.gravar(&b.id, &pedido("pedido da segunda"), None).unwrap();
 
-        assert_eq!(conversas.abrir(&a.id).unwrap()[1].content, "pedido da primeira");
-        assert_eq!(conversas.abrir(&b.id).unwrap()[1].content, "pedido da segunda");
+        assert_eq!(conversas.abrir(&a.id).unwrap().mensagens[1].content, "pedido da primeira");
+        assert_eq!(conversas.abrir(&b.id).unwrap().mensagens[1].content, "pedido da segunda");
         let estado = conversas.estado();
         assert_eq!(estado.conversas.len(), 2);
         assert_eq!(estado.ativa.as_deref(), Some(b.id.as_str()));
@@ -445,7 +536,7 @@ mod testes {
     fn apagar_leva_o_arquivo_e_a_entrada() {
         let conversas = temporaria("apagar");
         let a = conversas.criar().unwrap();
-        conversas.gravar(&a.id, &pedido("pedido")).unwrap();
+        conversas.gravar(&a.id, &pedido("pedido"), None).unwrap();
         let caminho = arquivo(&conversas.raiz, &a.id);
         assert!(caminho.is_file());
         conversas.apagar(&a.id).unwrap();
@@ -476,7 +567,7 @@ mod testes {
         for id in ["../indice", "..\\indice", "a/b", "", "indice.json"] {
             assert!(conversas.abrir(id).is_err(), "{id}");
             assert!(conversas.apagar(id).is_err(), "{id}");
-            assert!(conversas.gravar(id, &[]).is_err(), "{id}");
+            assert!(conversas.gravar(id, &[], None).is_err(), "{id}");
             assert!(conversas.renomear(id, "x").is_err(), "{id}");
         }
         let _ = std::fs::remove_dir_all(&conversas.raiz);
@@ -486,12 +577,12 @@ mod testes {
     fn a_lista_vem_da_mais_recente_para_a_mais_antiga() {
         let conversas = temporaria("ordem");
         let velha = conversas.criar().unwrap();
-        conversas.gravar(&velha.id, &pedido("velha")).unwrap();
+        conversas.gravar(&velha.id, &pedido("velha"), None).unwrap();
         // O relógio tem resolução de milissegundo: sem esta pausa as duas
         // conversas nasceriam no mesmo instante e a ordem seria a do id.
         std::thread::sleep(std::time::Duration::from_millis(5));
         let nova = conversas.criar().unwrap();
-        conversas.gravar(&nova.id, &pedido("nova")).unwrap();
+        conversas.gravar(&nova.id, &pedido("nova"), None).unwrap();
         let estado = conversas.estado();
         assert_eq!(estado.conversas[0].id, nova.id);
         assert_eq!(estado.conversas[1].id, velha.id);
@@ -502,7 +593,7 @@ mod testes {
     fn o_indice_sobrevive_a_reabrir_o_aplicativo() {
         let conversas = temporaria("indice");
         let ficha = conversas.criar().unwrap();
-        conversas.gravar(&ficha.id, &pedido("pedido")).unwrap();
+        conversas.gravar(&ficha.id, &pedido("pedido"), None).unwrap();
         let reaberto = Conversas::novo(conversas.raiz.clone());
         let estado = reaberto.estado();
         assert_eq!(estado.conversas.len(), 1);

@@ -36,6 +36,10 @@ export interface Turn {
   /// O bloco que a memória pôs no prompt antes do primeiro token, quando pôs.
   /// É o mesmo cartão da ferramenta: muda a origem, não o dado.
   memoria: Extract<Vista, { type: "memoria" }> | null;
+  /// O resumo que este turno escreveu no lugar das mensagens que saíram do
+  /// prompt, e quantas elas eram. O cartão é a prova de que ele leu o começo da
+  /// conversa condensado — e do que pôs no lugar.
+  resumo: { texto: string; mensagens: number } | null;
 }
 
 export function emptyTurn(role: Turn["role"]): Turn {
@@ -49,6 +53,7 @@ export function emptyTurn(role: Turn["role"]): Turn {
     streaming: false,
     medicao: null,
     memoria: null,
+    resumo: null,
   };
 }
 
@@ -123,6 +128,21 @@ export function Conversation({ turns, aguardando }: Props) {
                   {t("conversa.raciocinio")}
                 </summary>
                 <p>{turn.thinking}</p>
+              </details>
+            )}
+
+            {turn.resumo !== null && (
+              <details className="talk-resumo">
+                <summary>
+                  <Icon name="camadas" />
+                  {t("conversa.resumoTitulo")}
+                  <span className="contagem">
+                    {t("conversa.resumoMensagens", {
+                      n: inteiro(turn.resumo.mensagens, idioma),
+                    })}
+                  </span>
+                </summary>
+                <p>{turn.resumo.texto}</p>
               </details>
             )}
 
@@ -215,10 +235,10 @@ export function Conversation({ turns, aguardando }: Props) {
                     ),
                   })}
                 </span>
-                {turn.medicao.descartadas > 0 && (
+                {turn.medicao.dobradas > 0 && (
                   <span className="talk-medida aviso">
-                    {t("conversa.foraDeContexto", {
-                      n: inteiro(turn.medicao.descartadas, idioma),
+                    {t("conversa.dobradas", {
+                      n: inteiro(turn.medicao.dobradas, idioma),
                     })}
                   </span>
                 )}

@@ -115,7 +115,10 @@
     "aguardando": "Aguardando sua decisão",
     "tokens": "{saida} tokens de saída · {entrada} de entrada",
     "reaproveitados": "{n} de entrada reaproveitados",
-    "foraDeContexto": "{n} mensagens antigas ficaram fora desta resposta",
+    "dobradas": "{n} mensagens antigas entraram no resumo desta resposta",
+    "resumo": "Resumo das mensagens anteriores desta conversa — o texto delas não está mais aqui: {texto}",
+    "resumoTitulo": "Resumo",
+    "resumoMensagens": "{n} mensagens dobradas",
     "codigoLinhas": "{n} linhas",
     "codigoSemLinguagem": "código",
     "mostrarTudo": "Mostrar tudo",
@@ -131,6 +134,11 @@
     "paradaLimite": "cortado pelo limite de tokens",
     "paradaCancelada": "você parou",
     "paradaJanela": "cortado pela janela cheia"
+  },
+  "compactacao": {
+    "instrucao": "Você comprime o começo de uma conversa de assistente. Responda apenas com o resumo, em português: o que a pessoa pediu, o que já foi feito, os caminhos, nomes e valores citados e o que ainda está pendente. No máximo oito frases, sem introdução e sem falar do resumo.",
+    "anterior": "Resumo das mensagens já comprimidas antes destas: {texto}",
+    "pedido": "Resuma tudo o que vem antes desta mensagem."
   },
   "aprovacao": {
     "titulo": "Precisa da sua aprovação",
@@ -280,6 +288,8 @@
     "sementeSorteio": "sorteia a cada turno",
     "sementeNova": "Sortear uma semente nova",
     "contexto": "Janela de contexto",
+    "janelaInteira": "inteira na placa até {n}",
+    "janelaInteiraUsar": "levar para a janela inteira na placa",
     "janela": "Janela",
     "pensamento": "Mostrar o raciocínio",
     "pensamentoCusto": "O raciocínio ocupa tokens antes da primeira palavra.",
@@ -585,7 +595,8 @@
       "esquecer": "Esquecer ao trocar de conversa",
       "prefixo": "Reaproveitar o prefixo",
       "parada": "Parada da resposta",
-      "fluxo": "Texto em fluxo"
+      "fluxo": "Texto em fluxo",
+      "dobrar": "Compactar a conversa longa"
     },
     "cancelado": "a bancada foi parada antes deste caso",
     "semModelo": "nenhum modelo completo em disco para rodar este caso",
@@ -633,6 +644,12 @@
     "fluxo": {
       "divergiu": "o texto em fluxo não é a resposta final"
     },
+    "dobrar": {
+      "semLugar": "dobrar não bastou: {fixo} tokens fixos e {pedido} do pedido contra uma janela de {janela}",
+      "parou": "a conversa precisou de mais dobras do que o caso permite",
+      "cabeu": "a conversa montada coube na janela: o caso não mediu dobra nenhuma",
+      "estourou": "o prompt continuou maior que o limite depois de dobrar"
+    },
     "medida": {
       "motor": "motor",
       "placa": "placa",
@@ -653,7 +670,10 @@
       "motivo": "motivo da parada",
       "gerados": "tokens gerados",
       "caracteres": "caracteres",
-      "velocidade": "tokens/s"
+      "velocidade": "tokens/s",
+      "janela": "janela do motor",
+      "limite": "limite do prompt",
+      "dobras": "dobras feitas"
     }
   },
   "erros": {
@@ -664,7 +684,9 @@
     "semModeloParaPedido": "nenhum modelo disponível para este pedido",
     "modeloForaDoCatalogo": "o roteador escolheu {modelo}, que não está no catálogo",
     "pedidoCancelado": "pedido cancelado",
-    "janelaSemLugar": "a janela é de {janela} tokens: as ferramentas e a identidade já ocupam {fixo} e este pedido precisa de {pedido}; desconecte um servidor ou aumente a janela nas Escalas",
+    "janelaSemLugar": "a janela é de {janela} tokens: as ferramentas e a identidade já ocupam {fixo} e este pedido precisa de {pedido} mesmo com a conversa resumida; desconecte um servidor ou aumente a janela nas Escalas",
+    "nadaParaResumir": "não havia o que resumir: o trecho a comprimir está vazio",
+    "resumoVazio": "o modelo devolveu um resumo vazio; aumente a janela ou envie de novo",
     "lacoDeFerramentas": "o modelo pediu ferramentas {n} vezes sem concluir; parei para não entrar em laço",
     "renderizarConversa": "falha ao renderizar a conversa",
     "tokenizar": "falha ao tokenizar o prompt: {detalhe}",

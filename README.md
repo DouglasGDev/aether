@@ -65,10 +65,11 @@ movido se um hash divergir. Veja
   esquece o KV: a conversa seguinte não herda o estado da anterior. O índice e as
   mensagens ficam em `%APPDATA%\ai.aether.core\conversas` e voltam onde estavam
   depois de fechar e abrir o aplicativo.
-- **Bancada** — uma suíte de seis casos que roda dentro do aplicativo, contra o
+- **Bancada** — uma suíte de sete casos que roda dentro do aplicativo, contra o
   modelo carregado e a placa real, e mede cada um: motor na placa, bibliotecas do
   runtime, esquecimento do KV entre conversas, reaproveitamento do prefixo, parada
-  da resposta e texto em fluxo. Cada caso traz suas medidas e um veredito
+  da resposta, texto em fluxo e compactação da conversa longa. Cada caso traz suas
+  medidas e um veredito
   aprovado/reprovado; nenhum caso é aprovado por suposição — ele aprova o que o
   motor devolveu naquela rodada. A bancada não começa com um turno de conversa em
   curso, e o botão *Parar* dela usa o mesmo interruptor de cancelamento do chat.
@@ -83,9 +84,19 @@ movido se um hash divergir. Veja
   prefill de 30 ms contra 67 ms com o cache esquecido. Numa conversa real, o
   turno mostrou 2.034 dos 2.467 tokens de entrada já calculados — 433 tokens
   novos.
+- **Compactação** — o turno que não cabe na janela deixa de ser recusa: o próprio
+  modelo resume os turnos mais antigos, dentro de uma reserva de até 320 tokens, e
+  a resposta continua com o resumo no lugar do texto velho. Medido nesta máquina,
+  na mesma conversa: com a janela em 4.096 o pedido entrou com 7 mensagens
+  dobradas em um resumo escrito pelo modelo (108 tokens de saída, 4.443 de
+  entrada, 5,4 s no motor) e a resposta veio; com a janela em 65.536 a mesma
+  conversa coube inteira e o turno custou 4.324 tokens de entrada, 2,2 s, sem
+  dobra nenhuma. O caso da bancada que mede isso aprovou com janela 4.096, limite
+  de prompt 3.840, 1 dobra e 55 tokens gerados (2.891 ms) — e reprova, com os
+  números do banner antigo, se a decisão de dobrar volta a ser recusa.
 - **Medidas visíveis** — tokens de entrada e saída, quantos deles vieram do cache,
   tokens/s de prefill e decode, tempo no motor, motivo de parada e quantas
-  mensagens ficaram fora da janela.
+  mensagens entraram no resumo daquela resposta.
 - **Runtime nativo** — as DLLs de que o motor e a voz dependem não são um passo
   manual: o aplicativo baixa o pacote oficial (llama.cpp b12387 Vulkan, 38.119.681
   bytes; sherpa-onnx 1.13.8, 8.032.957 bytes), confere arquivo por arquivo contra
@@ -187,9 +198,16 @@ instalados). Nenhum desses arquivos sai da máquina.
   atenção pura (Granite 4.2 3B) o recorte acontece e é medido.
 - Adaptadores LoRA/QLoRA por turno estão em construção; o que existe hoje é o
   catálogo GGUF, o roteador e a montagem de contexto.
-- Janela e teto de tokens são escalas do usuário. Quando o pedido não cabe nem
-  derrubando o histórico, o aplicativo diz quantos tokens têm o prompt fixo e o
-  pedido, em vez de cortar em silêncio.
+- Janela e teto de tokens são escalas do usuário. A escada de janela vai até o
+  `context_length` que o GGUF instalado publica no próprio cabeçalho (262.144 no
+  Ornith 1.5 9B, 131.072 no Granite 4.2 3B). As Escalas também mostram, medido na
+  última carga, a maior janela que ainda vai inteira na placa — 65.536 aqui, com
+  16.195.903.344 bytes livres na Vulkan0 no momento da leitura — e um botão leva a
+  escala para esse número. Acima do que a placa leva o alojamento passa a
+  *dividida* e a tela diz quantas camadas ficaram na placa; o pedido continua
+  autorizado, porque a janela maior é escala do usuário, não do motor. O resumo é
+  a última saída: se nem com a conversa dobrada o prompt fixo e o pedido cabem, o
+  aplicativo diz quantos tokens são cada um, em vez de cortar em silêncio.
 
 ## Licença e contribuições
 

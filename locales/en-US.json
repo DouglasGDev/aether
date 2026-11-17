@@ -115,7 +115,10 @@
     "aguardando": "Waiting for your decision",
     "tokens": "{saida} output tokens · {entrada} input",
     "reaproveitados": "{n} input tokens reused",
-    "foraDeContexto": "{n} old messages were left out of this reply",
+    "dobradas": "{n} old messages went into this reply's summary",
+    "resumo": "Summary of the earlier messages in this conversation — their text is no longer here: {texto}",
+    "resumoTitulo": "Summary",
+    "resumoMensagens": "{n} messages folded",
     "codigoLinhas": "{n} lines",
     "codigoSemLinguagem": "code",
     "mostrarTudo": "Show all",
@@ -131,6 +134,11 @@
     "paradaLimite": "cut by the token limit",
     "paradaCancelada": "you stopped it",
     "paradaJanela": "cut by a full window"
+  },
+  "compactacao": {
+    "instrucao": "You compress the beginning of an assistant conversation. Reply with the summary only, in English: what the person asked, what was already done, the paths, names and values mentioned, and what is still pending. At most eight sentences, no preamble and no talk about the summary.",
+    "anterior": "Summary of the messages already compressed before these: {texto}",
+    "pedido": "Summarize everything that comes before this message."
   },
   "aprovacao": {
     "titulo": "Needs your approval",
@@ -280,6 +288,8 @@
     "sementeSorteio": "drawn every turn",
     "sementeNova": "Draw a new seed",
     "contexto": "Context window",
+    "janelaInteira": "fits the card up to {n}",
+    "janelaInteiraUsar": "set to the window that fits the card",
     "janela": "Window",
     "pensamento": "Show the reasoning",
     "pensamentoCusto": "Reasoning takes tokens before the first word.",
@@ -585,7 +595,8 @@
       "esquecer": "Forgetting between chats",
       "prefixo": "Reusing the prefix",
       "parada": "Where the answer stops",
-      "fluxo": "Streaming text"
+      "fluxo": "Streaming text",
+      "dobrar": "Compact the long conversation"
     },
     "cancelado": "the bench was stopped before this case",
     "semModelo": "no complete model on disk to run this case",
@@ -633,6 +644,12 @@
     "fluxo": {
       "divergiu": "the streamed text is not the final answer"
     },
+    "dobrar": {
+      "semLugar": "folding was not enough: {fixo} fixed tokens and {pedido} of the request against a {janela} window",
+      "parou": "the conversation needed more folds than the case allows",
+      "cabeu": "the conversation built here fit the window: the case measured no fold at all",
+      "estourou": "the prompt stayed over the limit after folding"
+    },
     "medida": {
       "motor": "engine",
       "placa": "graphics card",
@@ -653,7 +670,10 @@
       "motivo": "reason it stopped",
       "gerados": "tokens generated",
       "caracteres": "characters",
-      "velocidade": "tokens/s"
+      "velocidade": "tokens/s",
+      "janela": "engine window",
+      "limite": "prompt limit",
+      "dobras": "folds made"
     }
   },
   "erros": {
@@ -664,7 +684,9 @@
     "semModeloParaPedido": "no model available for this request",
     "modeloForaDoCatalogo": "the router chose {modelo}, which isn't in the catalog",
     "pedidoCancelado": "request canceled",
-    "janelaSemLugar": "the window is {janela} tokens: the tools and identity already take {fixo} and this request needs {pedido}; disconnect a server or raise the window in the generation scales",
+    "janelaSemLugar": "the window is {janela} tokens: the tools and identity already take {fixo} and this request needs {pedido} even with the conversation summarized; disconnect a server or raise the window in the generation scales",
+    "nadaParaResumir": "there was nothing to summarize: the section to compress is empty",
+    "resumoVazio": "the model returned an empty summary; raise the window or send it again",
     "lacoDeFerramentas": "the model requested tools {n} times without finishing; I stopped to avoid a loop",
     "renderizarConversa": "failed to render the conversation",
     "tokenizar": "failed to tokenize the prompt: {detalhe}",

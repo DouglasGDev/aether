@@ -280,6 +280,9 @@ export default function App() {
           case "replace":
             turn.text = event.text;
             break;
+          case "resumo":
+            turn.resumo = { texto: event.texto, mensagens: event.mensagens };
+            break;
           case "memoria":
             turn.memoria = {
               type: "memoria",

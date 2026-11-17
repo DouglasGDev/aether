@@ -18,10 +18,14 @@ pub const TOP_K_MAX: u32 = 200;
 pub const MAX_TOKENS_MIN: u32 = 16;
 pub const MAX_TOKENS_MAX: u32 = 8192;
 /// A janela que o núcleo aceita reservar. O teto é o maior `context_limit` do
-/// catálogo; abaixo disso cada placa decide o que sobrevive, e o que ela aceitou
-/// é o que `Engine::context` devolve.
+/// catálogo — hoje 262.144, o que o Ornith 1.5 9B publica no cabeçalho dos
+/// próprios pesos. Acima disso cada placa decide o que sobrevive, e o que ela
+/// aceitou é o que `Engine::context` devolve: `alojamento::alojar` mede os pesos
+/// mais o KV da janela pedida contra a VRAM livre lida agora, e o veredito vira
+/// `n_gpu_layers` na carga. Pedir a janela inteira do modelo numa placa que não
+/// segura o KV não é falha — é o modelo morando na RAM, mais devagar.
 pub const CONTEXTO_MIN: u32 = 2048;
-pub const CONTEXTO_MAX: u32 = 32_768;
+pub const CONTEXTO_MAX: u32 = 262_144;
 pub const RODADAS_MIN: u32 = 1;
 pub const RODADAS_MAX: u32 = 8;
 

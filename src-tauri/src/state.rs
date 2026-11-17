@@ -99,6 +99,11 @@ pub struct AiRuntime {
     /// UI precisa ler o nome do modelo nesse meio tempo para mostrar o card.
     loaded_id: Mutex<Option<String>>,
     pub history: Mutex<Vec<ChatMessage>>,
+    /// O resumo dos turnos que já saíram do prompt da conversa viva. É do mesmo
+    /// dono do `history` acima — troca de conversa, troca ele — e é gravado junto
+    /// dela: recompôr o resumo a cada turno seria cobrar da placa um texto que
+    /// ela já escreveu.
+    pub resumo: Mutex<Option<crate::ai::compactacao::Resumo>>,
     pub cancel: Arc<AtomicBool>,
     busy: AtomicBool,
     /// Um cancelador por download em curso. A UI precisa poder interromper sem
@@ -129,6 +134,7 @@ impl AiRuntime {
             loaded: Mutex::new(None),
             loaded_id: Mutex::new(None),
             history: Mutex::new(Vec::new()),
+            resumo: Mutex::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
             busy: AtomicBool::new(false),
             downloads: Mutex::new(HashMap::new()),

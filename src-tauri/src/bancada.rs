@@ -20,14 +20,19 @@ use std::time::Instant;
 
 use crate::ai::alojamento::Capacidade;
 use crate::ai::catalog::ModelSpec;
-use crate::ai::session::{TURN_MARKER, system_prompt};
-use crate::ai::{ChatMessage, ChatTemplate, Emission, Engine, Generation, SamplingParams, StopReason};
+use crate::ai::compactacao::{self, Resumo};
+use crate::ai::session::{encaixe, Encaixe, TURN_MARKER, system_prompt};
+use crate::ai::{ChatMessage, ChatTemplate, Emission, Engine, Generation, SamplingParams, StopReason, TurnConfig};
 use crate::idiomas::{self, tr};
 use crate::runtime;
 use crate::state::{AiRuntime, LoadedModel};
 
 /// Os casos da suíte, na ordem em que a tela os mostra.
-pub const CASOS: &[&str] = &["placa", "runtime", "esquecer", "prefixo", "parada", "fluxo"];
+pub const CASOS: &[&str] = &["placa", "runtime", "esquecer", "prefixo", "parada", "fluxo", "dobrar"];
+
+/// As dobras que `caso_dobrar` tem permissão para fazer antes de dar o caso por
+/// reprovado. A conversa montada dobra em duas; o resto é folga.
+const DOBRAS_MAX: usize = 4;
 
 /// O que a tela mostra de um caso: nunca uma opinião sem o número atrás.
 #[derive(Debug, Clone, Serialize)]
@@ -550,6 +555,124 @@ fn caso_fluxo(
     Ok(veredito("fluxo", Estado::Reprovado, medidas, Some(t("bancada.fluxo.divergiu")), inicio))
 }
 
+/// A conversa que não cabe e o aplicativo recusava em vez de continuar: foi assim
+/// que o dono da máquina viu "a janela é de N tokens, aumente a janela nas
+/// Escalas" no meio de um trabalho de verdade. O caso monta uma conversa maior
+/// que a janela do motor e exige as três condições da correção — a primeira
+/// decisão é dobrar (não é `SemLugar`, que é o banner na tela), o resumo sai do
+/// modelo dentro da reserva que a dobra separou para ele, e relido com o resumo
+/// dentro o prompt cabe. Com o `encaixe` de antes, o caso para no primeiro
+/// `SemLugar` e diz a janela, o fixo e o pedido, que são exatamente os números do
+/// banner.
+fn caso_dobrar(
+    engine: &mut Engine,
+    template: &ChatTemplate,
+    cancel: &AtomicBool,
+    inicio: Instant,
+) -> anyhow::Result<Resultado> {
+    let janela = engine.context();
+    let params = escala(256);
+    let config = TurnConfig {
+        tools: &[],
+        params: &params,
+        enable_thinking: false,
+        max_rounds: 2,
+        resumo: None,
+        memoria: None,
+        pastas: None,
+    };
+    // Um terço de janela por resposta, quatro respostas: a conta passa do limite
+    // em qualquer janela, e dobra-se pouco mais de uma vez — que é o que uma
+    // conversa longa faz. Um despejo só, do tamanho da janela inteira, não é o
+    // caso: nenhum resumo caberia dentro do prompt que resume.
+    let alvo = (janela / 3).max(64);
+    let linha = t("bancada.enchimento");
+    let mut corpo = String::new();
+    while engine.count_tokens(&corpo).unwrap_or(usize::MAX) < alvo && corpo.len() < 2_000_000 {
+        corpo.push_str(&linha);
+        corpo.push('\n');
+    }
+    let mut history = vec![
+        ChatMessage::new("system", system_prompt()),
+        ChatMessage::new("user", "Comece um trabalho longo."),
+    ];
+    for _ in 0..4 {
+        history.push(ChatMessage::new("assistant", corpo.as_str()));
+        history.push(ChatMessage::new("user", "Continue de onde parou."));
+    }
+
+    engine.reset();
+    let limite = compactacao::limite(janela, params.max_tokens);
+    let mut resumo: Option<Resumo> = None;
+    let mut dobras = 0usize;
+    let mut tokens_do_resumo = 0usize;
+    let decisão = loop {
+        match encaixe(engine, template, &history, &config, None, resumo.as_ref())? {
+            Encaixe::Cabe { ids, dobradas } => break Ok((ids.len(), dobradas)),
+            Encaixe::SemLugar { janela, fixo, pedido } => break Err(tr(
+                "bancada.dobrar.semLugar",
+                &[
+                    ("janela", &inteiro(janela)),
+                    ("fixo", &inteiro(fixo)),
+                    ("pedido", &inteiro(pedido)),
+                ],
+            )),
+            Encaixe::Dobre { desde, ate } => {
+                // Parar aqui com o histórico fora é o caso dizendo que a dobra
+                // não converge — não é a bancada girando para sempre na placa.
+                if dobras >= DOBRAS_MAX {
+                    break Err(t("bancada.dobrar.parou"));
+                }
+                let anterior = resumo.as_ref().map(|r| r.texto.as_str());
+                let (texto, gasto) = match compactacao::dobrar(
+                    engine,
+                    template,
+                    &params,
+                    anterior,
+                    &history[desde..ate],
+                    cancel,
+                ) {
+                    Ok(feita) => feita,
+                    Err(erro) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Ok(cancelado("dobrar", inicio));
+                        }
+                        return Err(erro);
+                    }
+                };
+                dobras += 1;
+                tokens_do_resumo += gasto.generated_tokens;
+                resumo = Some(Resumo { texto, ate });
+            }
+        }
+    };
+    let medidas = vec![
+        medida("bancada.medida.janela", inteiro(janela)),
+        medida("bancada.medida.limite", inteiro(limite)),
+        medida("bancada.medida.dobras", inteiro(dobras)),
+        medida("bancada.medida.gerados", inteiro(tokens_do_resumo)),
+    ];
+    let (prompt, dobradas) = match decisão {
+        // Cabe no primeiro exame significa que a conversa montada não passou do
+        // limite: o caso não mediu o que diz medir, e a bancada diz isso em vez de
+        // aprovar um verde sem defeito nenhum ali.
+        Ok((_, 0)) if dobras == 0 => {
+            return Ok(veredito("dobrar", Estado::Reprovado, medidas, Some(t("bancada.dobrar.cabeu")), inicio));
+        }
+        Ok(feito) => feito,
+        Err(motivo) => return Ok(veredito("dobrar", Estado::Reprovado, medidas, Some(motivo), inicio)),
+    };
+    let texto = resumo.map(|r| r.texto).unwrap_or_default();
+    if prompt <= limite
+        && dobradas > 0
+        && !texto.trim().is_empty()
+        && tokens_do_resumo <= compactacao::TETO_TOKENS * dobras.max(1)
+    {
+        return Ok(veredito("dobrar", Estado::Aprovado, medidas, None, inicio));
+    }
+    Ok(veredito("dobrar", Estado::Reprovado, medidas, Some(t("bancada.dobrar.estourou")), inicio))
+}
+
 // ─── A execução ───────────────────────────────────────────────────────────────
 
 /// Roda a suíte inteira contra o modelo que o aplicativo está usando — ou contra
@@ -611,6 +734,7 @@ pub fn rodar(
                 "prefixo" => caso_prefixo(&mut carregado.engine, &carregado.template, cancel, inicio),
                 "parada" => caso_parada(&mut carregado.engine, &carregado.template, cancel, inicio),
                 "fluxo" => caso_fluxo(&mut carregado.engine, &carregado.template, cancel, inicio),
+                "dobrar" => caso_dobrar(&mut carregado.engine, &carregado.template, cancel, inicio),
                 outra => Err(anyhow::anyhow!(tr("bancada.casoDesconhecido", &[("id", outra)]))),
             }
         };

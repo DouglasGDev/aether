@@ -232,6 +232,12 @@ export interface Acelerador {
   motivo: string | null;
   /** Onde os bytes ficaram; `null` só na CPU, onde não há placa. */
   alojado: Alojado | null;
+  /**
+   * A maior janela de potência de dois em que o modelo ainda iria inteiro para a
+   * placa, medida com a VRAM livre desta máquina. `null` é a CPU, ou o modelo
+   * que não cabe inteiro em janela nenhuma.
+   */
+  janelaInteira: number | null;
 }
 
 /// As escalas que o dono da máquina escolheu em `geracao.json`. Cada uma delas
@@ -402,8 +408,15 @@ export interface Medicao {
   /// Tokens por segundo na leitura do prompt.
   prefillTokensPorSegundo: number;
   stop: StopReason;
-  /// Mensagens que não caberam na janela e ficaram de fora do prompt.
-  descartadas: number;
+  /// Mensagens que entraram no prompt como resumo em vez de como texto. Zero é
+  /// a conversa inteira ao pé da letra.
+  dobradas: number;
+}
+
+/// O resumo que um turno deixou para a conversa, e até onde ele cobre.
+export interface Resumo {
+  texto: string;
+  ate: number;
 }
 
 export interface TurnOutcome {
@@ -411,6 +424,7 @@ export interface TurnOutcome {
   thinking: string;
   rounds: number;
   medicao: Medicao;
+  resumo: Resumo | null;
 }
 
 export type ChatEvent =
@@ -419,6 +433,14 @@ export type ChatEvent =
   | { type: "thinking"; text: string }
   | { type: "delta"; text: string }
   | { type: "replace"; text: string }
+  | {
+      /// O modelo dobrou os turnos antigos no resumo para caber na janela. Não é
+      /// rodapé: é o assistente dizendo que parou de ler aquilo ao pé da letra.
+      type: "resumo";
+      texto: string;
+      mensagens: number;
+      tokens: number;
+    }
   | { type: "toolCall"; name: string; arguments: unknown }
   | {
       type: "toolResult";

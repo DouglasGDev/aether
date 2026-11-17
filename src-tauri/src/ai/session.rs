@@ -8,6 +8,7 @@ use super::chat::{
     CALL_OPEN, ChatMessage, ChatTemplate, ToolCall, ToolSpec, afirma_que_fez, chamada_pendente,
     corpo_de_codigo, inicio_de_chamada, parse_tool_calls, promete_e_pede_licenca, strip_tool_calls,
 };
+use super::compactacao::{self, Resumo};
 use super::engine::{Emission, Engine, SamplingParams, StopReason};
 use super::memoria::Achado;
 use super::router::Choice;
@@ -80,6 +81,10 @@ pub enum SessionEvent {
     Thinking { text: String },
     Delta { text: String },
     Replace { text: String },
+    /// O modelo dobrou turnos antigos no resumo para caber na janela. Não é
+    /// recado de rodapé: é o assistente dizendo que parou de ler aquilo ao pé da
+    /// letra, e o que ele escreveu no lugar.
+    Resumo { texto: String, mensagens: usize, tokens: usize },
     ToolCall { name: String, arguments: serde_json::Value },
     /// O que a injeção automática pôs no prompt antes do primeiro token. Não é
     /// uma ferramenta que o modelo pediu: é memória que ele recebeu sem ter que
@@ -133,10 +138,10 @@ pub struct Medicao {
     /// Tokens por segundo no prefill, que é o custo de ler o histórico outra vez.
     pub prefill_tokens_por_segundo: f64,
     pub stop: StopReason,
-    /// Quantas mensagens ficaram de fora do prompt porque a janela não comportava
-    /// todas. Zero é o normal; um número aqui é o modelo dizendo, em números, que
-    /// deixou de ler o começo da conversa.
-    pub descartadas: usize,
+    /// Quantas mensagens entraram no prompt como resumo em vez de como texto.
+    /// Zero é a conversa inteira ao pé da letra; um número aqui é o modelo
+    /// dizendo que leu o começo da conversa condensado — e mostrando que leu.
+    pub dobradas: usize,
 }
 
 impl Medicao {
@@ -150,7 +155,7 @@ impl Medicao {
         prompt_ms: u64,
         decode_ms: u64,
         stop: StopReason,
-        descartadas: usize,
+        dobradas: usize,
     ) -> Self {
         Self {
             prompt_tokens,
@@ -169,7 +174,7 @@ impl Medicao {
                 0.0
             },
             stop,
-            descartadas,
+            dobradas,
         }
     }
 }
@@ -188,6 +193,11 @@ pub struct TurnOutcome {
     pub thinking: String,
     pub rounds: usize,
     pub medicao: Medicao,
+    /// O resumo que o turno deixou para a conversa — o que ele escreveu agora,
+    /// ou o que já estava guardado e continua cobrindo. Quem persiste a conversa
+    /// grava isto junto: recompor o resumo a cada turno seria cobrar da placa o
+    /// trabalho que ela já fez.
+    pub resumo: Option<Resumo>,
 }
 
 pub struct TurnConfig<'a> {
@@ -198,6 +208,9 @@ pub struct TurnConfig<'a> {
     /// que alucina a mesma chamada para sempre queima a placa e a paciência de
     /// quem espera. O valor vem de `geracao.json`.
     pub max_rounds: usize,
+    /// O resumo dos turnos que já saíram do prompt, com o índice até onde ele
+    /// cobre. `None` é a conversa lida inteira, que é o começo de tudo.
+    pub resumo: Option<Resumo>,
     /// O bloco de memória que a busca do RAG devolveu para este pedido. Ele só
     /// existe na renderização: o histórico guardado continua sendo o que o
     /// usuário digitou, e cada pedido novo busca de novo contra as pastas de
@@ -289,7 +302,7 @@ fn com_estado(
 /// A cabeça do recorte: a posição mais cedo da conversa que ainda deixa o
 /// prompt caber. `medir` devolve quantos tokens tem o prompt cortando antes de
 /// uma posição, e só encolhe conforme a posição avança — é por isso que a busca
-/// é binária. `None` é honesto: nem derrubando todos os turnos anteriores cabe.
+/// é binária. `None` é honesto: nem sobrando só o último pedido cabe.
 fn cabeca_que_cabe(
     cabecas: &[usize],
     limite: usize,
@@ -314,85 +327,106 @@ fn cabeca_que_cabe(
     Ok(Some(cabecas[baixo]))
 }
 
-/// O prompt cabe na janela por construção: quando não cabe, as mensagens mais
-/// antigas saem do que é renderizado, e nada mais. O histórico guardado fica
-/// inteiro — o recorte é só da leitura do modelo, e a conversa na tela não perde
-/// linha nenhuma. O corte sempre cai num começo de turno (uma mensagem do
-/// usuário), nunca no meio: derrubar um resultado de ferramenta sem o pedido que
-/// o gerou deixaria o modelo lendo uma resposta órfã. O prompt de sistema nunca
-/// sai, porque é ele que diz quem o modelo é.
+/// Onde a conversa pode ser dobrada sem mentir para o modelo: o começo de um
+/// pedido da pessoa ou o começo de uma rodada de ferramenta. Um resultado de
+/// ferramenta nunca é fronteira — deixá-lo sozinho, sem a chamada que o produziu,
+/// é o modelo lendo uma resposta órfã.
+fn fronteiras(history: &[ChatMessage], desde: usize) -> Vec<usize> {
+    (desde + 1..history.len())
+        .filter(|&i| {
+            let m = &history[i];
+            m.role == "user" || (m.role == "assistant" && m.tool_calls.is_some())
+        })
+        .collect()
+}
+
+/// O que a janela decidiu sobre uma conversa. Três saídas, cada uma com um dono:
+/// o turno escreve o resumo, o turno devolve o erro.
 ///
-/// Devolve os tokens do prompt e quantas mensagens ficaram de fora.
+/// `pub(crate)` não é folga de visibilidade: é a bancada conferir a decisão
+/// mesma que o turno obedece, caso a caso, com o motor real em placa.
+pub(crate) enum Encaixe {
+    /// Cabe. Os tokens do prompt e quantas mensagens entraram como resumo.
+    Cabe { ids: Vec<u32>, dobradas: usize },
+    /// Não cabe. Dobre as mensagens de `desde` até `ate` no resumo e meça de
+    /// novo; `ate` é fronteira de turno, nunca meio de resposta.
+    Dobre { desde: usize, ate: usize },
+    /// Nem sobrando só o pedido atual cabe. Os números são os que a interface
+    /// precisa dizer: a janela, o prompt fixo (identidade mais ferramentas) e o
+    /// que a pessoa escreveu.
+    SemLugar { janela: usize, fixo: usize, pedido: usize },
+}
+
+/// O prompt cabe na janela por construção: quando não cabe, as mensagens mais
+/// antigas não são derrubadas — elas viram resumo escrito pelo próprio modelo,
+/// que entra no prompt no lugar delas. O histórico guardado fica inteiro, a
+/// conversa na tela não perde linha nenhuma, e o que o modelo deixa de ler ao pé
+/// da letra ele passa a ler condensado. O prompt de sistema nunca sai, porque é
+/// ele que diz quem o modelo é.
+///
+/// A reserva é o que impede a compactação de correr atrás do próprio rabo: sem
+/// espaço separado para o resumo, o corte escolhido caberia até o resumo nascer
+/// — e aí nasceria sem onde ficar.
 ///
 /// `cabecilha` é texto que entra depois do prompt de geração, na boca do
 /// assistente. Ela conta na medida porque ocupa a janela igual a qualquer token
 /// lido.
-fn encaixe(
-    engine: &mut Engine,
+pub(crate) fn encaixe(
+    engine: &Engine,
     template: &ChatTemplate,
     history: &[ChatMessage],
     config: &TurnConfig,
     cabecilha: Option<&str>,
-) -> Result<(Vec<u32>, usize)> {
+    resumo: Option<&Resumo>,
+) -> Result<Encaixe> {
     let janela = engine.context();
-    // A resposta também precisa de espaço: um prompt que enche a janela não
-    // deixa o modelo dizer nada. A reserva é o teto de tokens de saída, e nunca
-    // passa de metade — o modelo precisa ter o que ler.
-    let limite = janela
-        .saturating_sub(config.params.max_tokens.min(janela / 2))
-        .max(1);
+    let limite = compactacao::limite(janela, config.params.max_tokens);
     let base = usize::from(history.first().map(|m| m.role == "system").unwrap_or(false));
-    let medir = |cabeca: usize| -> Result<Vec<u32>> {
-        let mut recorte = Vec::with_capacity(base + history.len() - cabeca);
+    // Índice da primeira mensagem que ainda não está no resumo.
+    let desde = resumo.map(|r| r.ate.max(base)).unwrap_or(base);
+    // `com_resumo` é o que distingue "o que está de pé agora" de "o que sobra
+    // depois de dobrar": na segunda conta o texto velho sai e o resumo novo —
+    // ainda não escrito — entra mais adiante, com o teto dele reservado.
+    let medir = |cabeca: usize, com_resumo: bool| -> Result<Vec<u32>> {
+        let mut recorte = Vec::with_capacity(base + 1 + history.len() - cabeca);
         recorte.extend_from_slice(&history[..base]);
+        if com_resumo {
+            if let Some(r) = resumo {
+                recorte.push(r.mensagem());
+            }
+        }
         recorte.extend_from_slice(&history[cabeca..]);
+        let conversa =
+            com_estado(&recorte, config.memoria.as_deref(), config.pastas.as_deref());
         let prompt = template
-            .render(&recorte, config.tools, config.enable_thinking)
+            .render(&conversa, config.tools, config.enable_thinking)
             .context(tr("erros.renderizarConversa", &[]))?;
-        let codificador = engine.tokenizer();
-        let mut ids = codificador
-            .encode(prompt.as_str(), false)
-            .map_err(|e| anyhow::anyhow!(tr("erros.tokenizar", &[("detalhe", &e.to_string())])))?
-            .get_ids()
-            .to_vec();
+        let mut ids = compactacao::codificar(engine, prompt.as_str())?;
         if let Some(texto) = cabecilha {
-            ids.extend(
-                codificador
-                    .encode(texto, false)
-                    .map_err(|e| anyhow::anyhow!(tr("erros.tokenizar", &[("detalhe", &e.to_string())])))?
-                    .get_ids(),
-            );
+            ids.extend(compactacao::codificar(engine, texto)?);
         }
         Ok(ids)
     };
 
-    // Cortar em `base` é não cortar: o histórico inteiro.
-    let ids = medir(base)?;
+    // Cortar em `desde` é não cortar nada agora: o que está de pé, com o resumo
+    // que já existe.
+    let ids = medir(desde, true)?;
     if ids.len() <= limite {
-        return Ok((ids, 0));
+        return Ok(Encaixe::Cabe { ids, dobradas: desde - base });
     }
 
-    let cabecas: Vec<usize> = ((base + 1)..history.len())
-        .filter(|&i| history[i].role == "user")
-        .collect();
-    let Some(cabeca) = cabeca_que_cabe(&cabecas, limite, &|i| Ok(medir(i)?.len()))? else {
-        // Nada a derrubar, ou o que sobra ainda não cabe. O que a interface
-        // precisa dizer é onde foram os tokens: o prompt fixo é a identidade mais
-        // as ferramentas, e o pedido é o que a pessoa escreveu.
-        let minima = cabecas.last().copied().unwrap_or(base);
-        let pedido = medir(minima)?.len();
-        let fixo = medir(history.len())?.len();
-        bail!(tr(
-            "erros.janelaSemLugar",
-            &[
-                ("janela", &janela.to_string()),
-                ("fixo", &fixo.to_string()),
-                ("pedido", &pedido.to_string()),
-            ]
-        ));
+    let dobras = fronteiras(history, desde);
+    let teto_dobrado = limite.saturating_sub(compactacao::RESERVA).max(1);
+    let Some(ate) = cabeca_que_cabe(&dobras, teto_dobrado, &|i| Ok(medir(i, false)?.len()))?
+    else {
+        // Nada a dobrar, ou o que sobra ainda não cabe — com a janela do modelo
+        // inteiro dentro, o que não couber é maior que a conversa.
+        let minima = dobras.last().copied().unwrap_or(desde);
+        let pedido = medir(minima, true)?.len();
+        let fixo = medir(history.len(), false)?.len();
+        return Ok(Encaixe::SemLugar { janela, fixo, pedido });
     };
-    let ids = medir(cabeca)?;
-    Ok((ids, cabeca - base))
+    Ok(Encaixe::Dobre { desde, ate })
 }
 
 /// A cabeceira que fecha a prosa, quando a resposta é um arquivo cercado com
@@ -473,20 +507,65 @@ pub fn run_turn(
     // guarda a promessa de "uma vez": sem este bool o turno pode reinvestir a
     // cabeceira indefinidamente enquanto o modelo responder em prosa.
     let mut cabeceira_usada = false;
+    // O que a conversa já tem de resumo, e o que este turno pode acrescentar a
+    // ele. É aqui dentro e não no `config` porque um turno com ferramentas pode
+    // dobrar mais de uma vez antes de responder.
+    let mut resumo = config.resumo.clone();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             bail!(tr("erros.pedidoCancelado", &[]));
         }
-        let (ids, fora) = {
-            let history = history.lock().expect("histórico envenenado");
-            let history =
-                com_estado(&history, config.memoria.as_deref(), config.pastas.as_deref());
-            encaixe(engine, template, &history, config, cabecilha.as_deref())?
+        // A conversa viva, fora do lock: dobrar é um turno de geração, e segurar
+        // o histórico enquanto o modelo escreve é prender a tela que o lê.
+        let conversa = history.lock().expect("histórico envenenado").to_vec();
+        let (ids, dobradas) = loop {
+            let decidido =
+                encaixe(engine, template, &conversa, config, cabecilha.as_deref(), resumo.as_ref())?;
+            match decidido {
+                Encaixe::Cabe { ids, dobradas } => break (ids, dobradas),
+                Encaixe::Dobre { desde, ate } => {
+                    if cancel.load(Ordering::Relaxed) {
+                        bail!(tr("erros.pedidoCancelado", &[]));
+                    }
+                    let (texto, gasto) = compactacao::dobrar(
+                        engine,
+                        template,
+                        config.params,
+                        resumo.as_ref().map(|r| r.texto.as_str()),
+                        &conversa[desde..ate],
+                        cancel,
+                    )?;
+                    // O resumo é um turno de verdade: leu tokens e escreveu
+                    // tokens, na placa. Contá-lo no turno é o que faz a medida
+                    // dizer quanto o pedido custou, e não quanto custou ignorando
+                    // o que foi preciso para caber.
+                    prompt_tokens += gasto.prompt_tokens;
+                    reused_tokens += gasto.reused_tokens;
+                    generated_tokens += gasto.generated_tokens;
+                    prompt_ms += gasto.prompt_ms;
+                    decode_ms += gasto.decode_ms;
+                    emit(SessionEvent::Resumo {
+                        texto: texto.clone(),
+                        mensagens: ate - desde,
+                        tokens: gasto.generated_tokens,
+                    });
+                    resumo = Some(Resumo { texto, ate });
+                }
+                Encaixe::SemLugar { janela, fixo, pedido } => {
+                    // A última saída, e só depois de dobrar o que dava para
+                    // dobrar: o que não cabe aqui não cabe nem sem conversa.
+                    bail!(tr(
+                        "erros.janelaSemLugar",
+                        &[
+                            ("janela", &janela.to_string()),
+                            ("fixo", &fixo.to_string()),
+                            ("pedido", &pedido.to_string()),
+                        ]
+                    ));
+                }
+            }
         };
-        // O recorte da rodada que gera agora é o que a interface mostra: foi
-        // isto que o modelo leu naquele turno.
-        let descartadas = fora;
 
         let mut raw = String::new();
         let mut shown = 0usize;
@@ -614,10 +693,10 @@ pub fn run_turn(
                 prompt_ms,
                 decode_ms,
                 generation.stop,
-                descartadas,
+                dobradas,
             );
             emit(SessionEvent::Done { text: text.clone(), rounds, medicao });
-            return Ok(TurnOutcome { text, thinking, rounds, medicao });
+            return Ok(TurnOutcome { text, thinking, rounds, medicao, resumo });
         }
 
         if rounds >= config.max_rounds {
@@ -817,6 +896,35 @@ mod tests {
         let achada =
             cabeca_que_cabe(&cabecas, 500, &|i| Ok(if i == 2 { 800 } else { 640 })).unwrap();
         assert_eq!(achada, None);
+    }
+
+    /// A fronteira é onde o modelo pode parar de ler sem ler uma resposta órfã:
+    /// o pedido da pessoa e a chamada de ferramenta. Um resultado de ferramenta
+    /// sozinho, sem a chamada que o gerou, não é começo de nada.
+    #[test]
+    fn dobrar_para_na_frenteira_de_turno_nunca_no_meio_de_uma_rodada() {
+        let chamada = ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                name: "local__ler_arquivo".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+        };
+        let history = vec![
+            ChatMessage::new("system", "prompt"),
+            ChatMessage::new("user", "leia"),
+            chamada.clone(),
+            ChatMessage::new("tool", "146 linhas"),
+            ChatMessage::new("assistant", "são 146 linhas"),
+            ChatMessage::new("user", "e agora"),
+        ];
+        assert_eq!(fronteiras(&history, 1), vec![2, 5]);
+        // Dobrar a partir da última fronteira não tem o que dobrar depois dela.
+        assert_eq!(fronteiras(&history, 5), Vec::<usize>::new());
+        // Uma resposta em prosa não é fronteira: ela é o fim de um turno, e
+        // cortá-la do pedido que a provocou deixaria o texto falando sozinho.
+        assert!(!fronteiras(&history, 1).contains(&4));
     }
 
     fn escrita(nome: &str) -> ToolSpec {

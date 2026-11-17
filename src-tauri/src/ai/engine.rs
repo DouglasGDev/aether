@@ -234,6 +234,14 @@ pub struct Acelerador {
     /// Onde os bytes ficaram, na placa que serviu. `None` só na CPU, onde não há
     /// placa para alojar nada.
     pub alojado: Option<Alojado>,
+    /// A maior janela de potência de dois em que este modelo ainda iria inteiro
+    /// para a placa — a mesma conta de `alojado`, varrida do teto que o arquivo
+    /// declara para baixo. É um número medido agora, com a VRAM livre desta
+    /// máquina, não uma ficha do folheto: por isso `None` na CPU e `None` para o
+    /// modelo que não cabe inteiro em janela nenhuma. A escala de geração oferece
+    /// este valor como o teto cômodo, e o que a pessoa pedir acima dele roda
+    /// dividido, mais devagar.
+    pub janela_inteira: Option<usize>,
 }
 
 /// A previsão feita com a VRAM livre de antes da carga, e o que a carga de fato
@@ -321,6 +329,20 @@ impl Engine {
             .as_ref()
             .map(super::alojamento::despacho)
             .unwrap_or(super::ggml::ffi::CAMADAS_NA_GPU);
+        // O teto cômodo que a escala de geração vai oferecer, medido com a mesma
+        // conta que acabou de comandar a carga: o livre lido antes dela e o
+        // cabeçalho destes pesos. Acima dele o veredito divide, e dividir é
+        // escolha de quem usa a máquina, não falha dela.
+        let inteira = ficha
+            .as_ref()
+            .zip(capacidade.as_ref())
+            .and_then(|(ficha, capacidade)| {
+                super::alojamento::maior_janela_inteira(
+                    ficha,
+                    Some(capacidade),
+                    super::geracao::CONTEXTO_MAX as usize,
+                )
+            });
         match ggml::Motor::novo(dlls, &weights, context, despacho) {
             Ok(motor) => {
                 let alojado = previsto.map(|previsto| {
@@ -336,6 +358,7 @@ impl Engine {
                     dispositivo: motor.dispositivo.clone(),
                     motivo: None,
                     alojado,
+                    janela_inteira: inteira,
                 };
                 Ok(Self {
                     model_id: model_id.to_string(),
@@ -366,6 +389,7 @@ impl Engine {
                         dispositivo: String::new(),
                         motivo: Some(falha_gpu.to_string()),
                         alojado: None,
+                        janela_inteira: None,
                     },
                 })
             }
@@ -763,6 +787,7 @@ mod tests {
             dispositivo: String::new(),
             motivo: Some("nenhuma GPU".to_string()),
             alojado: None,
+            janela_inteira: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains("\"tipo\":\"cpu\""));
@@ -777,6 +802,7 @@ mod tests {
             dispositivo: "AMD Radeon RX 9060 XT".to_string(),
             motivo: None,
             alojado: None,
+            janela_inteira: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains("RX 9060 XT"));
@@ -785,6 +811,7 @@ mod tests {
         // desenhar explicação onde não houve recusa.
         assert!(json.contains("\"motivo\":null"));
         assert!(json.contains("\"alojado\":null"));
+        assert!(json.contains("\"janelaInteira\":null"));
     }
 
     #[test]
@@ -807,6 +834,7 @@ mod tests {
                 },
                 cedido: 1900,
             }),
+            janela_inteira: Some(32768),
         };
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains("\"tipo\":\"gpu\""), "{json}");
@@ -815,5 +843,7 @@ mod tests {
         assert!(json.contains("\"tipo\":\"dividida\""), "{json}");
         assert!(json.contains("\"camadas\":21"), "{json}");
         assert!(json.contains("\"emRam\":1136"), "{json}");
+        // A escala lê esta chave para saber até onde o cursor pode ir inteiro.
+        assert!(json.contains("\"janelaInteira\":32768"), "{json}");
     }
 }

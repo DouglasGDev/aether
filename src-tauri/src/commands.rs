@@ -632,10 +632,11 @@ pub fn chat_history(state: State<'_, AppState>) -> Vec<ChatMessage> {
 pub fn chat_reset(state: State<'_, AppState>) -> Result<(), String> {
     state.ai.request_cancel();
     state.ai.history.lock().expect("histórico envenenado").clear();
+    *state.ai.resumo.lock().expect("resumo envenenado") = None;
     // O arquivo tem de dizer o mesmo que o buffer vivo: uma conversa limpa na
     // tela e cheia no disco voltaria cheia no próximo arranque.
     if let Some(id) = state.conversas.estado().ativa {
-        state.conversas.gravar(&id, &[]).map_err(report)?;
+        state.conversas.gravar(&id, &[], None).map_err(report)?;
     }
     Ok(())
 }
@@ -670,21 +671,24 @@ pub fn conversa_nova(state: State<'_, AppState>) -> Result<conversas::Estado, St
         state.conversas.criar().map_err(report)?;
     }
     state.ai.history.lock().expect("histórico envenenado").clear();
+    *state.ai.resumo.lock().expect("resumo envenenado") = None;
     state.ai.esquecer();
     Ok(state.conversas.estado())
 }
 
-/// Troca a conversa ativa: o histórico do arquivo entra no buffer vivo e o
-/// motor esquece o KV, porque o cache da conversa anterior não é prefixo desta.
+/// Troca a conversa ativa: o histórico do arquivo entra no buffer vivo, com o
+/// resumo que pertence a ele, e o motor esquece o KV — porque o cache da
+/// conversa anterior não é prefixo desta.
 #[tauri::command]
 pub fn conversa_abrir(state: State<'_, AppState>, id: String) -> Result<Vec<ChatMessage>, String> {
     if state.ai.is_busy() {
         return Err(tr("erros.turnoEmAndamento", &[]));
     }
-    let mensagens = state.conversas.abrir(&id).map_err(report)?;
-    *state.ai.history.lock().expect("histórico envenenado") = mensagens.clone();
+    let aberta = state.conversas.abrir(&id).map_err(report)?;
+    *state.ai.history.lock().expect("histórico envenenado") = aberta.mensagens.clone();
+    *state.ai.resumo.lock().expect("resumo envenenado") = aberta.resumo.clone();
     state.ai.esquecer();
-    Ok(mensagens)
+    Ok(aberta.mensagens)
 }
 
 #[tauri::command]
@@ -766,7 +770,8 @@ pub async fn chat_send(
         // ferramentas que já rodaram aconteceram, e a conversa é o registro
         // disso. O lock do histórico é tomado e largado antes do das conversas.
         let mensagens = ai.history.lock().expect("histórico envenenado").clone();
-        match (resultado, conversas.gravar(&id, &mensagens)) {
+        let resumo = ai.resumo.lock().expect("resumo envenenado").clone();
+        match (resultado, conversas.gravar(&id, &mensagens, resumo.as_ref())) {
             (Ok(desfecho), Ok(_)) => Ok(desfecho),
             // A causa do turno vem primeiro: ela é o que a pessoa precisa ver.
             (Err(erro), _) => Err(erro),
@@ -956,6 +961,7 @@ fn run_chat_turn(
         });
     }
     let params = ajustes.amostragem();
+    let resumo = ai.resumo.lock().expect("resumo envenenado").clone();
     let config = TurnConfig {
         tools: &specs,
         params: &params,
@@ -966,6 +972,7 @@ fn run_chat_turn(
         max_rounds: ajustes.rodadas as usize,
         memoria: bloco,
         pastas: bloco_pastas,
+        resumo,
     };
 
     {
@@ -995,6 +1002,12 @@ fn run_chat_turn(
         emit,
         run_tool,
     );
+    if let Ok(desfecho) = &turno {
+        // O resumo que o turno escreveu é do buffer vivo, como o histórico: sem
+        // isto o próximo pedido dobraria de novo os mesmos turnos, na placa, para
+        // chegar ao mesmo texto.
+        *ai.resumo.lock().expect("resumo envenenado") = desfecho.resumo.clone();
+    }
     if turno.is_err() {
         // O turno acima pôs o pedido no histórico antes de medir a janela, e
         // pode ter morrido antes do primeiro token: sem este desfazimento, cada

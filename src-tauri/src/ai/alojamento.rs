@@ -326,6 +326,36 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
     }
 }
 
+/// A maior janela de potência de dois, até `teto`, em que o modelo ainda cabe
+/// inteiro na placa. É o número que a escala de geração oferece como teto
+/// cômodo: acima dele o veredito vira `Dividida` e o fundo do modelo desce para
+/// a RAM — continua rodando, só custa mais lento, e a pessoa é quem decide se
+/// vale o troca.
+///
+/// A busca começa no teto e desce pela metade porque `alojar` é monotônico na
+/// janela: o KV cresce com ela, então se uma cabe, todas as menores cabem. Uma
+/// potência de dois é o que a reserva de KV aceita bem e o que a tela sabe
+/// mostrar. `None` é a placa que não segura nem os pesos — não é um zero.
+pub fn maior_janela_inteira(
+    ficha: &Ficha,
+    capacidade: Option<&Capacidade>,
+    teto: usize,
+) -> Option<usize> {
+    let cap = capacidade?;
+    let teto = ficha.janela_maxima.min(teto);
+    let mut janela = teto.next_power_of_two();
+    if janela > teto {
+        janela /= 2;
+    }
+    while janela > 0 {
+        if matches!(alojar(ficha, Some(cap), janela), Alojamento::Inteira { .. }) {
+            return Some(janela);
+        }
+        janela /= 2;
+    }
+    None
+}
+
 /// O veredito traduzido na moeda da carga: quantas camadas vão para a placa.
 /// Negativo é o sentinela do llama.cpp para "todas", zero é "nenhuma". Esta
 /// função existe porque prever sem obedecer é só uma tela bonita — o número que
@@ -488,6 +518,40 @@ mod testes {
             total: 16 * 1024 * 1024 * 1024,
         }), 4096);
         assert_eq!(despacho(&dividida), 10);
+    }
+
+    #[test]
+    fn a_recomendacao_para_na_maior_potencia_que_cabe_inteira() {
+        // A placa de 8 GiB leva este 3B inteiro até 65536 (2136 + 5120 + 220),
+        // e em 131072 o KV sozinho passa do livre. A resposta não é 131072 nem
+        // 7476: é a janela que a escala sabe oferecer.
+        let ficha = ficha_granite();
+        assert_eq!(maior_janela_inteira(&ficha, placa(8 * 1024).as_ref(), 131072), Some(65536));
+    }
+
+    #[test]
+    fn a_recomendacao_respeita_o_teto_do_arquivo_nao_o_pedido() {
+        // O teto que a tela oferece é o que o GGUF declara, e a ficha diz
+        // 131072 para o granite. Pedir 262144 não inventa janela no modelo.
+        let ficha = ficha_granite();
+        assert_eq!(maior_janela_inteira(&ficha, placa(16 * 1024).as_ref(), 262144), Some(131072));
+    }
+
+    #[test]
+    fn um_teto_fora_de_potencia_de_dois_arredonda_para_baixo() {
+        // 100000 não é janela que se reserve: começa-se em 65536 e desce-se até
+        // caber. Na placa de 4 GiB quem cabe é 16384 (2136 + 1280 + 220).
+        let ficha = ficha_granite();
+        assert_eq!(maior_janela_inteira(&ficha, placa(4 * 1024).as_ref(), 100_000), Some(16384));
+    }
+
+    #[test]
+    fn sem_placa_ou_sem_pesos_nao_ha_recomendacao() {
+        let ficha = ficha_granite();
+        assert_eq!(maior_janela_inteira(&ficha, None, 131072), None);
+        // Uma placa que não leva nem os pesos não tem janela cômoda alguma — e
+        // um zero aqui seria a tela oferecer uma janela que não roda.
+        assert_eq!(maior_janela_inteira(&ficha, placa(1000).as_ref(), 131072), None);
     }
 
     #[test]

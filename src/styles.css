@@ -1528,7 +1528,8 @@ button.small {
   height: 14px;
 }
 
-.talk-think {
+.talk-think,
+.talk-resumo {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -1536,7 +1537,8 @@ button.small {
   padding: 7px 11px;
 }
 
-.talk-think summary {
+.talk-think summary,
+.talk-resumo summary {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1548,16 +1550,19 @@ button.small {
   list-style: none;
 }
 
-.talk-think summary::-webkit-details-marker {
+.talk-think summary::-webkit-details-marker,
+.talk-resumo summary::-webkit-details-marker {
   display: none;
 }
 
-.talk-think summary .icon {
+.talk-think summary .icon,
+.talk-resumo summary .icon {
   width: 14px;
   height: 14px;
 }
 
-.talk-think p {
+.talk-think p,
+.talk-resumo p {
   margin: 8px 0 2px;
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
@@ -1565,6 +1570,11 @@ button.small {
   color: #a8b4cc;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.talk-resumo summary .contagem {
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .talk-tool {
