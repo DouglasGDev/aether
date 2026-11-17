@@ -8,6 +8,40 @@ arquivos e no terminal passa por um gate de permissão que a pessoa controla.
 **Ele não é** um front-end para LM Studio, Ollama ou uma API de nuvem: o motor de
 inferência é parte deste repositório, e o aplicativo é o dono da placa.
 
+## A tela
+
+As capturas abaixo são do aplicativo real rodando no Windows com a placa Vulkan,
+em 17 de novembro de 2026. Nada nelas é montado: as medidas saem do motor e da
+bancada.
+
+**O núcleo** — o orbe, as 11 ferramentas do conector embutido com o efeito de
+cada uma (`Só lê`, `Altera`, `Pode apagar`) e a faixa de conectores embaixo.
+
+![Tela inicial do Aether](docs/capturas/tela-inicial.png)
+
+**Um turno medido** — a resposta do Ornith 1.5 9B Q4_K_M com tokens de entrada e
+saída, tokens/s de prefill e de leitura, tempo no motor e o motivo da parada.
+
+![Conversa com as medidas do turno](docs/capturas/conversa.png)
+
+**A conexão MCP local** — as mesmas ferramentas do catálogo atendendo em
+`http://127.0.0.1:<porta>/mcp`. A porta é sorteada a cada execução e o token
+aparece mascarado na tela: ele só existe em memória e se copia, não se lê.
+
+![Seção Conexão MCP local servindo](docs/capturas/mcp-local.png)
+
+**A mesma conexão vista de fora** — um cliente MCP chamou `info_sistema` e o
+aplicativo segurou a execução até alguém aprovar; o card diz de onde veio a
+chamada (`Origem · Aether (MCP local)`) e o que o efeito dela é.
+
+![Card de aprovação de uma chamada recebida pelo servidor MCP local](docs/capturas/mcp-aprovacao.png)
+
+**A bancada** — a suíte que roda dentro do aplicativo. O caso `Conexão MCP
+local` mede a porta sorteada, quantas ferramentas o fio anuncia contra as 11 do
+catálogo e o `401` de quem chega sem token.
+
+![Bancada com os casos aprovados](docs/capturas/bancada.png)
+
 ## Como o modelo roda
 
 | Caminho | O que executa | Quando |
@@ -185,10 +219,12 @@ src/                 interface React + TypeScript
                      grafo, memória, voz, bancada
 src-tauri/src/       núcleo Rust
   ai/                motor, catálogo, download, alojamento, roteador, sessão, memória
-  bancada.rs         os seis casos medidos dentro do aplicativo
-  mcp/               cliente MCP, catálogo instalável, gate de aprovação
+  bancada.rs         os oito casos medidos dentro do aplicativo
+  mcp/               cliente MCP, catálogo instalável, gate de aprovação e o
+                     servidor que publica as ferramentas do próprio Aether
   local/             ferramentas locais e contenção de pastas
   voz/               fala (Kokoro) e escuta (Whisper)
+docs/capturas/       as imagens desta página
 locales/             pt-BR e en-US, a única fonte de texto do produto
 src-tauri/vendor/    cabeçalhos, licenças e somas dos binários de terceiros
 ```
