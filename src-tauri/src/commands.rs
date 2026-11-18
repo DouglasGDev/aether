@@ -911,7 +911,7 @@ pub async fn chat_send(
     let voz = Arc::clone(&state.voz);
     let app_fala = app.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let resultado = run_chat_turn(&app, &ai, &manager, &memoria, &pastas, &text);
+        let resultado = run_chat_turn(&app, &ai, &manager, &memoria, &pastas, &conversas, &id, &text);
         // Grava mesmo quando o turno falhou: o que o modelo já disse e as
         // ferramentas que já rodaram aconteceram, e a conversa é o registro
         // disso. O lock do histórico é tomado e largado antes do das conversas.
@@ -952,6 +952,8 @@ fn run_chat_turn(
     manager: &Arc<McpManager>,
     memoria: &Custodio,
     pastas: &Arc<RwLock<Pastas>>,
+    conversas: &Arc<conversas::Conversas>,
+    conversa: &str,
     text: &str,
 ) -> Result<TurnOutcome, String> {
     let emit = |event: SessionEvent| {
@@ -1011,8 +1013,20 @@ fn run_chat_turn(
     // injeção no mesmo instante — sem segundo interruptor a divergir.
     let sinapse = format!("{}__{}", local::CONECTOR, "buscar_memoria");
     let bloco = if manager.ferramenta_ativa(local::CONECTOR, "buscar_memoria") {
+        // As conversas salvas entram no índice antes de a busca rodar: é isto que
+        // faz "sobre o que falamos antes?" ter resposta numa sessão que começou
+        // vazia. Um turno sem conversa nova não paga vetor nenhum — a prova de
+        // cada conversa mora no próprio índice — e o que mudou cabe no orçamento
+        // de `TOKENS_POR_TURNO`, com o resto entrando no varrer.
+        let _ = memoria.revalidar_conversas(&conversas.para_memoria());
         let inicio = Instant::now();
-        let resposta = memoria.buscar(text, 0).ok();
+        // A conversa em curso fica de fora da injeção: o que ela já disse está no
+        // buffer do modelo, e reler isso custa as células que faltam para a
+        // lembrança que ele realmente não tem. A ferramenta, quando o modelo
+        // chama, responde por ela também — aí a pergunta é sobre o que a janela
+        // já perdeu.
+        let ignorar = [conversa.to_string()];
+        let resposta = memoria.buscar(text, 0, &ignorar).ok();
         match resposta.filter(|r| !r.achados.is_empty()) {
             Some(resposta) => {
                 let Resposta { achados, alcancados, modo } = resposta;
@@ -1484,18 +1498,20 @@ pub fn rag_ajustar(
     state.memoria.ajustar(ajustes).map_err(report)
 }
 
-/// Manda ler as pastas concedidas e vectorizar o que mudou. Devolve na hora: a
-/// varredura é longa e o progresso chega por evento, como no download dos
-/// pesos. O erro já saiu como `Evento::Falhou` e ficou guardado no estado, por
-/// isso aqui só o fio que não terminou é erro deste comando.
+/// Manda ler as pastas concedidas e as conversas salvas, e vectorizar o que
+/// mudou. Devolve na hora: a varredura é longa e o progresso chega por evento,
+/// como no download dos pesos. O erro já saiu como `Evento::Falhou` e ficou
+/// guardado no estado, por isso aqui só o fio que não terminou é erro deste
+/// comando.
 #[tauri::command]
 pub async fn rag_indexar(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let memoria = Arc::clone(&state.memoria);
+    let conversas = Arc::clone(&state.conversas);
     tauri::async_runtime::spawn_blocking(move || {
         let emit = move |evento: memoria::Evento| {
             let _ = app.emit("memoria-evento", &evento);
         };
-        let _ = memoria.indexar(emit);
+        let _ = memoria.indexar(&conversas.para_memoria(), emit);
     })
     .await
     .map_err(|e| tr("erros.memoriaIndexacaoNaoTerminou", &[("detalhe", &e.to_string())]))?;
@@ -1526,7 +1542,14 @@ pub async fn memoria_buscar(
     trechos: u32,
 ) -> Result<Resposta, String> {
     let memoria = Arc::clone(&state.memoria);
-    tauri::async_runtime::spawn_blocking(move || memoria.buscar(&consulta, trechos))
+    let conversas = Arc::clone(&state.conversas);
+    tauri::async_runtime::spawn_blocking(move || {
+        // O teste procura como o turno procura, e isso inclui estar atrás do
+        // histórico: sem esta linha a tela mostraria "nada encontrado" para uma
+        // conversa que o turno de agora já lembraria.
+        let _ = memoria.revalidar_conversas(&conversas.para_memoria());
+        memoria.buscar(&consulta, trechos, &[])
+    })
         .await
         .map_err(|e| tr("erros.memoriaBuscaNaoTerminou", &[("detalhe", &e.to_string())]))?
         .map_err(report)

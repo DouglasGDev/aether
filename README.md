@@ -31,6 +31,12 @@ saída, tokens/s de prefill e de leitura, tempo no motor e o motivo da parada.
 
 ![Conversa com as medidas do turno](docs/capturas/conversa.png)
 
+**A memória** — a folha do índice: a placa que serve o codificador, quantos
+trechos há de arquivo e quantos de conversa, e a busca de teste, que usa a mesma
+régua do turno e mostra os mesmos cartões.
+
+![Folha de Memória com o índice servido pela placa](docs/capturas/memoria.png)
+
 **A conexão MCP local** — as mesmas ferramentas do catálogo atendendo em
 `http://127.0.0.1:<porta>/mcp`. A porta é sorteada a cada execução e o token
 aparece mascarado na tela: ele só existe em memória e se copia, não se lê.
@@ -132,15 +138,33 @@ movido se um hash divergir. Veja
   motor abrir. O teto de linhas por leitura e o SQL livre são da conexão. São 9
   ferramentas (`bancos_listar` a `bancos_sql`) no mesmo catálogo, na mesma
   allowlist e no mesmo gate que as locais; só `bancos_apagar` é destrutiva.
-- **Memória (RAG)** — índice das pastas concedidas com busca híbrida (BM25 +
-  vetorial com fusão), peças com sobreposição e piso de similaridade. A injeção
-  automática e a ferramenta `buscar_memoria` obedecem ao mesmo fio do grafo.
+- **Memória (RAG)** — um índice, duas fontes: os arquivos das pastas concedidas e
+  as conversas salvas. As duas entram na mesma busca híbrida (BM25 + vetorial com
+  fusão), com peças sobrepostas e piso de similaridade, e cada uma obedece à
+  política da própria fonte: um trecho de arquivo só é lembrado enquanto a pasta
+  dele continua concedida; um trecho de conversa é lembrado enquanto a conversa
+  está no histórico e não é a conversa em curso, que já está na janela do modelo.
+  Revogar uma pasta não apaga a memória de conversa e a varredura de pastas não
+  apaga as conversas. A injeção automática e a ferramenta `buscar_memoria`
+  obedecem ao mesmo fio do grafo; a ferramenta, ao contrário da injeção, também
+  responde pela conversa aberta. O bloco que entra no turno declara de quem é
+  cada linha — `você:` é o que o usuário escreveu, `Aether:` é a resposta dele —
+  e o cartão cita a conversa e o número da fala, então aquelas falas não são
+  lidas como texto de arquivo. O índice guarda por conversa a prova do estado
+  dela (contagem de mensagens e instante da última), então um turno sem histórico
+  novo não custa um vetor. O trabalho de conversa paga um teto de tokens por turno
+  (8.192) e sempre entrega ao menos uma conversa inteira; a varredura, que corre
+  fora do turno com barra de progresso, drena o resto. Medido na suíte: 456 testes
+  de unidade, incluindo os que provam o isolamento das duas fontes e a
+  idempotência da prova.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
 - **Conversas salvas** — várias conversas no disco, com barra lateral: criar,
   trocar, renomear e apagar (com confirmação em dois cliques). Trocar de conversa
   esquece o KV: a conversa seguinte não herda o estado da anterior. O índice e as
   mensagens ficam em `%APPDATA%\ai.aether.core\conversas` e voltam onde estavam
-  depois de fechar e abrir o aplicativo.
+  depois de fechar e abrir o aplicativo. O que foi dito nelas entra na memória: a
+  transcrição de cada conversa (só as falas, sem as chamadas de ferramenta) vira
+  índice, com o título e a data no cartão de onde o trecho saiu.
 - **Bancada** — uma suíte de nove casos que roda dentro do aplicativo e mede
   cada um: motor na placa, bibliotecas do runtime, conexão MCP local, bancos de
   dados (com política só de leitura e um SQLite real montado na hora), esquecimento
@@ -212,7 +236,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 441 testes
+cd src-tauri && cargo test --lib     # 461 testes (456 passam, 5 com `#[ignore]`)
 npm run build                        # tsc + vite
 ```
 

@@ -22,6 +22,8 @@ fn trecho(achado: &Achado) -> TrechoMemoria {
         texto: achado.texto.clone(),
         pontuacao: achado.pontuacao as f64,
         origem: achado.origem,
+        fonte: achado.fonte,
+        quando: achado.quando,
     }
 }
 
@@ -30,7 +32,11 @@ pub fn buscar(args: &Map<String, Value>, memoria: &Custodio) -> Result<Saida> {
     // O pedido do modelo é um teto, e não uma ordem: o que ele escreveu maior
     // que `TRECHOS_MAX` volta cortado ao máximo que o índice entrega.
     let pedido = inteiro(args, "trechos").map(|n| (n as u32).min(TRECHOS_MAX));
-    let Resposta { achados, alcancados, modo } = memoria.buscar(&consulta, pedido.unwrap_or(0))?;
+    // A conversa em curso não é ignorada aqui, e é na injeção do prompt. Quando o
+    // modelo chama esta ferramenta, a pergunta pode justamente ser sobre o que a
+    // janela dele já perdeu.
+    let Resposta { achados, alcancados, modo } =
+        memoria.buscar(&consulta, pedido.unwrap_or(0), &[])?;
     let texto = if achados.is_empty() {
         tr("memoria.nadaEncontrado", &[])
     } else {

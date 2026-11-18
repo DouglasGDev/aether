@@ -19,6 +19,7 @@
 
 use crate::ai::ChatMessage;
 use crate::ai::compactacao::Resumo;
+use crate::ai::memoria::{CONVERSAS_MEMORIAIS, CONVERSA_MAX_BYTES, ConversaViva};
 use crate::idiomas::tr;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -346,6 +347,89 @@ impl Conversas {
         self.salvar_indice(&indice)?;
         Ok(())
     }
+
+    /// O que a memória lê do histórico: as conversas mais novas, cada uma com a
+    /// ficha que o cartão mostra e o texto do que foi dito. É a janela de
+    /// `CONVERSAS_MEMORIAIS` — o que ficou para trás continua na tela, só não
+    /// está no índice.
+    ///
+    /// A conversa ativa entra, e não de propósito para o turno reler a si mesmo:
+    /// quem decide isso é a busca, com `ignorar`. Aqui a lista é o histórico, e a
+    /// memória de uma conversa longa é o que a janela do modelo já não cabe.
+    ///
+    /// Arquivo que não abre fica de fora, em silêncio: uma conversa ilegível não
+    /// pode custar o turno inteiro, e a memória não promete o que não leu.
+    pub fn para_memoria(&self) -> Vec<ConversaViva> {
+        let estado = self.estado();
+        let mut vivas = Vec::new();
+        for ficha in estado.conversas.into_iter().take(CONVERSAS_MEMORIAIS) {
+            let Ok(conversa) = ler_json::<Conversa>(&arquivo(&self.raiz, &ficha.id)) else {
+                continue;
+            };
+            let falas = transcricao(&conversa.mensagens);
+            let Some((texto, a_partir_de)) = cauda(&falas, CONVERSA_MAX_BYTES) else {
+                // Nada dito: uma conversa vazia não tem o que lembrar, e ficha
+                // dela no índice diria que tem.
+                continue;
+            };
+            vivas.push(ConversaViva {
+                id: ficha.id,
+                titulo: if ficha.titulo.is_empty() {
+                    tr("memoria.conversaSemTitulo", &[])
+                } else {
+                    ficha.titulo
+                },
+                atualizada: ficha.atualizada,
+                mensagens: ficha.mensagens,
+                texto,
+                a_partir_de,
+            });
+        }
+        vivas
+    }
+}
+
+/// O texto lembrado de uma conversa: uma fala por linha, com o rótulo de quem
+/// falou. Papéis que não são fala (`system`, `tool`) e a linha de uma chamada de
+/// ferramenta ficam de fora de propósito — o índice existe para responder o que
+/// as duas partes disseram, e o JSON de uma chamada responderia como se fosse
+/// conversa.
+///
+/// Uma fala por linha é o que faz a linha citada no cartão ser a fala: o índice
+/// numera as linhas do texto que recebeu.
+fn transcricao(mensagens: &[ChatMessage]) -> Vec<String> {
+    mensagens
+        .iter()
+        .filter_map(|mensagem| {
+            let quem = match mensagem.role.as_str() {
+                "user" => tr("memoria.falaUsuario", &[]),
+                "assistant" => tr("memoria.falaAssistente", &[]),
+                _ => return None,
+            };
+            let texto = mensagem.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!texto.is_empty()).then(|| format!("{quem}: {texto}"))
+        })
+        .collect()
+}
+
+/// A cauda do histórico, do limite para trás. O corte é em fim de linha porque
+/// metade de uma fala no índice não é lembrança — é texto picado; e a linha só
+/// sai inteira, ainda que uma fala sozinha passe do teto (o fatiador dela cuida).
+///
+/// Devolve o texto e quantas falas ficaram para trás, que é o que devolve ao
+/// cartão o número verdadeiro da fala citada. `None` é histórico sem fala.
+fn cauda(falas: &[String], limite: usize) -> Option<(String, usize)> {
+    let mut bytes = 0usize;
+    let mut inicio = falas.len();
+    while inicio > 0 {
+        let custo = falas[inicio - 1].len() + 1;
+        if inicio < falas.len() && bytes + custo > limite {
+            break;
+        }
+        bytes += custo;
+        inicio -= 1;
+    }
+    (!falas.is_empty()).then(|| (falas[inicio..].join("\n"), inicio))
 }
 
 #[cfg(test)]
@@ -609,6 +693,163 @@ mod testes {
         let estado = conversas.estado();
         assert!(estado.conversas.is_empty());
         assert_eq!(estado.ativa, None);
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// A memória lê o histórico pela mesma janela que a tela mostra, e o que ela
+    /// recebe é o que as duas partes disseram: nem o prompt de sistema, nem o
+    /// JSON de uma chamada de ferramenta — que responderia a uma pergunta como se
+    /// fosse alguém tendo falado.
+    #[test]
+    fn a_memoria_recebe_as_falas_e_nao_as_chamadas() {
+        let conversas = temporaria("memoria-falas");
+        let ficha = conversas.criar().unwrap();
+        let mut mensagens = pedido("qual a vazão da bomba?");
+        mensagens.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![crate::ai::ToolCall {
+                name: "local__ler_arquivo".to_string(),
+                arguments: serde_json::json!({"caminho": "E:\\teste\\bomba.txt"}),
+            }]),
+        });
+        mensagens.push(ChatMessage::new("tool", "4,2 m³/h"));
+        conversas.gravar(&ficha.id, &mensagens, None).unwrap();
+
+        let vivas = conversas.para_memoria();
+        assert_eq!(vivas.len(), 1);
+        let viva = &vivas[0];
+        assert_eq!(viva.id, ficha.id);
+        assert_eq!(viva.titulo, "qual a vazão da bomba?");
+        assert_eq!(viva.atualizada, conversas.estado().conversas[0].atualizada);
+        // A ficha diz quantas mensagens o histórico tem; o texto diz o que foi
+        // dito. Os dois números não precisam bater — e é assim que tem de ser.
+        assert_eq!(viva.mensagens, 5);
+        assert_eq!(viva.a_partir_de, 0);
+        let falas: Vec<&str> = viva.texto.split('\n').collect();
+        assert_eq!(falas.len(), 2);
+        assert_eq!(falas[0], format!("{}: qual a vazão da bomba?", tr("memoria.falaUsuario", &[])));
+        assert_eq!(falas[1], format!("{}: resposta", tr("memoria.falaAssistente", &[])));
+        assert!(!viva.texto.contains("tool"));
+        assert!(!viva.texto.contains("local__ler_arquivo"));
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// Conversa sem fala lembrada não vira ficha: um índice que promete o que não
+    /// leu faria a tela dizer que a memória está em dia com um histórico vazio.
+    #[test]
+    fn a_conversa_recem_criada_nao_entra_na_memoria() {
+        let conversas = temporaria("memoria-vazia");
+        let ficha = conversas.criar().unwrap();
+        assert!(conversas.para_memoria().is_empty());
+        // Nem a que ficou sem texto por causa de uma limpeza.
+        conversas.gravar(&ficha.id, &pedido("algo"), None).unwrap();
+        assert_eq!(conversas.para_memoria().len(), 1);
+        conversas.gravar(&ficha.id, &[], None).unwrap();
+        assert!(conversas.para_memoria().is_empty());
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// A cauda corta em fim de fala, nunca no meio de uma, e diz quantas ficaram
+    /// para trás — é este número que devolve ao cartão a fala verdadeira.
+    #[test]
+    fn a_cauda_corta_na_fala_e_conta_o_que_deixou_para_tras() {
+        let falas: Vec<String> = (0..10).map(|i| "x".repeat(100) + &format!("-{i}")).collect();
+        // O teto cabe exatamente três falas de 104 bytes (com o \n): 312.
+        let (texto, a_partir_de) = cauda(&falas, 3 * 104).unwrap();
+        let linhas: Vec<&str> = texto.split('\n').collect();
+        assert_eq!(linhas.len(), 3);
+        assert_eq!(a_partir_de, 7);
+        assert_eq!(linhas[0], format!("{}-7", "x".repeat(100)));
+        assert_eq!(linhas[2], format!("{}-9", "x".repeat(100)));
+        // A última fala entra mesmo sem caber sozinha: o fatiador cuida dela, e
+        // uma conversa sem lembrança nenhuma é o pior resultado possível.
+        let (texto, a_partir_de) = cauda(&falas, 10).unwrap();
+        assert_eq!(a_partir_de, 9);
+        assert_eq!(texto, format!("{}-9", "x".repeat(100)));
+        // Sem limite, entra tudo.
+        let (texto, a_partir_de) = cauda(&falas, usize::MAX).unwrap();
+        assert_eq!(a_partir_de, 0);
+        assert_eq!(texto.split('\n').count(), 10);
+        assert_eq!(cauda(&[], 100), None);
+    }
+
+    /// O teto por conversa é medido no texto que sai, não no que foi escrito: uma
+    /// conversa de um megabyte entra no índice do tamanho da janela, e o resto
+    /// fica onde a tela ainda pode ler.
+    #[test]
+    fn a_memoria_recebe_no_maximo_a_cauda_de_cada_conversa() {
+        let conversas = temporaria("memoria-cauda");
+        let ficha = conversas.criar().unwrap();
+        let longo = "a".repeat(4000);
+        let mut mensagens = Vec::new();
+        for _ in 0..20 {
+            mensagens.push(ChatMessage::new("user", &longo));
+            mensagens.push(ChatMessage::new("assistant", &longo));
+        }
+        conversas.gravar(&ficha.id, &mensagens, None).unwrap();
+        let vivas = conversas.para_memoria();
+        assert_eq!(vivas.len(), 1);
+        let viva = &vivas[0];
+        let falas = viva.texto.split('\n').count();
+        // Aqui toda mensagem é uma fala: as lembradas são as que não ficaram
+        // para trás.
+        assert_eq!(falas, viva.mensagens - viva.a_partir_de);
+        assert!(falas > 1 && viva.a_partir_de > 0);
+        // O custo com que a cauda é medida é fala + o \n: é assim que ela cabe.
+        assert!(
+            viva.texto.len() + falas <= CONVERSA_MAX_BYTES,
+            "passou do teto: {} bytes",
+            viva.texto.len()
+        );
+        // Toda fala lembrada é fala inteira, até a última — que é a última de
+        // verdade do histórico.
+        assert!(viva.texto.split('\n').all(|fala| fala.ends_with(&longo)));
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// A janela tem um teto de conversas: o que ficou para trás continua no
+    /// histórico e na tela, só não vira vetor no turno.
+    #[test]
+    fn a_memoria_cobre_a_janela_e_nao_o_historico_inteiro() {
+        let conversas = temporaria("memoria-janela");
+        let sobra = CONVERSAS_MEMORIAIS + 3;
+        for i in 0..sobra {
+            let ficha = conversas.criar().unwrap();
+            conversas.gravar(&ficha.id, &pedido(&format!("pedido {i}")), None).unwrap();
+        }
+        assert_eq!(conversas.estado().conversas.len(), sobra);
+        let vivas = conversas.para_memoria();
+        assert_eq!(vivas.len(), CONVERSAS_MEMORIAIS);
+        // A lista vem da mais recente para a mais antiga: o que a janela deixa
+        // fora é o fim do histórico, não o começo.
+        assert_eq!(vivas.first().unwrap().titulo, format!("pedido {}", sobra - 1));
+        assert_eq!(
+            vivas.last().unwrap().titulo,
+            format!("pedido {}", sobra - CONVERSAS_MEMORIAIS)
+        );
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// A memória conta as falas pelo que o histórico tem agora. É este número,
+    /// e não o texto, que a ficha prova contra o índice: ganhou fala, o trabalho
+    /// volta a existir.
+    #[test]
+    fn a_memoria_recebe_a_conversa_com_o_estado_novo() {
+        let conversas = temporaria("memoria-contagem");
+        let ficha = conversas.criar().unwrap();
+        conversas.gravar(&ficha.id, &pedido("primeira"), None).unwrap();
+        let primeira = conversas.para_memoria().remove(0);
+        assert_eq!(primeira.mensagens, 3);
+        assert_eq!(primeira.texto.split('\n').count(), 2);
+
+        let mut mais = pedido("segunda");
+        mais.push(ChatMessage::new("assistant", "e o filtro também"));
+        conversas.gravar(&ficha.id, &mais, None).unwrap();
+        let segunda = conversas.para_memoria().remove(0);
+        assert_eq!(segunda.mensagens, 4);
+        assert_eq!(segunda.texto.split('\n').count(), 3);
+        assert!(segunda.texto.ends_with(&format!("{}: e o filtro também", tr("memoria.falaAssistente", &[]))));
         let _ = std::fs::remove_dir_all(&conversas.raiz);
     }
 }

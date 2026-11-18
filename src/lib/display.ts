@@ -1,4 +1,5 @@
 import type {
+  FonteMemoria,
   GeneroVoz,
   ModoMemoria,
   OrigemMemoria,
@@ -60,6 +61,13 @@ export const ORIGEM_KEY: Record<OrigemMemoria, string> = {
   vetorial: "memoria.origemVetorial",
   lexica: "memoria.origemLexica",
   ambas: "memoria.origemAmbas",
+};
+
+/// De onde saiu um achado. Um trecho de conversa não se cita como um de
+/// arquivo — "linha 12" de um código não é a fala 12 de um papo.
+export const FONTE_KEY: Record<FonteMemoria, string> = {
+  arquivo: "memoria.fonteArquivo",
+  conversa: "memoria.fonteConversa",
 };
 
 /// Por que o motor parou. A palavra é nossa; o motivo vem medido do motor.

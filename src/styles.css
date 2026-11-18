@@ -2834,6 +2834,15 @@ button.small {
   white-space: nowrap;
 }
 
+/* A data de uma conversa lembrada: o mesmo peso do número da fala, porque as
+   duas coisas dizem onde o trecho esteve. */
+.hit-data {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .hit-text {
   grid-column: 1 / -1;
   color: #a8b4cc;

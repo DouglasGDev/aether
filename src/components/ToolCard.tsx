@@ -2,6 +2,8 @@ import {
   MODO_KEY,
   ORIGEM_KEY,
   bytes,
+  data,
+  dataCurta,
   duracao,
   inteiro,
   medida,
@@ -291,11 +293,18 @@ export function ToolCard({ vista, falha = false }: Props) {
                   </span>
                   <span className="hit-meta">
                     <span className="hit-line">
-                      {t("cartao.linha", { n: trecho.linha })}
+                      {t(trecho.fonte === "conversa" ? "cartao.fala" : "cartao.linha", {
+                        n: trecho.linha,
+                      })}
                     </span>
                     <span className={`hit-origem ${trecho.origem}`}>
                       {t(ORIGEM_KEY[trecho.origem])}
                     </span>
+                    {trecho.quando !== undefined && (
+                      <span className="hit-data" title={data(trecho.quando, id)}>
+                        {dataCurta(trecho.quando, id)}
+                      </span>
+                    )}
                     <span
                       className="hit-score"
                       title={t("cartao.proximidade", {

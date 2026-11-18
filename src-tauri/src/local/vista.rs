@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-use crate::ai::memoria::Origem;
+use crate::ai::memoria::{Fonte, Origem};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +44,14 @@ pub struct TrechoMemoria {
     /// origem que a tela de memória mostra, para o cartão da conversa não
     /// esconder como o trecho entrou.
     pub origem: Origem,
+    /// De onde ele saiu: um arquivo das pastas concedidas ou uma conversa salva.
+    /// As duas coisas não se citam do mesmo jeito — caminho e linha contra
+    /// conversa e fala — e um cartão que não distingue está citando errado.
+    pub fonte: Fonte,
+    /// Instante da última fala da conversa, em milissegundos. `None` num arquivo:
+    /// a data que importa ali é a do trecho, e o índice não a tem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quando: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

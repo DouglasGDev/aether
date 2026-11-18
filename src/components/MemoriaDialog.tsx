@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, message, onMemoriaEvent, onModelEvent } from "../lib/api";
-import { MODO_KEY, ORIGEM_KEY, bytes, data, numero } from "../lib/display";
+import { MODO_KEY, ORIGEM_KEY, bytes, data, dataCurta, numero } from "../lib/display";
 import { useIdioma, useT, type Traduzir } from "../lib/i18n";
 import type {
   AjustesMemoria,
@@ -308,6 +308,13 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
             {t("memoria.arquivos", { n: numero(estado.arquivos, idioma, 0) })}
             {estado.bytes > 0 && ` · ${bytes(estado.bytes, idioma)}`}
           </span>
+          <span className="memoria-chip">
+            {t("memoria.conversas", { n: numero(estado.conversas, idioma, 0) })}
+            {estado.trechosConversas > 0 &&
+              ` · ${t("memoria.trechosDeConversa", {
+                n: numero(estado.trechosConversas, idioma, 0),
+              })}`}
+          </span>
           {estado.concluidoEm !== null && (
             <span className="memoria-chip">
               {t("memoria.varridoEm")} {data(estado.concluidoEm, idioma)}
@@ -493,13 +500,18 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
                   <span className="hit-file">{achado.nome}</span>
                   <span className="hit-meta">
                     <span className="hit-line">
-                      {t("memoria.linha", {
+                      {t(achado.fonte === "conversa" ? "memoria.fala" : "memoria.linha", {
                         n: numero(achado.linha, idioma, 0),
                       })}
                     </span>
                     <span className={`hit-origem ${achado.origem}`}>
                       {t(ORIGEM_KEY[achado.origem])}
                     </span>
+                    {achado.quando !== undefined && (
+                      <span className="hit-data" title={data(achado.quando, idioma)}>
+                        {dataCurta(achado.quando, idioma)}
+                      </span>
+                    )}
                     <span
                       className="hit-score"
                       title={t("memoria.proximidade", {

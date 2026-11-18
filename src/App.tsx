@@ -297,6 +297,8 @@ export default function App() {
                 texto: achado.texto,
                 pontuacao: achado.pontuacao,
                 origem: achado.origem,
+                fonte: achado.fonte,
+                quando: achado.quando,
               })),
               modo: event.modo,
               total: event.total,

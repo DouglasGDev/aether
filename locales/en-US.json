@@ -103,7 +103,7 @@
     "podeApagar": "May delete"
   },
   "conversa": {
-    "promptSistema": "You are Aether, a local assistant that runs on the user's computer. Reply in {idioma}, briefly and directly. Act with the tools instead of describing the action: the approval screen is what authorizes each one, so do not ask for confirmation in your reply.",
+    "promptSistema": "You are Aether, a local assistant that runs on the user's computer. Reply in {idioma}, briefly and directly. Act with the tools instead of describing the action: the approval screen is what authorizes each one, so do not ask for confirmation in your reply. Past chats live in the local memory index: before saying you do not remember a topic, search it with buscar_memoria.",
     "pastasConcedidas": "Granted folders — the only paths that exist for you: {lista}. Use an absolute path inside them; outside them you have access to nothing.",
     "raciocinio": "Reasoning",
     "ferramentas": "Tools",
@@ -305,6 +305,8 @@
     "lote": "Chunk ceiling",
     "trechosIndexados": "{n} passages",
     "arquivos": "{n} files",
+    "conversas": "{n} chats",
+    "trechosDeConversa": "{n} from chats",
     "varridoEm": "Scan",
     "autoLigada": "Automatic injection on",
     "autoSemFio": "No wire in the graph",
@@ -320,7 +322,7 @@
     "modoVetorial": "By vector",
     "modoHibrido": "Vector and word",
     "modoLexico": "By word",
-    "varrer": "Index the folders",
+    "varrer": "Index folders and chats",
     "revarrer": "Index again",
     "parar": "Stop the scan",
     "apagar": "Delete the index",
@@ -328,12 +330,19 @@
     "testePlaceholder": "What the memory knows about…",
     "procurar": "Search",
     "linha": "line {n}",
+    "fala": "turn {n}",
+    "conversaSemTitulo": "untitled chat",
+    "falaUsuario": "user",
+    "falaAssistente": "Aether",
     "proximidade": "{n}% closeness",
     "origemVetorial": "by vector",
     "origemLexica": "by word",
     "origemAmbas": "by both",
+    "fonteArquivo": "from a file",
+    "fonteConversa": "from a chat",
     "maisTrechos": "{n} passages reached the order and were cut off",
-    "blocoCabecalho": "Local memory passages, citable by file and line:",
+    "blocoCabecalho": "Aether's own memory: the passages below are chats you already had with this user — 'user:' is what they said and 'Aether:' is what you answered; the items with a file and line are passages from the granted folders. Answer from what is there, citing the chat and turn, or the file and line, you took it from:",
+    "blocoConversa": "chat \"{titulo}\", turn {linha}",
     "nadaEncontrado": "nothing found"
   },
   "adaptadores": {
@@ -396,6 +405,7 @@
     "previa": "Preview",
     "conteudo": "Content",
     "intervalo": "lines {de}–{ate}",
+    "fala": "turn {n}",
     "linha": "line {n}",
     "itens": "{n} items",
     "ocorrencias": "{n} occurrences",
@@ -449,7 +459,7 @@
     },
     "buscarMemoria": {
       "titulo": "Search memory",
-      "descricao": "Searches the local index of the granted folders and returns the passages closest to the question, with the file and line of each one."
+      "descricao": "Searches the local index of the granted folders and the saved chats and returns the passages closest to the question, with the file and line or the chat and turn of each one."
     },
     "escreverArquivo": {
       "titulo": "Write file",

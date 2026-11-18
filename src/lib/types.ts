@@ -505,6 +505,11 @@ export interface TrechoMemoria {
   pontuacao: number;
   /// O que trouxe o trecho: o vetor, a palavra escrita ou os dois.
   origem: OrigemMemoria;
+  /// De onde ele saiu: arquivo concedido ou conversa salva.
+  fonte: FonteMemoria;
+  /// Instante da última fala da conversa, em milissegundos. Ausente no arquivo:
+  /// a data que importa ali é a do trecho, e o índice não a tem.
+  quando?: number;
 }
 
 export interface VistaTroca {
@@ -532,6 +537,10 @@ export interface VistaMemoria {
   pontuacao: number;
   /// O que trouxe o trecho: o vetor, a palavra escrita ou os dois.
   origem: OrigemMemoria;
+  /// Arquivo concedido ou conversa salva: muda como o cartão cita a origem.
+  fonte: FonteMemoria;
+  /// Instante da última fala da conversa, em milissegundos.
+  quando?: number;
 }
 
 /// O cartão que o computador desenha no lugar de um despejo técnico. Vem sempre
@@ -762,6 +771,11 @@ export type ModoMemoria = "vetorial" | "hibrido" | "lexico";
 /// dois caminhos na fusão.
 export type OrigemMemoria = "vetorial" | "lexica" | "ambas";
 
+/// De onde saiu um trecho: um arquivo das pastas concedidas ou uma conversa
+/// salva. As duas fontes se citam de jeitos diferentes — caminho e linha contra
+/// conversa e fala — e a tela não pode usar uma só etiqueta para as duas.
+export type FonteMemoria = "arquivo" | "conversa";
+
 /// O que a tela da memória edita, e que vale em `rag.json`.
 export interface AjustesMemoria {
   /// Id do codificador; vazio é o primeiro completo em disco.
@@ -799,6 +813,8 @@ export interface ResumoMemoria {
   arquivos: number;
   relidos: number;
   trechos: number;
+  /// Conversas que ficaram lembradas nesta varredura.
+  conversas: number;
   ms: number;
   truncado: boolean;
   cancelado: boolean;
@@ -825,6 +841,10 @@ export interface EstadoMemoria {
   modo: ModoMemoria;
   indexados: number;
   arquivos: number;
+  /// Conversas salvas que hoje têm trechos no índice.
+  conversas: number;
+  /// Dos `indexados`, quantos saíram de conversa e não de arquivo.
+  trechosConversas: number;
   bytes: number;
   indexando: boolean;
   progresso: ProgressoMemoria;

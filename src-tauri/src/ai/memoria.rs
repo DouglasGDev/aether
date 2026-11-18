@@ -72,6 +72,29 @@ const LIMITE_TRECHOS: usize = 12_000;
 /// janela fechada no meio não pode jogar o trabalho fora.
 const SALVAR_A_CADA: usize = 24;
 
+/// Quantas conversas a memória cobre, contadas da mais recente para trás. É a
+/// janela: o histórico na tela guarda tudo, a memória lembra as últimas. Passou
+/// da janela, o trecho sai do índice — e voltar depois é só o varrer de novo.
+pub const CONVERSAS_MEMORIAIS: usize = 200;
+/// O teto do texto lembrado de cada conversa, contado a partir do fim. Uma
+/// resposta longa de ferramenta não pode custar o turno inteiro para virar
+/// vetor, e o fim da conversa é o que responde "sobre que estávamos falando".
+pub const CONVERSA_MAX_BYTES: usize = 32 * 1024;
+/// Tokens de conversa que um turno pode transformar em vetor antes de responder.
+/// É a unidade que mede o custo real — o vetor sai de tokens, não de peças — e o
+/// que impede a primeira pergunta depois de ligar a memória de esperar o
+/// histórico inteiro. O resto entra nos turnos seguintes e no varrer, que já
+/// corre fora do turno com barra de progresso.
+pub const TOKENS_POR_TURNO: usize = 8_192;
+
+/// A regra que decide se a verba do turno acabou. A primeira conversa entra
+/// sempre, maior que a verba ou não: sem essa exceção um histórico com uma
+/// conversa só, grande, ficaria para sempre fora do índice — e o atraso que a
+/// tela mostra nunca se pagaria.
+fn acabou_a_verba(gastos: usize, tokens: usize, orcamento: usize) -> bool {
+    gastos > 0 && gastos + tokens > orcamento
+}
+
 /// O que a varredura aceita como texto, por extensão conhecida. "Tenta ler e vê"
 /// custaria abrir binários de centenas de megabytes; aqui o arquivo só é lido
 /// quando já se sabe que é do tipo que se lê.
@@ -221,6 +244,36 @@ pub enum Origem {
     Ambas,
 }
 
+/// O que escreve um trecho no índice. As duas fontes convivem no mesmo arquivo e
+/// na mesma busca — é isso que faz um cosseno e um BM25 competirem na mesma
+/// régua — mas a política de cada uma é sua.
+///
+/// Um arquivo só é lido enquanto a pasta onde ele está continua concedida; a
+/// revogação tira o conteúdo dele da resposta e da varredura. Uma conversa é
+/// estado do próprio aplicativo: não há pasta a revogar, e quem a apaga é a
+/// lista de conversas. Confundir as duas — deixar a varredura de pastas apagar as
+/// conversas, ou a concessão de pastas esconder o histórico — seria uma das
+/// duas: memória perdida ou memória que o dono mandou esquecer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Fonte {
+    /// Texto lido de um arquivo dentro de uma pasta concedida.
+    #[default]
+    Arquivo,
+    /// Uma fala de uma conversa salva.
+    Conversa,
+}
+
+impl Fonte {
+    /// A palavra de máquina que a interface traduz.
+    pub fn nome(self) -> &'static str {
+        match self {
+            Self::Arquivo => "arquivo",
+            Self::Conversa => "conversa",
+        }
+    }
+}
+
 /// O que a tela edita, em `rag.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -320,13 +373,33 @@ struct Assinatura {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Trecho {
+    /// O caminho do arquivo, ou o id da conversa. É a chave que a escrita e a
+    /// remoção usam dentro da fonte dele.
     pub arquivo: String,
     /// Primeira linha do trecho, contando a partir de 1: é para onde o cartão
     /// aponta, e o número vem da contagem real dos quebras-linha do arquivo.
+    /// Numa conversa, a linha é a mensagem — o texto dela vem uma por linha.
     pub linha: usize,
     /// O texto exatamente como está no arquivo. É o que o vetor representa;
     /// mostrar outra coisa seria um cartão mentiroso.
     pub texto: String,
+    /// Quem pôs este trecho aqui. Um índice gravado antes disto existir é todo de
+    /// arquivo, que é como ele foi escrito de fato.
+    #[serde(default)]
+    pub fonte: Fonte,
+}
+
+/// A ficha de uma conversa indexada: o que o cartão mostra e a prova de que o
+/// texto dela é o que está no índice. `modificado` é o instante da última
+/// mensagem e `bytes` a contagem delas — os dois números que a lista de conversas
+/// dá de graça, sem reler arquivo nenhum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FichaConversa {
+    titulo: String,
+    /// Momento da última mensagem, para o cartão dizer quando foi a conversa.
+    atualizada: u64,
+    prova: Assinatura,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -347,6 +420,11 @@ struct Meta {
     /// Um arquivo por chave, mesmo os que não renderam trecho nenhum — é assim
     /// que a próxima varredura sabe que não precisa relê-los.
     assinaturas: BTreeMap<String, Assinatura>,
+    /// Uma conversa por id, com o título que o cartão mostra e a prova de que o
+    /// texto indexado é o do arquivo dela. Separado de `assinaturas` de propósito:
+    /// as duas fontes têm políticas diferentes, e um mapa só obrigaria a varredura
+    /// de pastas a decidir o que fazer com o histórico — que não é dela.
+    conversas: BTreeMap<String, FichaConversa>,
     trechos: Vec<Trecho>,
 }
 
@@ -354,7 +432,9 @@ struct Meta {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Achado {
+    /// O caminho do arquivo, ou o id da conversa.
     pub arquivo: String,
+    /// O rótulo curto do cartão: o nome do arquivo ou o título da conversa.
     pub nome: String,
     pub linha: usize,
     pub texto: String,
@@ -365,6 +445,14 @@ pub struct Achado {
     pub pontuacao: f32,
     /// O que trouxe o trecho: a proximidade, a palavra, ou as duas.
     pub origem: Origem,
+    /// De onde veio o trecho — arquivo concedido ou conversa salva. O cartão
+    /// traduz, porque "linha 12" de um arquivo não é a mesma coisa que a mensagem
+    /// 12 de uma conversa.
+    pub fonte: Fonte,
+    /// Instante da última mensagem da conversa, em milissegundos. `None` num
+    /// arquivo: a data que importa ali é a do trecho, e ela não existe no índice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quando: Option<u64>,
 }
 
 /// O que uma busca devolve. Os `k` melhores e quantos trechos entraram nas
@@ -389,6 +477,39 @@ pub struct Busca<'a> {
     pub k: usize,
     pub piso: f32,
     pub modo: Modo,
+    /// Conversas que esta busca não responde. É o turno deixando de fora a
+    /// conversa que já está no buffer do modelo: reler o que ele acabou de ler
+    /// custa os tokens que faltariam para a conversa que ele realmente não sabe.
+    pub ignorar: &'a [String],
+}
+
+/// Uma conversa como a memória a recebe: a ficha que o cartão mostra e o texto
+/// do que foi dito, uma fala por linha. Quem lê o histórico é `conversas.rs`;
+/// aqui o texto só é fatiado e virado vetor, e a linha da peça é a fala que o
+/// cartão cita.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversaViva {
+    pub id: String,
+    pub titulo: String,
+    /// Instante da última mensagem, em milissegundos. É a data que o cartão mostra.
+    pub atualizada: u64,
+    /// Quantas mensagens tem a conversa — com `atualizada`, a prova de que não há
+    /// trabalho novo.
+    pub mensagens: usize,
+    /// O texto de uma fala por linha: usuário e assistente, sem as chamadas de
+    /// ferramenta. Quando a conversa é longa, é o fim dela — as falas da frente
+    /// saem pelo teto de `CONVERSA_MAX_BYTES`.
+    pub texto: String,
+    /// Quantas falas o `texto` deixou para trás. É o que devolve ao cartão o
+    /// número verdadeiro da fala citada numa conversa cortada pela cauda.
+    pub a_partir_de: usize,
+}
+
+impl ConversaViva {
+    /// A prova de que o índice gravado ainda representa esta conversa.
+    fn prova(&self) -> Assinatura {
+        Assinatura { bytes: self.mensagens as u64, modificado: self.atualizada }
+    }
 }
 
 /// O que a tela lê do índice sem precisar dos vetores: tamanho, origem, o
@@ -398,6 +519,8 @@ pub struct Busca<'a> {
 struct Leitura {
     trechos: usize,
     arquivos: usize,
+    conversas: usize,
+    trechos_conversas: usize,
     dimensao: usize,
     agrupamento: String,
     peca: u32,
@@ -432,6 +555,7 @@ impl Indice {
                 peca,
                 sobreposicao,
                 assinaturas: BTreeMap::new(),
+                conversas: BTreeMap::new(),
                 trechos: Vec::new(),
             },
             vetores: Vec::new(),
@@ -470,12 +594,28 @@ impl Indice {
         self.meta.sobreposicao = sobreposicao;
         self.meta.trechos.clear();
         self.meta.assinaturas.clear();
+        // As peças de conversa foram cortadas na escala antiga também. Sem tirar
+        // a ficha junto, o índice diria que a conversa está lembrada quando o
+        // vetor que a representa não existe mais.
+        self.meta.conversas.clear();
         self.vetores.clear();
         true
     }
 
     pub fn trechos(&self) -> usize {
         self.meta.trechos.len()
+    }
+
+    /// Conversas que o índice lembra. É o número que a tela compara com a lista
+    /// de conversas para o dono ver se a memória está atrás do histórico.
+    pub fn conversas(&self) -> usize {
+        self.meta.conversas.len()
+    }
+
+    /// Quantos trechos vieram de uma fonte. É como a tela diz, do mesmo índice,
+    /// quantos são de arquivo e quantos são de conversa.
+    pub fn trechos_de(&self, fonte: Fonte) -> usize {
+        self.meta.trechos.iter().filter(|t| t.fonte == fonte).count()
     }
 
     /// Arquivos que a varredura já viu, incluindo os que não renderam nada.
@@ -490,15 +630,74 @@ impl Indice {
         self.meta.assinaturas.get(arquivo) == Some(assinatura)
     }
 
+    /// Se a conversa já está no índice exatamente como está na lista de conversas.
+    /// É esta resposta, e não uma reescrita, que faz o turno sem conversa nova não
+    /// pagar um vetor nenhum.
+    fn conversa_vista(&self, id: &str, prova: &Assinatura) -> bool {
+        self.meta.conversas.get(id).is_some_and(|ficha| ficha.prova == *prova)
+    }
+
+    /// Quantas conversas pedem trabalho: as novas, as que ganharam mensagem e as
+    /// que saíram do histórico (apagadas ou velhas demais para a janela que a
+    /// tela manda). Zero é o caso comum, e é ele que o turno paga para
+    /// reconhecer — sem clonar um vetor sequer.
+    pub fn conversas_pendentes(&self, vivas: &[ConversaViva]) -> usize {
+        let fora = self
+            .meta
+            .conversas
+            .keys()
+            .filter(|id| !vivas.iter().any(|c| *c.id == **id))
+            .count();
+        let mudaram = vivas
+            .iter()
+            .filter(|c| !self.conversa_vista(&c.id, &c.prova()))
+            .count();
+        fora + mudaram
+    }
+
+    /// Esquece toda conversa que não está mais na lista: apagada do histórico ou
+    /// saída da janela que a memória cobre. Devolve quantas saíram.
+    pub fn reter_conversas(&mut self, vivas: &[ConversaViva]) -> usize {
+        let fora: Vec<String> = self
+            .meta
+            .conversas
+            .keys()
+            .filter(|id| !vivas.iter().any(|c| *c.id == **id))
+            .cloned()
+            .collect();
+        let mut saíram = 0usize;
+        for id in fora {
+            saíram += self.esquecer_conversa(&id);
+        }
+        saíram
+    }
+
     /// Remove os trechos de um arquivo e o marca para reler. Devolve quantos
     /// trechos saíram, que é o número que a interface mostra.
     pub fn remover_arquivo(&mut self, arquivo: &str) -> usize {
+        self.remover(Fonte::Arquivo, arquivo)
+    }
+
+    /// Esquece uma conversa inteira: o texto lembrado dela e a ficha. É o que
+    /// acontece quando a pessoa apaga a conversa — apagar o histórico tem de
+    /// apagar a memória, e não só o arquivo.
+    pub fn esquecer_conversa(&mut self, id: &str) -> usize {
+        let saíram = self.remover(Fonte::Conversa, id);
+        self.meta.conversas.remove(id);
+        saíram
+    }
+
+    /// Tira do índice os trechos de uma chave, e só os da fonte pedida. As duas
+    /// fontes têm chaves que não se encontram — caminho cheio contra id de
+    /// conversa — mas é a fonte que decide, para a varredura de pastas não mexer
+    /// no histórico nem a reescrita de uma conversa mexer nos arquivos.
+    fn remover(&mut self, fonte: Fonte, chave: &str) -> usize {
         let antes = self.meta.trechos.len();
         let mut novos_trechos: Vec<Trecho> = Vec::with_capacity(antes);
         let mut novos_vetores: Vec<f32> = Vec::with_capacity(self.vetores.len());
         let dimensao = self.meta.dimensao;
         for (indice, trecho) in self.meta.trechos.iter().enumerate() {
-            if trecho.arquivo != arquivo {
+            if trecho.fonte != fonte || trecho.arquivo != chave {
                 novos_trechos.push(trecho.clone());
                 let inicio = indice * dimensao;
                 novos_vetores.extend_from_slice(&self.vetores[inicio..inicio + dimensao]);
@@ -536,10 +735,40 @@ impl Indice {
                 arquivo: arquivo.to_string(),
                 linha: peca.linha,
                 texto: peca.texto.clone(),
+                fonte: Fonte::Arquivo,
             });
             self.vetores.extend_from_slice(vetor);
         }
         self.meta.assinaturas.insert(arquivo.to_string(), assinatura);
+    }
+
+    /// Troca a memória de uma conversa inteira: sai o texto lembrado, entra o de
+    /// agora com a ficha que o cartão mostra. Reescrever a conversa toda, e não
+    /// só as mensagens novas, é o que faz um histórico editado ou limpo não deixar
+    /// trecho órfão apontando para uma mensagem que não existe mais.
+    ///
+    /// A linha de cada peça é contada no texto que foi fatiado; somar
+    /// `a_partir_de` devolve o número da mensagem como a conversa o vê.
+    fn substituir_conversa(
+        &mut self,
+        viva: &ConversaViva,
+        prova: Assinatura,
+        pecas: &[(Peca, Vec<f32>)],
+    ) {
+        self.remover(Fonte::Conversa, &viva.id);
+        for (peca, vetor) in pecas {
+            self.meta.trechos.push(Trecho {
+                arquivo: viva.id.clone(),
+                linha: peca.linha + viva.a_partir_de,
+                texto: peca.texto.clone(),
+                fonte: Fonte::Conversa,
+            });
+            self.vetores.extend_from_slice(vetor);
+        }
+        self.meta.conversas.insert(
+            viva.id.clone(),
+            FichaConversa { titulo: viva.titulo.clone(), atualizada: viva.atualizada, prova },
+        );
     }
 
     /// Nada entra no índice sem passar por aqui: com os dois lados normatizados,
@@ -559,8 +788,9 @@ impl Indice {
         Ok(())
     }
 
-    /// Os `k` melhores acima do `piso`, na ordem que o `modo` manda, e só das
-    /// pastas que ainda estão concedidas em `raizes`.
+    /// Os `k` melhores acima do `piso`, na ordem que o `modo` manda, e só do que
+    /// ainda pode ser lembrado: os arquivos das pastas concedidas em `raizes` e as
+    /// conversas que `ignorar` não corta.
     ///
     /// O cosseno é sempre medido, mesmo em modo léxico: ele é o número do
     /// cartão, e um achado que chegou pela palavra continua tendo o vetor dele no
@@ -579,10 +809,22 @@ impl Indice {
             ));
         }
         let lexico = matches!(busca.modo, Modo::Hibrido | Modo::Lexico);
+        // Quem responde se um trecho pode ser devolvido é a fonte dele: o arquivo
+        // obedece às pastas concedidas, a conversa obedece à lista de conversas e
+        // ao `ignorar` do turno. Nenhuma das duas empresta política para a outra.
+        let pode = |indice: usize| -> bool {
+            let trecho = &self.meta.trechos[indice];
+            match trecho.fonte {
+                Fonte::Arquivo => concedida(&trecho.arquivo, raizes),
+                Fonte::Conversa => {
+                    !busca.ignorar.iter().any(|id| *id == trecho.arquivo)
+                }
+            }
+        };
         let mut proximidade = vec![0f32; self.meta.trechos.len()];
         let mut vetorial: Vec<usize> = Vec::new();
-        for (indice, trecho) in self.meta.trechos.iter().enumerate() {
-            if !concedida(&trecho.arquivo, raizes) {
+        for indice in 0..self.meta.trechos.len() {
+            if !pode(indice) {
                 continue;
             }
             let inicio = indice * self.meta.dimensao;
@@ -603,7 +845,7 @@ impl Indice {
                 .lexico()
                 .pontuar(busca.texto)
                 .into_iter()
-                .filter(|(_, indice)| concedida(&self.meta.trechos[*indice].arquivo, raizes))
+                .filter(|(_, indice)| pode(*indice))
                 .collect::<Vec<(f32, usize)>>();
             // Empate de BM25 vai para o índice menor: sem desempate fixo a mesma
             // pergunta daria listas diferentes, e nenhuma medição do cartão
@@ -647,13 +889,30 @@ impl Indice {
                 .take(busca.k)
                 .map(|(indice, origem)| {
                     let trecho = &self.meta.trechos[indice];
+                    // O rótulo vem da ficha gravada junto com o trecho, nunca de
+                    // uma suposição sobre o id: um título que a pessoa escreveu
+                    // depois de indexar aparece na próxima reescrita da conversa,
+                    // que é quando o índice passa a ser outro.
+                    let (nome, quando) = match trecho.fonte {
+                        Fonte::Arquivo => (nome_do_arquivo(&trecho.arquivo), None),
+                        Fonte::Conversa => self
+                            .meta
+                            .conversas
+                            .get(&trecho.arquivo)
+                            .map(|ficha| {
+                                (ficha.titulo.clone(), Some(ficha.atualizada))
+                            })
+                            .unwrap_or_else(|| (trecho.arquivo.clone(), None)),
+                    };
                     Achado {
-                        nome: nome_do_arquivo(&trecho.arquivo),
+                        nome,
                         arquivo: trecho.arquivo.clone(),
                         linha: trecho.linha,
                         texto: trecho.texto.clone(),
                         pontuacao: proximidade[indice],
                         origem,
+                        fonte: trecho.fonte,
+                        quando,
                     }
                 })
                 .collect(),
@@ -905,6 +1164,8 @@ fn leitura(indice: &Indice) -> Leitura {
     Leitura {
         trechos: indice.trechos(),
         arquivos: indice.arquivos(),
+        conversas: indice.conversas(),
+        trechos_conversas: indice.trechos_de(Fonte::Conversa),
         dimensao: indice.dimensao(),
         agrupamento: indice.agrupamento().to_string(),
         peca,
@@ -1177,6 +1438,8 @@ pub struct Resumo {
     pub arquivos: usize,
     pub relidos: usize,
     pub trechos: usize,
+    /// Conversas que hoje têm trechos neste índice.
+    pub conversas: usize,
     pub ms: u64,
     /// A varredura bateu num teto seu; o índice está certo, mas incompleto.
     pub truncado: bool,
@@ -1208,6 +1471,11 @@ pub struct Estado {
     pub modo: &'static str,
     pub indexados: usize,
     pub arquivos: usize,
+    /// Conversas salvas que hoje têm trechos no índice.
+    pub conversas: usize,
+    /// Dos `indexados`, quantos vieram de conversa e não de arquivo. É o número
+    /// que diz se a memória de conversa está realmente montada.
+    pub trechos_conversas: usize,
     /// Bytes do arquivo de índice, medidos no disco.
     pub bytes: u64,
     pub indexando: bool,
@@ -1513,8 +1781,139 @@ impl Custodio {
         Ok(vetor)
     }
 
-    /// A busca em si: o chão do índice, o vetor da pergunta, os `k` vizinhos.
-    pub fn buscar(&self, consulta: &str, trechos: u32) -> Result<Resposta> {
+    /// Põe as conversas salvas dentro do índice. É o que faz a memória chegar ao
+    /// que foi dito em outra sessão sem que ninguém precise varrer pasta
+    /// nenhuma: o histórico do próprio aplicativo entra no mesmo índice híbrido
+    /// dos arquivos, com a mesma busca e o mesmo cartão.
+    ///
+    /// O turno comum não paga nada por isto: a pendência é lida só na metadata,
+    /// e enquanto a prova de cada conversa — contagem de mensagens e instante da
+    /// última — bater, nenhum vetor é recalculado. Quando há trabalho, ele cabe em
+    /// `TOKENS_POR_TURNO`, e uma conversa só entra inteira: metade de um papo no
+    /// índice é um lembrado pior que nenhum.
+    pub fn revalidar_conversas(&self, vivas: &[ConversaViva]) -> Result<usize> {
+        let resultado = self.fundir_conversas(vivas, TOKENS_POR_TURNO);
+        if let Err(erro) = &resultado {
+            // O turno continua sem a lembrança nova, e é por isso que o erro não
+            // pode sumir: ele fica onde a tela de memória já mostra os outros, e
+            // diz por que o índice está atrás do histórico.
+            *self.erro.lock().expect("erro envenenado") = Some(format!("{erro:#}"));
+        }
+        resultado
+    }
+
+    fn fundir_conversas(&self, vivas: &[ConversaViva], orcamento: usize) -> Result<usize> {
+        if self.esta_indexando() {
+            // A varredura segura o índice e o regrava no fim. Escrever por cima
+            // agora seria perder o trabalho dela.
+            return Ok(0);
+        }
+        let Some(spec) = self.spec() else {
+            // Sem codificador não há vetor, e sem vetor a conversa não entra. A
+            // tela já diz isto por `auto`; aqui basta não fazer nada.
+            return Ok(0);
+        };
+        let pendente = {
+            let guard = self.indice.read().expect("índice envenenado");
+            match guard.as_ref() {
+                Some(indice) => indice.conversas_pendentes(vivas),
+                None => vivas.len(),
+            }
+        };
+        if pendente == 0 {
+            return Ok(0);
+        }
+        // Daqui para baixo há trabalho, e o `carregado` é o mesmo da varredura:
+        // por isso a ordem dos locks — carregado antes de índice — vale também.
+        let mut trava = self.carregado()?;
+        let carregado = trava.as_mut().expect("carregado acabou de ser garantido");
+        let ajustes = self.ajustes();
+        let mut indice = self.indice_na_memoria().unwrap_or_else(|| {
+            Indice::vazio(
+                spec.id,
+                carregado.embutidor.dimensao(),
+                carregado.embutidor.agrupamento,
+                ajustes.peca,
+                ajustes.sobreposicao,
+            )
+        });
+        if indice.refatiar(ajustes.peca, ajustes.sobreposicao) {
+            // Escala da tela diferente da escala gravada: as peças de conversa
+            // foram cortadas na antiga também. A gravação imediata é o que faz
+            // um índice esvaziado sobreviver mesmo se o turno cair no meio.
+            indice.salvar(&self.caminho_indice)?;
+            *self.indice.write().expect("índice envenenado") = Some(copiar(&indice));
+        }
+        let mudadas = self.escrever_conversas(&mut indice, carregado, vivas, orcamento)?;
+        if mudadas > 0 {
+            indice.salvar(&self.caminho_indice)?;
+            *self.indice.write().expect("índice envenenado") = Some(indice);
+        }
+        Ok(mudadas)
+    }
+
+    /// O trabalho em si, com o codificador e o índice já na mão. Existe separado
+    /// de `fundir_conversas` porque a varredura já segura os dois: quem tem os
+    /// dois travados e chama `carregado()?` de novo morre ali, e o mutex não é
+    /// reentrante.
+    ///
+    /// Devolve quantas conversas mudaram de estado — as reescritas mais as que
+    /// saíram porque o histórico as apagou ou a janela as deixou para trás.
+    fn escrever_conversas(
+        &self,
+        indice: &mut Indice,
+        carregado: &mut Carregado,
+        vivas: &[ConversaViva],
+        orcamento: usize,
+    ) -> Result<usize> {
+        let (alvo, sobre) = indice.fatiamento();
+        let (alvo, sobre) = (alvo as usize, sobre as usize);
+        let limite = carregado.embutidor.limite();
+        // Primeiro sai o que não é mais lista: apagar um papo apaga a lembrança
+        // dele, e tirar da memória não custa um vetor.
+        let mut mudadas = indice.reter_conversas(vivas);
+        let mut gastos = 0usize;
+        for viva in vivas {
+            let prova = viva.prova();
+            if indice.conversa_vista(&viva.id, &prova) {
+                continue;
+            }
+            if indice.trechos() >= LIMITE_TRECHOS {
+                // O teto de trechos do índice vale para as duas fontes: com a
+                // casa cheia, nem fatiar — o custo seria tokenizar para nada.
+                break;
+            }
+            let lidas = pecas(&viva.texto, alvo, sobre, limite, &carregado.tokenizador)?;
+            let tokens: usize = lidas.iter().map(|p| p.ids.len()).sum();
+            if acabou_a_verba(gastos, tokens, orcamento) {
+                // O orçamento do turno acabou. Sair sem gravar a ficha é o que
+                // faz esta conversa ser a próxima, e não uma repetição da que já
+                // entrou: nenhuma fica pela metade.
+                break;
+            }
+            let mut prontas: Vec<(Peca, Vec<f32>)> = Vec::with_capacity(lidas.len());
+            for peca in lidas {
+                if indice.trechos() + prontas.len() >= LIMITE_TRECHOS {
+                    break;
+                }
+                let mut vetor = carregado.embutidor.embutir(&peca.ids)?;
+                Indice::normalizar(&mut vetor)?;
+                prontas.push((peca, vetor));
+            }
+            // O que entra é o que a ficha prova. Uma conversa cortada pelo teto
+            // fica lembrada até onde coube, e a ficha diz isso em vez de prometer
+            // o texto inteiro: assim ela não volta a ser vetorada turno após
+            // turno atrás de um começo que não cabe.
+            indice.substituir_conversa(viva, prova, &prontas);
+            gastos += tokens;
+            mudadas += 1;
+        }
+        Ok(mudadas)
+    }
+
+    /// A busca em si: o chão do índice, o vetor da pergunta, os `k` vizinhos e as
+    /// conversas que ela não pode responder.
+    pub fn buscar(&self, consulta: &str, trechos: u32, ignorar: &[String]) -> Result<Resposta> {
         let consulta = consulta.trim();
         let ajustes = self.ajustes();
         if consulta.is_empty() {
@@ -1540,19 +1939,27 @@ impl Custodio {
             k,
             piso: ajustes.piso,
             modo: ajustes.modo,
+            ignorar,
         })
     }
 
-    /// O texto que o modelo lê: cabeçalho e trechos, com o caminho e a linha de
-    /// cada um, para a citação sair certa.
+    /// O texto que o modelo lê: cabeçalho e trechos, cada um com a origem de
+    /// onde ele saiu — caminho e linha num arquivo, conversa e mensagem numa
+    /// lembrança de papo — para a citação sair certa.
     pub fn texto_do_bloco(achados: &[Achado]) -> String {
         let mut saida = String::from(tr("memoria.blocoCabecalho", &[]).as_str());
         for (numero, achado) in achados.iter().enumerate() {
+            let origem = match achado.fonte {
+                Fonte::Arquivo => format!("{}:{}", achado.arquivo, achado.linha),
+                Fonte::Conversa => tr(
+                    "memoria.blocoConversa",
+                    &[("titulo", &achado.nome), ("linha", &achado.linha.to_string())],
+                ),
+            };
             saida.push_str(&format!(
-                "\n[{}] {}:{}\n{}",
+                "\n[{}] {}\n{}",
                 numero + 1,
-                achado.arquivo,
-                achado.linha,
+                origem,
                 achado.texto.trim_end()
             ));
         }
@@ -1590,6 +1997,8 @@ impl Custodio {
             modo: ajustes.modo.nome(),
             indexados,
             arquivos: disco.arquivos,
+            conversas: disco.conversas,
+            trechos_conversas: disco.trechos_conversas,
             bytes: std::fs::metadata(&self.caminho_indice).map(|m| m.len()).unwrap_or(0),
             indexando: self.esta_indexando(),
             progresso: self.progresso(),
@@ -1615,9 +2024,9 @@ impl Custodio {
         }
     }
 
-    /// Constrói ou atualiza o índice das pastas concedidas. Bloqueante: quem
-    /// chama roda isto fora do runtime assíncrono.
-    pub fn indexar(&self, mut emitir: impl FnMut(Evento)) -> Result<Resumo> {
+    /// Constrói ou atualiza o índice das pastas concedidas e das conversas
+    /// salvas. Bloqueante: quem chama roda isto fora do runtime assíncrono.
+    pub fn indexar(&self, conversas: &[ConversaViva], mut emitir: impl FnMut(Evento)) -> Result<Resumo> {
         if self.ocupado.swap(true, Ordering::SeqCst) {
             bail!(tr("erros.memoriaOcupada", &[]));
         }
@@ -1630,7 +2039,7 @@ impl Custodio {
             arquivo: String::new(),
             trechos: 0,
         };
-        let resultado = self.varrer_e_embutir(&mut emitir);
+        let resultado = self.varrer_e_embutir(conversas, &mut emitir);
         self.ocupado.store(false, Ordering::SeqCst);
         match resultado {
             Ok(mut resumo) => {
@@ -1653,10 +2062,16 @@ impl Custodio {
         }
     }
 
-    fn varrer_e_embutir(&self, emitir: &mut dyn FnMut(Evento)) -> Result<Resumo> {
+    fn varrer_e_embutir(
+        &self,
+        conversas: &[ConversaViva],
+        emitir: &mut dyn FnMut(Evento),
+    ) -> Result<Resumo> {
         let spec = self.spec().ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
         let raizes = self.pastas.read().expect("pastas envenenadas").raizes.clone();
-        if raizes.is_empty() {
+        if raizes.is_empty() && conversas.is_empty() {
+            // Nada para ler em lugar nenhum. Mas conversa salva já é memória:
+            // sem pasta concedida o varrer ainda lembrado o histórico.
             bail!(tr("erros.semPastas", &[]));
         }
         let Varredura { candidatos, completa } = varrer(&raizes);
@@ -1787,10 +2202,17 @@ impl Custodio {
         let vivas = self.pastas.read().expect("pastas envenenadas").raizes.clone();
         indice.reter_dentro(&vivas);
 
+        // O varrer é também o ponto em que o histórico inteiro entra na memória,
+        // sem o orçamento de um turno: aqui o codificador já está na mão, o
+        // trabalho corre fora da conversa e a barra de progresso existe justamente
+        // para o dono ver o índice subir.
+        self.escrever_conversas(&mut indice, carregado, conversas, usize::MAX)?;
+
         let resumo = Resumo {
             arquivos: indice.arquivos(),
             relidos,
             trechos: indice.trechos(),
+            conversas: indice.conversas(),
             ms: 0,
             truncado: truncado || !completa,
             cancelado,
@@ -1855,7 +2277,7 @@ mod testes {
     /// texto da pergunta fica em branco porque o que se verifica aqui é o cosseno
     /// e o piso, não a palavra.
     fn por_vetor(vetor: &[f32], k: usize, piso: f32) -> Busca<'_> {
-        Busca { vetor, texto: "", k, piso, modo: Modo::Vetorial }
+        Busca { vetor, texto: "", k, piso, modo: Modo::Vetorial, ignorar: &[] }
     }
 
     #[test]
@@ -2062,7 +2484,7 @@ mod testes {
         let vetor = [0.0f32, 1.0];
         let buscar = |modo: Modo| {
             indice.buscar(
-                &Busca { vetor: &vetor, texto: "ds18b20", k: 2, piso: 0.5, modo },
+                &Busca { vetor: &vetor, texto: "ds18b20", k: 2, piso: 0.5, modo, ignorar: &[] },
                 &raizes,
             )
             .unwrap()
@@ -2104,7 +2526,7 @@ mod testes {
         let raizes = [PathBuf::from("C:/concedida")];
         let vetor = [1.0f32, 0.0];
         let resposta = indice
-            .buscar(&Busca { vetor: &vetor, texto: "norte", k: 3, piso: 0.5, modo: Modo::Hibrido }, &raizes)
+            .buscar(&Busca { vetor: &vetor, texto: "norte", k: 3, piso: 0.5, modo: Modo::Hibrido, ignorar: &[] }, &raizes)
             .unwrap();
         assert_eq!(
             resposta
@@ -2137,6 +2559,7 @@ mod testes {
                 k: 1,
                 piso: 0.9,
                 modo: Modo::Lexico,
+                ignorar: &[],
             }, &raizes)
             .unwrap();
         assert_eq!(resposta.achados.len(), 1);
@@ -2145,7 +2568,7 @@ mod testes {
         // Sem nenhuma palavra em comum, a lista léxica fica vazia — ausência não
         // entra em lista nenhuma como "nota baixa".
         let vazio = indice
-            .buscar(&Busca { vetor: &vetor, texto: "tubulação", k: 1, piso: 0.0, modo: Modo::Lexico }, &raizes)
+            .buscar(&Busca { vetor: &vetor, texto: "tubulação", k: 1, piso: 0.0, modo: Modo::Lexico, ignorar: &[] }, &raizes)
             .unwrap();
         assert!(vazio.achados.is_empty());
     }
@@ -2211,6 +2634,253 @@ mod testes {
         assert_eq!(indice.trechos(), 1);
         assert_eq!(indice.arquivos(), 1);
         assert_eq!(indice.meta.trechos[0].arquivo, "C:/outra/b.rs");
+    }
+
+    /// Uma conversa como `conversas.rs` a entrega: `falas` falas, todas no texto
+    /// porque aqui nenhuma delas estourou o teto de cauda.
+    fn conversa(id: &str, titulo: &str, falas: usize, atualizada: u64) -> ConversaViva {
+        ConversaViva {
+            id: id.to_string(),
+            titulo: titulo.to_string(),
+            atualizada,
+            mensagens: falas,
+            texto: (1..=falas)
+                .map(|n| format!("fala {n} sobre a troca da bomba"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            a_partir_de: 0,
+        }
+    }
+
+    /// O índice com as duas fontes ligadas no mesmo espaço vetorial: um trecho de
+    /// arquivo concedido e um de conversa, ambos na direção da consulta. É assim
+    /// que se vê qual das duas políticas corta qual.
+    fn indice_duas_fontes() -> Indice {
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        indice.adicionar(
+            "C:/concedida/a.txt",
+            Assinatura { bytes: 1, modificado: 1 },
+            &[(Peca { linha: 3, texto: "a bomba d'água".into(), ids: vec![] }, vec![1.0, 0.0])],
+        );
+        let viva = conversa("c1", "Troca da bomba", 2, 1_700_000_000_000);
+        indice.substituir_conversa(
+            &viva,
+            viva.prova(),
+            &[(
+                Peca { linha: 1, texto: "fala 1 sobre a troca da bomba".into(), ids: vec![] },
+                vec![1.0, 0.0],
+            )],
+        );
+        indice
+    }
+
+    /// A revogação de pasta é a política dos arquivos. O que a pessoa disse numa
+    /// conversa não muda de dono quando ela mexe no grafo: perder isso seria
+    /// apagar a memória por engano.
+    #[test]
+    fn revogar_a_pasta_nao_apaga_o_que_a_conversa_lembra() {
+        let mut indice = indice_duas_fontes();
+        assert_eq!(indice.trechos(), 2);
+        // Nenhuma pasta concedida: o arquivo perde o direito de ser lembrado.
+        assert_eq!(indice.reter_dentro(&[]), 1);
+        assert_eq!(indice.trechos_de(Fonte::Arquivo), 0);
+        assert_eq!(indice.trechos_de(Fonte::Conversa), 1);
+        assert_eq!(indice.conversas(), 1);
+        // E a busca, sem pasta nenhuma, ainda devolve a conversa.
+        let resposta = indice.buscar(&por_vetor(&[1.0, 0.0], 2, 0.0), &[]).unwrap();
+        assert_eq!(resposta.achados.len(), 1);
+        assert_eq!(resposta.achados[0].fonte, Fonte::Conversa);
+    }
+
+    /// O contrário também vale, e aqui a chave é a mesma string de propósito: o
+    /// id de uma conversa pode, por azar, ser igual ao caminho guardado no
+    /// trecho de um arquivo. O que separa as duas casas é a fonte, nunca a chave.
+    #[test]
+    fn esquecer_a_conversa_tira_so_o_trecho_dela_mesmo_com_o_arquivo_de_mesma_chave() {
+        let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+        indice.adicionar(
+            "c1",
+            Assinatura { bytes: 1, modificado: 1 },
+            &[(Peca { linha: 1, texto: "o arquivo c1".into(), ids: vec![] }, vec![1.0])],
+        );
+        let viva = conversa("c1", "A conversa c1", 1, 7);
+        indice.substituir_conversa(
+            &viva,
+            viva.prova(),
+            &[(Peca { linha: 1, texto: "a fala da conversa".into(), ids: vec![] }, vec![1.0])],
+        );
+        assert_eq!(indice.trechos(), 2);
+        assert_eq!(indice.esquecer_conversa("c1"), 1);
+        assert_eq!(indice.trechos(), 1);
+        assert_eq!(indice.meta.trechos[0].fonte, Fonte::Arquivo);
+        assert_eq!(indice.meta.trechos[0].texto, "o arquivo c1");
+        assert_eq!(indice.arquivos(), 1);
+    }
+
+    /// Apagar do histórico, ou simplesmente sair da janela que a memória cobre,
+    /// tem de apagar a lembrança — e só ela.
+    #[test]
+    fn a_conversa_que_sai_da_lista_sai_do_indice() {
+        let mut indice = indice_duas_fontes();
+        let vivas = [conversa("c2", "Outro papo", 1, 200)];
+        assert_eq!(indice.reter_conversas(&vivas), 1);
+        assert_eq!(indice.trechos_de(Fonte::Conversa), 0);
+        assert_eq!(indice.trechos_de(Fonte::Arquivo), 1);
+        assert_eq!(indice.conversas(), 0);
+        // O arquivo continua visto pela varredura: a conversa não tinha nada a
+        // ver com as assinaturas dele.
+        assert!(indice.esta_visto("C:/concedida/a.txt", &Assinatura { bytes: 1, modificado: 1 }));
+    }
+
+    /// Zero é o caso comum, e é ele que faz um turno ligar a memória de conversa
+    /// sem custar um vetor nenhum.
+    #[test]
+    fn o_turno_sem_conversa_nova_nao_tem_trabalho_nenhum() {
+        let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+        let viva = conversa("c1", "Bomba", 3, 100);
+        assert_eq!(indice.conversas_pendentes(&[viva.clone()]), 1);
+        indice.substituir_conversa(
+            &viva,
+            viva.prova(),
+            &[(Peca { linha: 1, texto: "fala 1".into(), ids: vec![] }, vec![1.0])],
+        );
+        assert_eq!(indice.conversas_pendentes(&[viva.clone()]), 0);
+        // Ganhou falas: voltou a ser trabalho.
+        let crescida = ConversaViva { mensagens: 4, atualizada: 150, ..viva.clone() };
+        assert_eq!(indice.conversas_pendentes(&[crescida]), 1);
+        // Só mudou o título: o texto lembrado ainda é o mesmo, e reescrever por
+        // causa de título seria pagar um vetor para trocar uma palavra do cartão.
+        let renomeada = ConversaViva { titulo: "Título novo".into(), ..viva.clone() };
+        assert_eq!(indice.conversas_pendentes(&[renomeada]), 0);
+        // A que saiu da lista também é trabalho — trabalho de desfazer.
+        assert_eq!(indice.conversas_pendentes(&[]), 1);
+    }
+
+    /// A prova de que a conversa está lembrada precisa sobreviver à reinicialização,
+    /// ou o primeiro turno depois de abrir o app re vetorizaria o histórico todo.
+    #[test]
+    fn a_ficha_da_conversa_volta_do_disco_com_a_prova() {
+        let pasta = std::env::temp_dir().join(format!("aether-memoria-conversa-{}", std::process::id()));
+        std::fs::create_dir_all(&pasta).unwrap();
+        let arquivo = pasta.join("indice.aether");
+        let indice = indice_duas_fontes();
+        let viva = conversa("c1", "Troca da bomba", 2, 1_700_000_000_000);
+        indice.salvar(&arquivo).unwrap();
+        let lido = Indice::carregar(&arquivo).expect("leu o índice");
+        assert_eq!(lido.conversas(), 1);
+        assert_eq!(lido.trechos_de(Fonte::Conversa), 1);
+        assert!(lido.conversa_vista(&viva.id, &viva.prova()));
+        assert_eq!(lido.conversas_pendentes(&[viva]), 0);
+        // O trecho de arquivo, gravado antes de `fonte` existir, é arquivo: o
+        // padrão do campo velho é a verdade sobre ele.
+        assert_eq!(lido.meta.trechos[0].fonte, Fonte::Arquivo);
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// O cartão cita o que o modelo pode reler: título e data da ficha gravada
+    /// junto do trecho, não uma suposição sobre o id. E o `ignorar` do turno corta
+    /// a conversa que já está na janela dele, sem tocar nos arquivos.
+    #[test]
+    fn o_achado_de_conversa_diz_o_titulo_a_data_e_sai_pelo_ignorar() {
+        let indice = indice_duas_fontes();
+        let raizes = [PathBuf::from("C:/concedida")];
+        let buscar = |ignorar: &[String]| {
+            indice
+                .buscar(
+                    &Busca {
+                        vetor: &[1.0, 0.0],
+                        texto: "bomba",
+                        k: 2,
+                        piso: 0.0,
+                        modo: Modo::Hibrido,
+                        ignorar,
+                    },
+                    &raizes,
+                )
+                .unwrap()
+        };
+        let resposta = buscar(&[]);
+        let da_conversa = resposta
+            .achados
+            .iter()
+            .find(|a| a.fonte == Fonte::Conversa)
+            .expect("a conversa não entrou na lista");
+        assert_eq!(da_conversa.nome, "Troca da bomba");
+        assert_eq!(da_conversa.arquivo, "c1");
+        assert_eq!(da_conversa.quando, Some(1_700_000_000_000));
+        let do_arquivo = resposta
+            .achados
+            .iter()
+            .find(|a| a.fonte == Fonte::Arquivo)
+            .expect("o arquivo não entrou na lista");
+        assert_eq!(do_arquivo.nome, "a.txt");
+        assert_eq!(do_arquivo.quando, None);
+        assert_eq!(do_arquivo.linha, 3);
+
+        // O turno pergunta sobre o que ainda não sabe.
+        let ignorada = ["c1".to_string()];
+        let resposta = buscar(&ignorada);
+        assert_eq!(resposta.achados.len(), 1);
+        assert_eq!(resposta.achados[0].fonte, Fonte::Arquivo);
+    }
+
+    /// Numa conversa cortada pela cauda, a linha do trecho não é a posição dele no
+    /// texto recebido: é o número da fala como a pessoa a vê no histórico.
+    #[test]
+    fn a_peca_da_cauda_cita_a_fala_verdadeira() {
+        let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+        let viva = ConversaViva {
+            id: "c1".into(),
+            titulo: "Bomba".into(),
+            atualizada: 9,
+            mensagens: 50,
+            texto: "fala 49\nfala 50".into(),
+            a_partir_de: 48,
+        };
+        indice.substituir_conversa(
+            &viva,
+            viva.prova(),
+            &[
+                (Peca { linha: 1, texto: "fala 49".into(), ids: vec![] }, vec![1.0]),
+                (Peca { linha: 2, texto: "fala 50".into(), ids: vec![] }, vec![1.0]),
+            ],
+        );
+        assert_eq!(
+            indice.meta.trechos.iter().map(|t| t.linha).collect::<Vec<_>>(),
+            vec![49, 50]
+        );
+        // Reescrever a conversa não acumula: sai o texto lembrado, entra o novo.
+        indice.substituir_conversa(
+            &viva,
+            viva.prova(),
+            &[(Peca { linha: 1, texto: "fala 49 de novo".into(), ids: vec![] }, vec![1.0])],
+        );
+        assert_eq!(indice.trechos_de(Fonte::Conversa), 1);
+        assert_eq!(indice.meta.trechos[0].linha, 49);
+        assert_eq!(indice.meta.trechos[0].texto, "fala 49 de novo");
+    }
+
+    /// A verba do turno é um teto de trabalho, não uma fila de espera eterna: a
+    /// primeira conversa sempre entra, mesmo maior que a verba inteira.
+    #[test]
+    fn a_verba_do_turno_nunca_deixa_a_primeira_conversa_de_fora() {
+        // A primeira entra sempre, maior que a verba inteira.
+        assert!(!acabou_a_verba(0, TOKENS_POR_TURNO * 6, TOKENS_POR_TURNO));
+        // Da segunda em diante é a soma que manda, e ela corta no limite exato.
+        assert!(!acabou_a_verba(TOKENS_POR_TURNO - 1, 1, TOKENS_POR_TURNO));
+        assert!(acabou_a_verba(TOKENS_POR_TURNO, 1, TOKENS_POR_TURNO));
+        assert!(acabou_a_verba(4_001, 4_001, 8_000));
+    }
+
+    /// Trocar a escala do fatiamento joga fora as peças inteiras — inclusive as de
+    /// conversa, cuja ficha teria de dizer que lembra um texto que não existe mais.
+    #[test]
+    fn refatiar_tambem_esquece_as_conversas() {
+        let mut indice = indice_duas_fontes();
+        assert!(indice.refatiar(128, 32));
+        assert_eq!(indice.trechos(), 0);
+        assert_eq!(indice.conversas(), 0);
+        assert_eq!(indice.conversas_pendentes(&[conversa("c1", "Troca da bomba", 2, 1_700_000_000_000)]), 1);
     }
 
     #[test]

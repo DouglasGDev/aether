@@ -103,7 +103,7 @@
     "podeApagar": "Pode apagar"
   },
   "conversa": {
-    "promptSistema": "Você é Aether, um assistente local que roda no computador do usuário. Responda em {idioma}, de forma breve e direta. Aja com as ferramentas em vez de descrever a ação: quem aprova cada ação é a tela de aprovação, então não peça confirmação na resposta.",
+    "promptSistema": "Você é Aether, um assistente local que roda no computador do usuário. Responda em {idioma}, de forma breve e direta. Aja com as ferramentas em vez de descrever a ação: quem aprova cada ação é a tela de aprovação, então não peça confirmação na resposta. As conversas passadas ficam no índice de memória local: antes de dizer que não lembra de um assunto, procure em buscar_memoria.",
     "pastasConcedidas": "Pastas concedidas — os únicos caminhos que existem para você: {lista}. Use caminho absoluto dentro delas; fora delas você não tem acesso a nada.",
     "raciocinio": "Raciocínio",
     "ferramentas": "Ferramentas",
@@ -305,6 +305,8 @@
     "lote": "Teto da peça",
     "trechosIndexados": "{n} trechos",
     "arquivos": "{n} arquivos",
+    "conversas": "{n} conversas",
+    "trechosDeConversa": "{n} de conversa",
     "varridoEm": "Varredura",
     "autoLigada": "Injeção automática ligada",
     "autoSemFio": "Sem fio no grafo",
@@ -320,7 +322,7 @@
     "modoVetorial": "Pelo vetor",
     "modoHibrido": "Vetor e palavra",
     "modoLexico": "Pela palavra",
-    "varrer": "Indexar as pastas",
+    "varrer": "Indexar pastas e conversas",
     "revarrer": "Indexar de novo",
     "parar": "Parar a varredura",
     "apagar": "Apagar o índice",
@@ -328,12 +330,19 @@
     "testePlaceholder": "O que a memória sabe sobre…",
     "procurar": "Procurar",
     "linha": "linha {n}",
+    "fala": "fala {n}",
+    "conversaSemTitulo": "conversa sem título",
+    "falaUsuario": "você",
+    "falaAssistente": "Aether",
     "proximidade": "{n}% de proximidade",
     "origemVetorial": "pelo vetor",
     "origemLexica": "pela palavra",
     "origemAmbas": "pelos dois",
+    "fonteArquivo": "do arquivo",
+    "fonteConversa": "da conversa",
     "maisTrechos": "{n} trechos entraram na ordem e ficaram fora do corte",
-    "blocoCabecalho": "Trechos da memória local, citáveis por arquivo e linha:",
+    "blocoCabecalho": "Memória própria do Aether: as falas abaixo são conversas que você já teve com este usuário — 'você:' é o que ele disse e 'Aether:' é o que você respondeu; os itens com arquivo e linha são trechos das pastas concedidas. Responda com o que está aí, citando a conversa e a fala, ou o arquivo e a linha, de onde tirou a resposta:",
+    "blocoConversa": "conversa \"{titulo}\", fala {linha}",
     "nadaEncontrado": "nada encontrado"
   },
   "adaptadores": {
@@ -396,6 +405,7 @@
     "previa": "Prévia",
     "conteudo": "Conteúdo",
     "intervalo": "linhas {de}–{ate}",
+    "fala": "fala {n}",
     "linha": "linha {n}",
     "itens": "{n} itens",
     "ocorrencias": "{n} ocorrências",
@@ -449,7 +459,7 @@
     },
     "buscarMemoria": {
       "titulo": "Buscar na memória",
-      "descricao": "Procura no índice local das pastas concedidas e devolve os trechos mais próximos da pergunta, com o arquivo e a linha de cada um."
+      "descricao": "Procura no índice local das pastas concedidas e das conversas salvas e devolve os trechos mais próximos da pergunta, com o arquivo e a linha ou a conversa e a fala de cada um."
     },
     "escreverArquivo": {
       "titulo": "Escrever arquivo",
