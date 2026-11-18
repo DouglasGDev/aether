@@ -57,6 +57,9 @@ pub fn run() {
             // O cadastro de conexões de banco: conexões, senhas cifradas e a
             // política por tabela que o dono escolheu.
             let bancos_path = Arc::new(app.path().app_config_dir()?.join("bancos.json"));
+            // O depósito dos resultados longos de ferramenta. Fica no dado local,
+            // ao lado dos modelos: é corpo de conversa, não escolha de configuração.
+            let derrame_path = Arc::new(app.path().app_local_data_dir()?.join("resultados"));
             // A memória tem pasta própria dentro de `models`: apagar um LLM de
             // conversa não leva o índice nem o codificador junto.
             let memoria = Arc::new(ai::memoria::Custodio::novo(
@@ -75,6 +78,7 @@ pub fn run() {
                 Arc::clone(&config_path),
                 Arc::clone(&segredos),
                 Arc::clone(&bancos_path),
+                Arc::clone(&derrame_path),
             ));
             // Os modelos de voz têm pasta própria dentro de `models`: apagar um
             // LLM não leva o Kokoro junto, e vice-versa.
@@ -103,6 +107,7 @@ pub fn run() {
                 instalacoes: mcp::instalador::Instalacoes::novo(),
                 ligacoes_path,
                 bancos_path: (*bancos_path).clone(),
+                derrame_path: (*derrame_path).clone(),
                 voz,
                 runtime_dir,
                 runtime_job: Mutex::new(None),

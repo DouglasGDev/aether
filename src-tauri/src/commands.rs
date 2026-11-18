@@ -895,6 +895,7 @@ pub async fn chat_send(
     let memoria = Arc::clone(&state.memoria);
     let pastas = Arc::clone(&state.pastas);
     let conversas = Arc::clone(&state.conversas);
+    let derrame = state.derrame_path.clone();
     if !ai.begin() {
         return Err(tr("erros.turnoEmAndamento", &[]));
     }
@@ -911,7 +912,9 @@ pub async fn chat_send(
     let voz = Arc::clone(&state.voz);
     let app_fala = app.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let resultado = run_chat_turn(&app, &ai, &manager, &memoria, &pastas, &conversas, &id, &text);
+        let resultado = run_chat_turn(
+            &app, &ai, &manager, &memoria, &pastas, &conversas, &derrame, &id, &text,
+        );
         // Grava mesmo quando o turno falhou: o que o modelo já disse e as
         // ferramentas que já rodaram aconteceram, e a conversa é o registro
         // disso. O lock do histórico é tomado e largado antes do das conversas.
@@ -953,6 +956,10 @@ fn run_chat_turn(
     memoria: &Custodio,
     pastas: &Arc<RwLock<Pastas>>,
     conversas: &Arc<conversas::Conversas>,
+    // A pasta do depósito de resultados longos, vinda do estado. O turno escreve
+    // nela e a ferramenta `ler_resultado` lê dela: as duas pontas têm de ser a
+    // mesma pasta, senão o id que o modelo recebe não leva a lugar nenhum.
+    derrame: &std::path::Path,
     conversa: &str,
     text: &str,
 ) -> Result<TurnOutcome, String> {
@@ -1132,6 +1139,7 @@ fn run_chat_turn(
         max_rounds: ajustes.rodadas as usize,
         memoria: bloco,
         pastas: bloco_pastas,
+        derrame: Some(derrame.to_path_buf()),
         resumo,
     };
 

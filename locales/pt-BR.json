@@ -386,7 +386,18 @@
     "todos": "Ligar ou desligar tudo de {nome}",
     "cortar": "Cortar {nome}"
   },
+  "derrame": {
+    "cabecalho": "O resultado tem {total} caracteres e não cabe inteiro na conversa. Guardei o corpo no depósito como {id}; abaixo estão os {cabeca} primeiros e os {cauda} últimos. Os {omitidos} do meio voltam quando a ferramenta ler_resultado for chamada com esse id.",
+    "meio": "[meio omitido: {omitidos} caracteres guardados]",
+    "janelaAberta": "Caracteres {desde} a {ate} do resultado {id}, que tem {total}. Sobraram {sobrou} depois deste pedaço, e a ferramenta ler_resultado devolve o resto.",
+    "janelaFechada": "Caracteres {desde} a {ate} do resultado {id}, que tem {total}. É o fim do corpo.",
+    "depositoVazio": "o depósito está vazio: nenhum resultado longo foi guardado ainda",
+    "guardados": "os resultados guardados mais novos são {lista}"
+  },
   "cartao": {
+    "resultado": "Resultado",
+    "pedaco": "caracteres {desde} a {ate} de {total}",
+    "sobram": "faltam {n}",
     "arquivo": "Arquivo",
     "pasta": "Pasta",
     "busca": "Busca",
@@ -460,6 +471,10 @@
     "buscarMemoria": {
       "titulo": "Buscar na memória",
       "descricao": "Procura no índice local das pastas concedidas e das conversas salvas e devolve os trechos mais próximos da pergunta, com o arquivo e a linha ou a conversa e a fala de cada um."
+    },
+    "lerResultado": {
+      "titulo": "Ler resultado guardado",
+      "descricao": "Devolve um pedaço de um resultado de ferramenta que é grande demais para a conversa. O começo e o fim já foram mostrados; aqui entra o meio, pelo id que veio junto."
     },
     "escreverArquivo": {
       "titulo": "Escrever arquivo",
@@ -563,6 +578,12 @@
     "consultaDescricao": "Pergunta em linguagem natural a procurar no índice das pastas concedidas.",
     "trechos": "Trechos",
     "trechosDescricao": "Quantos trechos devolver. Zero usa a escala salva e o teto é 8.",
+    "id": "Id do resultado",
+    "idDescricao": "O número do resultado guardado no depósito, exatamente como veio na janela do resultado longo.",
+    "desde": "Desde",
+    "desdeDescricao": "Primeiro caractere a ler, contando a partir de 0.",
+    "quantos": "Quantos",
+    "quantosDescricao": "Quantos caracteres devolver. O teto é 3584; zero pede o máximo.",
     "conexao": "Nome da conexão",
     "conexaoDescricao": "Nome exato de uma conexão do cadastro do dono. Chame bancos_listar para ver os nomes.",
     "fonte": "Tabela",
@@ -841,6 +862,8 @@
     "falhaMover": "não movi {caminho}: {detalhe}",
     "falhaCriarPasta": "não criei a pasta {caminho}: {detalhe}",
     "falhaListar": "não listei {caminho}: {detalhe}",
+    "resultadoAusente": "não há o resultado {id} no depósito. {lista}",
+    "falhaDeposito": "não consegui escrever no depósito de resultados: {detalhe}",
     "falhaExecutar": "não executei o comando: {detalhe}",
     "falhaMedirDisco": "não medi o espaço em disco: {detalhe}",
     "idiomaDesconhecido": "o idioma {id} não existe na pasta de idiomas",

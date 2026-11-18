@@ -386,7 +386,18 @@
     "todos": "Wire or cut everything from {nome}",
     "cortar": "Cut {nome}"
   },
+  "derrame": {
+    "cabecalho": "The result has {total} characters and doesn't fit in the conversation. I kept the whole body in the deposit as {id}; below are the first {cabeca} and the last {cauda}. The {omitidos} in between come back when the ler_resultado tool is called with that id.",
+    "meio": "[middle omitted: {omitidos} characters kept]",
+    "janelaAberta": "Characters {desde} to {ate} of result {id}, which has {total} in all. {sobrou} remain after this piece, and the ler_resultado tool returns the rest.",
+    "janelaFechada": "Characters {desde} to {ate} of result {id}, which has {total} in all. This is the end of the body.",
+    "depositoVazio": "the deposit is empty: no long result has been kept yet",
+    "guardados": "the newest results in the deposit are {lista}"
+  },
   "cartao": {
+    "resultado": "Result",
+    "pedaco": "characters {desde} to {ate} of {total}",
+    "sobram": "{n} still missing",
     "arquivo": "File",
     "pasta": "Folder",
     "busca": "Search",
@@ -460,6 +471,10 @@
     "buscarMemoria": {
       "titulo": "Search memory",
       "descricao": "Searches the local index of the granted folders and the saved chats and returns the passages closest to the question, with the file and line or the chat and turn of each one."
+    },
+    "lerResultado": {
+      "titulo": "Read kept result",
+      "descricao": "Returns a piece of a tool result that is too large for the conversation. The start and the end were already shown; this is the middle, by the id that came with it."
     },
     "escreverArquivo": {
       "titulo": "Write file",
@@ -563,6 +578,12 @@
     "consultaDescricao": "Natural-language question to look up in the index of the granted folders.",
     "trechos": "Passages",
     "trechosDescricao": "How many passages to return. Zero uses the saved setting and the ceiling is 8.",
+    "id": "Result id",
+    "idDescricao": "The number of a result kept in the deposit, exactly as it came in the window of the long result.",
+    "desde": "From",
+    "desdeDescricao": "First character to read, counting from 0.",
+    "quantos": "How many",
+    "quantosDescricao": "How many characters to return. The ceiling is 3584; zero asks for the most.",
     "conexao": "Connection name",
     "conexaoDescricao": "Exact name of one of the owner's registered connections. Call bancos_listar to see the names.",
     "fonte": "Table",
@@ -841,6 +862,8 @@
     "falhaMover": "couldn't move {caminho}: {detalhe}",
     "falhaCriarPasta": "couldn't create the folder {caminho}: {detalhe}",
     "falhaListar": "couldn't list {caminho}: {detalhe}",
+    "resultadoAusente": "there is no result {id} in the deposit. {lista}",
+    "falhaDeposito": "couldn't write to the result deposit: {detalhe}",
     "falhaExecutar": "couldn't run the command: {detalhe}",
     "falhaMedirDisco": "couldn't measure disk space: {detalhe}",
     "idiomaDesconhecido": "the language {id} doesn't exist in the languages folder",

@@ -199,6 +199,17 @@ pub enum Vista {
         estourou: bool,
         truncado: bool,
     },
+    /// Um pedaço de um resultado que o laço guardou no depósito. O cartão diz o
+    /// intervalo lido e quanto sobrou depois dele, porque um recorte mostrado sem
+    /// essas duas números parece o corpo inteiro.
+    Resultado {
+        id: String,
+        total: usize,
+        desde: usize,
+        ate: usize,
+        sobrou: usize,
+        texto: String,
+    },
     Sistema {
         linhas: Vec<Par>,
     },

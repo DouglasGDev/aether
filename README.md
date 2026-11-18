@@ -14,7 +14,7 @@ As capturas abaixo são do aplicativo real rodando no Windows com a placa Vulkan
 em 18 de novembro de 2026. Nada nelas é montado: as medidas saem do motor e da
 bancada.
 
-**O núcleo** — o orbe, as 11 ferramentas do conector embutido com o efeito de
+**O núcleo** — o orbe, as ferramentas do conector embutido com o efeito de
 cada uma (`Só lê`, `Altera`, `Pode apagar`) e a faixa de conectores embaixo. Na
 barra ficam os controles de um turno — conversas, ligações e confiança; o resto
 do aplicativo está no menu.
@@ -50,8 +50,9 @@ chamada (`Origem · Aether (MCP local)`) e o que o efeito dela é.
 ![Card de aprovação de uma chamada recebida pelo servidor MCP local](docs/capturas/mcp-aprovacao.png)
 
 **A bancada** — a suíte que roda dentro do aplicativo. O caso `Conexão MCP
-local` mede a porta sorteada, quantas ferramentas o fio anuncia contra as 20 do
-catálogo (11 locais + 9 de banco de dados) e o `401` de quem chega sem token.
+local` mede a porta sorteada, quantas ferramentas o fio anuncia contra o catálogo
+que o núcleo monta nesta mesma execução (locais + bancos, contado por símbolo, não
+por número escrito à mão) e o `401` de quem chega sem token.
 
 ![Bancada com os casos aprovados](docs/capturas/bancada.png)
 
@@ -105,7 +106,7 @@ movido se um hash divergir. Veja
   se ainda assim faltar um argumento obrigatório, a ferramenta recusa e diz o
   que faltou, em vez de criar um arquivo vazio com a cara de sucesso; uma
   chamada com nome que não existe devolve a lista dos nomes reais.
-- **Conector local** — 11 ferramentas de arquivo, terminal, código, memória e
+- **Conector local** — 12 ferramentas de arquivo, terminal, código, memória e
   sistema, dentro das pastas que a pessoa concedeu, mais `criar_mcp_local`, que
   publica o servidor abaixo. Ele entra no mesmo cadastro, na mesma allowlist e no
   mesmo gate que um servidor MCP de terceiros.
@@ -129,7 +130,7 @@ movido se um hash divergir. Veja
   devolveu o catálogo do momento (as 11 ferramentas locais, antes dos bancos
   entrarem) e um `tools/call` de `info_sistema` ficou parado até a pessoa
   clicar *Aprovar* no cartão da tela — depois disso devolveu o sistema, a placa e
-  as pastas concedidas de verdade. O servidor anuncia o catálogo inteiro — as 11
+  as pastas concedidas de verdade. O servidor anuncia o catálogo inteiro — as 12
   ferramentas locais e as 9 de banco de dados; `criar_mcp_local` não é anunciada
   por ele, porque publicar de dentro de uma publicação seria outra porta para a
   mesma sala.
@@ -159,7 +160,7 @@ movido se um hash divergir. Veja
   dela (contagem de mensagens e instante da última), então um turno sem histórico
   novo não custa um vetor. O trabalho de conversa paga um teto de tokens por turno
   (8.192) e sempre entrega ao menos uma conversa inteira; a varredura, que corre
-  fora do turno com barra de progresso, drena o resto. Medido na suíte: 461 testes
+  fora do turno com barra de progresso, drena o resto. Medido na suíte: 478 testes
   de unidade, incluindo os que provam o isolamento das duas fontes e a
   idempotência da prova.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
@@ -201,6 +202,19 @@ movido se um hash divergir. Veja
   dobra nenhuma. O caso da bancada que mede isso aprovou com janela 4.096, limite
   de prompt 3.840, 1 dobra e 55 tokens gerados (2.891 ms) — e reprova, com os
   números do banner antigo, se a decisão de dobrar volta a ser recusa.
+- **Janela de resultado** — o corpo de uma ferramenta é o que pesa: um
+  `ler_arquivo` devolve até 256 KiB, um comando até 64 KiB, e cada rodada seguinte
+  prefila aquilo de novo para o modelo chegar à chamada seguinte. Acima de 4.096
+  caracteres o corpo sai do histórico e vira um arquivo do depósito; ao modelo
+  vão os 1.536 primeiros caracteres, os 512 últimos e um id. A 12ª ferramenta do
+  catálogo, `ler_resultado`, devolve o pedaço que ele pedir — até 3.584 por
+  chamada, e o teto é essa conta e não o limiar porque o cabeçalho vai na frente:
+  uma leitura do tamanho exato do limiar seria um resultado longo, derramado de
+  novo, e o laço passaria a guardar janelas de janelas. O que a pessoa vê não
+  encolhe: o cartão continua recebendo o resultado inteiro, e um erro de
+  ferramenta nunca é cortado. O depósito guarda os 64 resultados mais novos; um id
+  que já saiu de lá responde com a lista dos que estão, como o nome errado de uma
+  ferramenta responde com a lista dos nomes reais.
 - **Medidas visíveis** — tokens de entrada e saída, quantos deles vieram do cache,
   tokens/s de prefill e decode, tempo no motor, motivo de parada e quantas
   mensagens entraram no resumo daquela resposta.
@@ -241,7 +255,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 466 testes (461 passam, 5 com `#[ignore]`)
+cd src-tauri && cargo test --lib     # 483 testes (478 passam, 5 com `#[ignore]`)
 npm run build                        # tsc + vite
 ```
 
@@ -286,8 +300,11 @@ src-tauri/vendor/    cabeçalhos, licenças e somas dos binários de terceiros
 O aplicativo grava em `%APPDATA%\ai.aether.core` (ajustes, conectores,
 allowlists, pastas concedidas, grafo, voz, RAG e o cadastro de bancos de dados),
 em `%APPDATA%\ai.aether.core\conversas` (o índice e as mensagens de cada
-conversa) e em `%LOCALAPPDATA%\ai.aether.core\models` (pesos, índice e os pacotes
-de runtime instalados). Nenhum desses arquivos sai da máquina.
+conversa), em `%LOCALAPPDATA%\ai.aether.core\models` (pesos, índice e os pacotes
+de runtime instalados) e em `%LOCALAPPDATA%\ai.aether.core\resultados` (os corpos
+de ferramenta que saíram do histórico para caber na janela — texto cru do que a
+ferramenta leu, dos 64 mais novos, sem cifra nenhuma). Nenhum desses arquivos sai
+da máquina.
 
 Segredo não vai para disco: o `mcp.json` guarda no máximo a referência
 `${AETHER_MCP_TOKEN}`, e o valor dela vive só na memória do aplicativo enquanto a

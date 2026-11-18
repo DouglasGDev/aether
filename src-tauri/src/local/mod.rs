@@ -20,7 +20,7 @@ use crate::permissions::ToolEffect;
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 pub use vista::Vista;
 
 /// Identificador do conector embutido. Não é um servidor MCP: não há processo
@@ -137,6 +137,19 @@ pub fn catalogo() -> Vec<Ferramenta> {
                     "trechos": campo("integer", "trechos"),
                 }),
                 &["consulta"],
+            ),
+        ),
+        ferramenta(
+            "ler_resultado",
+            "lerResultado",
+            ReadOnly,
+            objeto(
+                json!({
+                    "id": campo("string", "id"),
+                    "desde": campo("integer", "desde"),
+                    "quantos": campo("integer", "quantos"),
+                }),
+                &["id"],
             ),
         ),
         ferramenta(
@@ -277,11 +290,16 @@ pub fn booleano(args: &Map<String, Value>, chave: &str, padrao: bool) -> bool {
 
 /// Executa uma ferramenta local. Síncrono de propósito: quem chama roda isto
 /// numa tarefa bloqueante, para não prender o runtime assíncrono do aplicativo.
+///
+/// `derrame` é a pasta onde o laço de conversa guarda os resultados longos. Só
+/// `ler_resultado` usa, mas ela entra pela mesma porta das outras porque o
+/// depósito é uma capacidade do computador, não um atalho por fora dele.
 pub fn executar(
     nome: &str,
     argumentos: Value,
     pastas: &pastas::Pastas,
     memoria: &Custodio,
+    derrame: &Path,
 ) -> Result<Saida> {
     let args = match argumentos {
         Value::Object(mapa) => mapa,
@@ -292,6 +310,7 @@ pub fn executar(
         "listar_pasta" => arquivos::listar(&args, pastas),
         "buscar_texto" => arquivos::buscar(&args, pastas),
         "buscar_memoria" => memoria::buscar(&args, memoria),
+        "ler_resultado" => crate::ai::derrame::ferramenta(&args, derrame),
         "escrever_arquivo" => arquivos::escrever(&args, pastas),
         "editar_arquivo" => arquivos::editar(&args, pastas),
         "criar_pasta" => arquivos::criar_pasta(&args, pastas),
@@ -338,6 +357,14 @@ mod tests {
         )
     }
 
+    /// A pasta do depósito usada pelos testes de execução. Cada um tem a sua,
+    /// porque a poda dos resultados mais antigos é shared entre todos.
+    fn deposito(nome: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("aether-deposito-{nome}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
     /// Nome errado não é bloqueio: a resposta tem de dizer quais ferramentas
     /// existem, senão o modelo procura uma porta alternativa.
     #[test]
@@ -348,6 +375,7 @@ mod tests {
             Value::Object(Default::default()),
             &pastas,
             &memoria(),
+            &deposito("nome"),
         )
         .expect_err("nome inexistente não roda");
         let texto = format!("{erro:#}");
@@ -356,13 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn o_catalogo_cobre_arquivos_memoria_terminal_e_sistema() {
+    fn o_catalogo_cobre_arquivos_memoria_resultados_terminal_e_sistema() {
         let nomes: Vec<&str> = catalogo().iter().map(|f| f.nome).collect();
         for esperado in [
             "ler_arquivo",
             "listar_pasta",
             "buscar_texto",
             "buscar_memoria",
+            "ler_resultado",
             "escrever_arquivo",
             "editar_arquivo",
             "criar_pasta",
@@ -373,7 +402,7 @@ mod tests {
         ] {
             assert!(nomes.contains(&esperado), "falta {esperado}");
         }
-        assert_eq!(nomes.len(), 11);
+        assert_eq!(nomes.len(), 12);
     }
 
     #[test]
@@ -382,7 +411,7 @@ mod tests {
             let esperado = match ferramenta.nome {
                 "apagar" => ToolEffect::Destructive,
                 "ler_arquivo" | "listar_pasta" | "buscar_texto" | "buscar_memoria"
-                | "info_sistema" => ToolEffect::ReadOnly,
+                | "ler_resultado" | "info_sistema" => ToolEffect::ReadOnly,
                 _ => ToolEffect::Mutating,
             };
             assert_eq!(ferramenta.efeito, esperado, "{}", ferramenta.nome);
@@ -457,19 +486,25 @@ mod tests {
     #[test]
     fn ferramenta_desconhecida_e_recusada() {
         let pastas = pastas::Pastas::default();
-        assert!(executar("apagar_tudo", json!({}), &pastas, &memoria()).is_err());
+        assert!(
+            executar("apagar_tudo", json!({}), &pastas, &memoria(), &deposito("desconhecida"))
+                .is_err()
+        );
     }
 
     #[test]
     fn argumentos_que_nao_sao_objeto_sao_recusados() {
         let pastas = pastas::Pastas::default();
-        assert!(executar("ler_arquivo", json!("caminho"), &pastas, &memoria()).is_err());
+        assert!(
+            executar("ler_arquivo", json!("caminho"), &pastas, &memoria(), &deposito("argumentos"))
+                .is_err()
+        );
     }
 
     #[test]
     fn argumento_obrigatorio_ausente_nomeia_o_que_falta() {
         let pastas = pastas::Pastas::default();
-        let erro = executar("ler_arquivo", json!({}), &pastas, &memoria())
+        let erro = executar("ler_arquivo", json!({}), &pastas, &memoria(), &deposito("faltando"))
             .unwrap_err()
             .to_string();
         assert!(erro.contains("caminho"), "{erro}");
@@ -485,9 +520,42 @@ mod tests {
             json!({ "consulta": "como ligar a placa" }),
             &pastas,
             &memoria(),
+            &deposito("memoria"),
         )
         .unwrap_err()
         .to_string();
         assert_eq!(erro, tr("erros.memoriaSemModelo", &[]));
+    }
+
+    /// O depósito não é uma porta paralela: o que o laço guardou sai pela mesma
+    /// `executar` que atende um `ler_arquivo`, com o mesmo gate e o mesmo cartão.
+    #[test]
+    fn o_que_o_laco_guardou_volta_pela_mesma_porta_das_outras_ferramentas() {
+        use crate::ai::derrame;
+        let pastas = pastas::Pastas::default();
+        let p = deposito("ida-e-volta");
+        let corpo = "linha larga do despejo da ferramenta\n".repeat(2_000);
+        let total = corpo.chars().count();
+
+        // O que o laço escreve no histórico é a janela, e o nome legível ali é o
+        // mesmo nome sob o qual o corpo está guardado.
+        let id = derrame::guardar(&p, &corpo).expect("guardou");
+        let janela = derrame::derramar(&p, &corpo).expect("derramou");
+        assert!(janela.chars().count() < total, "a janela é menor que o corpo");
+
+        let saida = executar(
+            "ler_resultado",
+            json!({ "id": id, "desde": 100, "quantos": 200 }),
+            &pastas,
+            &memoria(),
+            &p,
+        )
+        .expect("li pelo catálogo");
+        assert!(saida.texto.contains("linha larga do despejo"), "{}", saida.texto);
+        let Vista::Resultado { desde, ate, total: t, sobrou, .. } = &saida.vista else {
+            panic!("cartão de resultado");
+        };
+        assert_eq!((*desde, *ate, *t, *sobrou), (100, 300, total, total - 300));
+        let _ = std::fs::remove_dir_all(&p);
     }
 }

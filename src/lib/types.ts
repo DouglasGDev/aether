@@ -606,6 +606,16 @@ export type Vista =
       truncado: boolean;
     }
   | { type: "sistema"; linhas: VistaPar[] }
+  | {
+      /** Um pedaço de um resultado que o laço guardou no depósito de `resultados`. */
+      type: "resultado";
+      id: string;
+      total: number;
+      desde: number;
+      ate: number;
+      sobrou: number;
+      texto: string;
+    }
   | { type: "bancoConexoes"; itens: ConexaoCartao[] }
   | { type: "bancoFontes"; conexao: string; itens: FonteCartao[] }
   | { type: "bancoEsquema"; conexao: string; fonte: string; colunas: ColunaCartao[] }

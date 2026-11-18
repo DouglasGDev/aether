@@ -3,6 +3,7 @@ pub mod alojamento;
 pub mod catalog;
 pub mod chat;
 pub mod compactacao;
+pub mod derrame;
 pub mod download;
 pub mod engine;
 pub mod geracao;

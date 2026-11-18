@@ -42,6 +42,11 @@ pub struct AppState {
     /// entrega o caminho às ferramentas de banco, que o leem na hora da chamada:
     /// a política que a tela salvou vale na chamada seguinte, sem cache.
     pub bancos_path: PathBuf,
+    /// A pasta do depósito de resultados longos. O laço de conversa guarda aqui o
+    /// corpo que não coube no histórico, e `ler_resultado` lê daqui: a ferramenta
+    /// e o turno veem a mesma pasta, então o id que o modelo recebeu é um número
+    /// de registro, nunca um caminho.
+    pub derrame_path: PathBuf,
     /// A voz do aplicativo: fala, escuta e as escolhas de `voz.json`. Vive atrás
     /// de um Arc porque a thread de fala e os comandos a leem ao mesmo tempo.
     pub voz: Arc<crate::voz::MotorVoz>,

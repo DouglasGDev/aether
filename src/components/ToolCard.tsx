@@ -332,6 +332,28 @@ export function ToolCard({ vista, falha = false }: Props) {
         </div>
       );
 
+    case "resultado": {
+      const fatos = [
+        t("cartao.pedaco", {
+          desde: vista.desde,
+          ate: vista.ate,
+          total: vista.total,
+        }),
+      ];
+      if (vista.sobrou > 0) fatos.push(t("cartao.sobram", { n: vista.sobrou }));
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone="file"
+            tipo={t("cartao.resultado")}
+            alvo={vista.id}
+            fatos={fatos}
+          />
+          <pre className="card-out">{vista.texto}</pre>
+        </div>
+      );
+    }
+
     case "sistema":
       return (
         <div className={classe}>

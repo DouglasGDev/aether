@@ -9,12 +9,14 @@ use super::chat::{
     corpo_de_codigo, inicio_de_chamada, parse_tool_calls, promete_e_pede_licenca, strip_tool_calls,
 };
 use super::compactacao::{self, Resumo};
+use super::derrame;
 use super::engine::{Emission, Engine, SamplingParams, StopReason};
 use super::memoria::Achado;
 use super::router::Choice;
 use crate::idiomas::{self, tr};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -222,6 +224,12 @@ pub struct TurnConfig<'a> {
     /// parede. É estado vivo, não memória — por isso entra na renderização e
     /// nunca no histórico guardado.
     pub pastas: Option<String>,
+    /// A pasta do depósito de resultados longos. Um corpo grande não fica no
+    /// histórico: cada rodada seguinte prefilaria aquilo de novo, e o laço de
+    /// dez chamadas pagaria dez vezes um despejo que o modelo talvez nunca leia.
+    /// `None` é o laço sem depósito: o turno manda o texto inteiro, como mandava
+    /// antes de isto existir.
+    pub derrame: Option<PathBuf>,
 }
 
 /// Onde começa a resposta dentro do texto bruto gerado. Com pensamento ligado o
@@ -266,6 +274,22 @@ fn visible_end(raw: &str, from: usize) -> usize {
 /// tomado só pelo tempo de um push, nunca segurado enquanto o modelo gera.
 fn push(history: &Mutex<Vec<ChatMessage>>, message: ChatMessage) {
     history.lock().expect("histórico envenenado").push(message);
+}
+
+/// O que um resultado de ferramenta deixa no histórico. O cartão da pessoa já
+/// saiu com o corpo inteiro, então a pergunta aqui é outra: quanto deste corpo a
+/// próxima rodada vai pagar para reler. Um despejo de duzentos mil bytes dentro
+/// da conversa é o mesmo despejo prefilado pela placa a cada chamada que o
+/// modelo ainda vai fazer, e o meio de um log raramente é o que ele procura.
+///
+/// O corpo não some: vai para o depósito e volta por `ler_resultado`, pedaço a
+/// pedaço, quando o modelo pedir. Um erro é a resposta da ferramenta, não um
+/// despejo — o motivo chega por inteiro.
+fn texto_para_modelo(derrame: Option<&PathBuf>, ok: bool, texto: String) -> String {
+    match derrame {
+        Some(pasta) if ok => derrame::derramar(pasta, &texto).unwrap_or(texto),
+        _ => texto,
+    }
 }
 
 /// O histórico com os blocos de estado encaixados depois do prompt de sistema,
@@ -733,7 +757,10 @@ pub fn run_turn(
                 vista,
                 ms: inicio.elapsed().as_millis() as u64,
             });
-            push(history, ChatMessage::new("tool", text));
+            // A pessoa vê o resultado inteiro; o histórico recebe uma janela
+            // declarada como janela, com o corpo guardado atrás do id.
+            let para_modelo = texto_para_modelo(config.derrame.as_ref(), ok, text);
+            push(history, ChatMessage::new("tool", para_modelo));
         }
     }
 }
@@ -860,6 +887,63 @@ mod tests {
             papel_e_texto(&com_estado(&history, Some("trechos"), None)),
             vec![("system", "trechos"), ("user", "oi")]
         );
+    }
+
+    /// O depósito montado numa pasta de teste, com o corpo que o laço acabou de
+    /// receber devolvido de volta por ele.
+    fn deposito(nome: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("aether-session-{nome}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn um_resultado_curto_entra_inteiro_no_historico() {
+        let p = deposito("curto");
+        let texto = "as três primeiras linhas do arquivo".repeat(20);
+        assert_eq!(
+            texto_para_modelo(Some(&p), true, texto.clone()),
+            texto,
+            "abaixo do limiar não se guarda nada"
+        );
+        assert!(!p.exists(), "o depósito ficou de fora");
+    }
+
+    #[test]
+    fn um_resultado_largo_deixa_a_janela_no_historico_e_o_corpo_no_deposito() {
+        let p = deposito("largo");
+        let corpo = "linha do meio do despejo\n".repeat(4_000);
+        let janela = texto_para_modelo(Some(&p), true, corpo.clone());
+        assert!(janela.chars().count() < corpo.chars().count() / 4);
+        assert!(janela.contains("ler_resultado"), "{janela}");
+        // O corpo está guardado inteiro, e é o corpo que a ferramenta devolveu.
+        let guardados: Vec<_> = std::fs::read_dir(&p)
+            .expect("depósito")
+            .filter_map(|i| i.ok())
+            .map(|i| i.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(guardados.len(), 1, "{guardados:?}");
+        assert_eq!(
+            std::fs::read_to_string(p.join(&guardados[0])).expect("lido"),
+            corpo
+        );
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn um_erro_de_ferramenta_nunca_chega_cortado_ao_modelo() {
+        // O motivo da recusa é a resposta: cortá-lo na metade deixaria o modelo
+        // afirmando que a ferramenta rodou.
+        let p = deposito("erro");
+        let erro = "a ferramenta falhou: ".to_string() + &"detalhe do erro ".repeat(1_000);
+        assert_eq!(texto_para_modelo(Some(&p), false, erro.clone()), erro);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn sem_deposito_o_laco_continua_despejando() {
+        let corpo = "x".repeat(derrame::LIMIAR * 4);
+        assert_eq!(texto_para_modelo(None, true, corpo.clone()), corpo);
     }
 
     #[test]

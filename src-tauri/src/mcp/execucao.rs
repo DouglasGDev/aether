@@ -35,6 +35,10 @@ pub struct Execucao {
     /// disco na hora da chamada, dentro da tarefa bloqueante: o que a tela salvou
     /// agora vale na chamada seguinte, sem cache a invalidar.
     bancos_path: Arc<PathBuf>,
+    /// A pasta do depósito de resultados longos. É do turno que ela veio, mas é
+    /// daqui que `ler_resultado` a recebe: o corpo que o modelo lê foi guardado
+    /// pelo laço de conversa, e ler por fora do laço é ler a mesma pasta.
+    derrame: Arc<PathBuf>,
 }
 
 impl Execucao {
@@ -44,6 +48,7 @@ impl Execucao {
         pastas: Arc<RwLock<Pastas>>,
         memoria: Arc<Custodio>,
         bancos_path: Arc<PathBuf>,
+        derrame: Arc<PathBuf>,
     ) -> Arc<Self> {
         Self::nova_com_aprovacoes(
             gate,
@@ -52,6 +57,7 @@ impl Execucao {
             pastas,
             memoria,
             bancos_path,
+            derrame,
         )
     }
 
@@ -62,6 +68,7 @@ impl Execucao {
         pastas: Arc<RwLock<Pastas>>,
         memoria: Arc<Custodio>,
         bancos_path: Arc<PathBuf>,
+        derrame: Arc<PathBuf>,
     ) -> Arc<Self> {
         Self {
             gate,
@@ -71,6 +78,7 @@ impl Execucao {
             pastas,
             memoria,
             bancos_path,
+            derrame,
         }
         .into()
     }
@@ -204,9 +212,16 @@ impl Execucao {
         // uma pasta não pode ficar presa atrás de um comando.
         let pastas = self.pastas.read().expect("pastas envenenadas").clone();
         let memoria = Arc::clone(&self.memoria);
+        let derrame = Arc::clone(&self.derrame);
         let nome = ferramenta.to_string();
         tokio::task::spawn_blocking(move || {
-            local::executar(&nome, serde_json::Value::Object(args), &pastas, &memoria)
+            local::executar(
+                &nome,
+                serde_json::Value::Object(args),
+                &pastas,
+                &memoria,
+                &derrame,
+            )
         })
         .await
         .map_err(|e| anyhow!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])))?
@@ -319,6 +334,7 @@ mod tests {
                 pastas,
             )),
             Arc::new(raiz.join("bancos.json")),
+            Arc::new(raiz.join("resultados")),
         );
         let alvo = raiz.join("proibido.txt");
         let erro = execucao

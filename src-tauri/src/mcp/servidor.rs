@@ -509,6 +509,7 @@ mod tests {
                 Arc::clone(&pastas),
             )),
             Arc::new(raiz.join("bancos.json")),
+            Arc::new(raiz.join("resultados")),
         );
         (Publicador::novo(execucao), raiz)
     }

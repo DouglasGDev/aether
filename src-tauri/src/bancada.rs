@@ -841,6 +841,7 @@ fn caso_dobrar(
         resumo: None,
         memoria: None,
         pastas: None,
+        derrame: None,
     };
     // Um terço de janela por resposta, quatro respostas: a conta passa do limite
     // em qualquer janela, e dobra-se pouco mais de uma vez — que é o que uma

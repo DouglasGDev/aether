@@ -130,9 +130,10 @@ impl McpManager {
         config_path: Arc<PathBuf>,
         segredos: Arc<Segredos>,
         bancos_path: Arc<PathBuf>,
+        derrame: Arc<PathBuf>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
-        let execucao = Execucao::nova(gate, events.clone(), pastas, memoria, bancos_path);
+        let execucao = Execucao::nova(gate, events.clone(), pastas, memoria, bancos_path, derrame);
         let publicador = Arc::new(Publicador::novo(Arc::clone(&execucao)));
         Self {
             registry: RwLock::new(registry),
