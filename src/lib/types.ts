@@ -596,7 +596,90 @@ export type Vista =
       estourou: boolean;
       truncado: boolean;
     }
-  | { type: "sistema"; linhas: VistaPar[] };
+  | { type: "sistema"; linhas: VistaPar[] }
+  | { type: "bancoConexoes"; itens: ConexaoCartao[] }
+  | { type: "bancoFontes"; conexao: string; itens: FonteCartao[] }
+  | { type: "bancoEsquema"; conexao: string; fonte: string; colunas: ColunaCartao[] }
+  | {
+      type: "bancoConsulta";
+      conexao: string;
+      fonte: string;
+      colunas: string[];
+      linhas: unknown[][];
+      total: number;
+      truncado: boolean;
+      duracaoMs: number;
+    }
+  | {
+      type: "bancoLinhas";
+      conexao: string;
+      fonte?: string;
+      operacao: string;
+      linhas: number;
+      duracaoMs: number;
+    };
+
+/** Um conector de banco cadastrado, como o núcleo devolve: a cifra nunca
+ * atravessa a fronteira de volta, só o aviso de que existe. */
+export interface ConexaoBanco {
+  id: string;
+  nome: string;
+  tipo: string;
+  host: string;
+  porta: number | null;
+  usuario: string;
+  banco: string;
+  arquivo: string;
+  temSenha: boolean;
+  limiteLinhas: number;
+  sqlLivre: boolean;
+  fontes: Record<string, FontePolitica>;
+}
+
+/** O que atravessa para o núcleo ao salvar: a senha vai num campo à parte e
+ * morre na cifra DPAPI. */
+export interface ConexaoRegistro {
+  id: string;
+  nome: string;
+  tipo: string;
+  host: string;
+  porta: number | null;
+  usuario: string;
+  banco: string;
+  arquivo: string;
+  limiteLinhas: number;
+  sqlLivre: boolean;
+  fontes: Record<string, FontePolitica>;
+}
+
+export interface FontePolitica {
+  ler: boolean;
+  inserir: boolean;
+  atualizar: boolean;
+  apagar: boolean;
+}
+
+export interface ConexaoCartao {
+  nome: string;
+  tipo: string;
+  destino: string;
+  fontes: number;
+  limiteLinhas: number;
+  sqlLivre: boolean;
+}
+
+export interface FonteCartao {
+  nome: string;
+  ler: boolean;
+  inserir: boolean;
+  atualizar: boolean;
+  apagar: boolean;
+}
+
+export interface ColunaCartao {
+  nome: string;
+  tipo: string;
+}
 
 /** Para que serve um modelo de voz: fala (texto → áudio) ou escuta (microfone
  * → texto). Vem do catálogo Rust, que é quem sabe de cada entrada. */

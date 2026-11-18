@@ -51,7 +51,8 @@
     "parar": "Parar",
     "voz": "Voz",
     "bancada": "Bancada",
-    "ajusteFino": "Ajuste fino"
+    "ajusteFino": "Ajuste fino",
+    "bancos": "Bancos de dados"
   },
   "voz": {
     "titulo": "Voz",
@@ -418,7 +419,23 @@
     "nadaEncontrado": "nada encontrado",
     "modificado": "Modificado",
     "linguagem": "Linguagem",
-    "em": "em {pasta}"
+    "em": "em {pasta}",
+    "bancoConexoes": "Conexões de banco",
+    "bancoFontes": "Tabelas expostas",
+    "bancoEsquema": "Colunas",
+    "bancoConsulta": "Consulta",
+    "bancoContadas": "Linhas contadas",
+    "bancoInseridas": "Linhas inseridas",
+    "bancoAtualizadas": "Linhas atualizadas",
+    "bancoApagadas": "Linhas apagadas",
+    "bancoAfetadas": "Linhas afetadas",
+    "bancoLinhasN": "{n} linha(s)",
+    "bancoFontesN": "{n} tabela(s)",
+    "bancoSqlLivre": "SQL livre",
+    "bancoLer": "ler",
+    "bancoInserir": "inserir",
+    "bancoAtualizar": "atualizar",
+    "bancoApagar": "apagar"
   },
   "ferramentas": {
     "lerArquivo": {
@@ -468,6 +485,42 @@
     "criarMcpLocal": {
       "titulo": "Abrir conexão MCP local",
       "descricao": "Publica as ferramentas do Aether como um servidor MCP no endereço local do aplicativo e conecta o próprio Aether nele. Nada escuta fora da máquina, e cada chamada passa pela aprovação."
+    },
+    "bancosListar": {
+      "titulo": "Listar conexões de banco",
+      "descricao": "Lista as conexões de banco de dados que o dono do Aether cadastrou, com o tipo, o destino, quantas tabelas estão expostas, o limite de linhas e se aceita SQL livre. Não revela senhas."
+    },
+    "bancosTabelas": {
+      "titulo": "Listar tabelas expostas",
+      "descricao": "Lista as tabelas que o dono expôs numa conexão e o que cada uma permite (ler, inserir, atualizar, apagar). Só mostra o que está no cadastro."
+    },
+    "bancosColunas": {
+      "titulo": "Ver colunas da tabela",
+      "descricao": "Mostra as colunas de uma tabela exposta com o tipo de cada uma, para montar filtros e inserções corretos."
+    },
+    "bancosConsultar": {
+      "titulo": "Consultar tabela",
+      "descricao": "Lê linhas de uma tabela exposta, com colunas escolhidas, filtro opcional, ordenação e limite. O limite pedido nunca passa do teto que o dono cadastrou."
+    },
+    "bancosContar": {
+      "titulo": "Contar linhas",
+      "descricao": "Conta quantas linhas de uma tabela exposta casam com o filtro, sem trazer os dados."
+    },
+    "bancosInserir": {
+      "titulo": "Inserir linha",
+      "descricao": "Insere uma linha numa tabela exposta com os valores dados. Só funciona se o dono autorizou inserir nessa tabela."
+    },
+    "bancosAtualizar": {
+      "titulo": "Atualizar linhas",
+      "descricao": "Atualiza as linhas de uma tabela exposta que casam com o filtro. O filtro é obrigatório: sem ele nada é atualizado. Só funciona se o dono autorizou atualizar nessa tabela."
+    },
+    "bancosApagar": {
+      "titulo": "Apagar linhas",
+      "descricao": "Apaga as linhas de uma tabela exposta que casam com o filtro. O filtro é obrigatório e a ação é irreversível. Só funciona se o dono autorizou apagar nessa tabela."
+    },
+    "bancosSql": {
+      "titulo": "Executar SQL",
+      "descricao": "Executa uma declaração SQL numa conexão que tenha SQL livre ligado. Uma declaração por chamada. A conexão decide se devolve consulta ou linhas afetadas."
     }
   },
   "argumentos": {
@@ -502,7 +555,25 @@
     "consulta": "Consulta",
     "consultaDescricao": "Pergunta em linguagem natural a procurar no índice das pastas concedidas.",
     "trechos": "Trechos",
-    "trechosDescricao": "Quantos trechos devolver. Zero usa a escala salva e o teto é 8."
+    "trechosDescricao": "Quantos trechos devolver. Zero usa a escala salva e o teto é 8.",
+    "conexao": "Nome da conexão",
+    "conexaoDescricao": "Nome exato de uma conexão do cadastro do dono. Chame bancos_listar para ver os nomes.",
+    "fonte": "Tabela",
+    "fonteDescricao": "Nome da tabela exposta nessa conexão. Chame bancos_tabelas para ver o que está exposto.",
+    "colunas": "Colunas",
+    "colunasDescricao": "Colunas a devolver, na ordem pedida. Omita para trazer todas.",
+    "filtro": "Filtro",
+    "filtroDescricao": "Condições que as linhas precisam cumprir. Exemplo: {\"coluna\": \"valor\"}. Com comparação: {\"coluna\": {\"op\": \"maior\", \"valor\": 10}}. Operações: igual, diferente, maior, maiorigual, menor, menorigual, contendo. Um filtro vazio casa com todas as linhas.",
+    "ordem": "Ordenar por",
+    "ordemDescricao": "Coluna para ordenar o resultado.",
+    "ordemDesc": "Ordem decrescente",
+    "ordemDescDescricao": "Ordena do maior para o menor quando verdadeiro.",
+    "limite": "Limite",
+    "limiteDescricao": "Quantas linhas trazer. O teto cadastrado pelo dono sempre vence.",
+    "valores": "Valores",
+    "valoresDescricao": "Objeto coluna → valor para gravar. Exemplo: {\"nome\": \"Ana\", \"idade\": 30}. Chame bancos_colunas para ver os tipos.",
+    "sql": "SQL",
+    "sqlDescricao": "Uma declaração SQL por chamada, sem ponto e vírgula no fim."
   },
   "sistema": {
     "sistemaOperacional": "Sistema operacional",
@@ -597,6 +668,7 @@
       "placa": "Motor na placa",
       "runtime": "Bibliotecas do runtime",
       "mcp": "Conexão MCP local",
+      "bancos": "Bancos de dados",
       "esquecer": "Esquecer ao trocar de conversa",
       "prefixo": "Reaproveitar o prefixo",
       "parada": "Parada da resposta",
@@ -631,6 +703,13 @@
       "semResposta": "a porta publicada não respondeu",
       "abriuSemSegredo": "um pedido sem token entrou: a porta respondeu {status}",
       "anuncioFalso": "o cliente recebeu {anunciadas} ferramentas de {esperadas}"
+    },
+    "bancos": {
+      "leitura": "a leitura com teto de 1 linha devolveu {lidas} linha(s)",
+      "teto": "o teto do cadastro não cortou a leitura",
+      "escrita": "uma escrita que era para ser recusada passou: {op}",
+      "recusas": "esperava 4 escritas recusadas, tive {recusadas}",
+      "bancoMudou": "o banco mudou com política só de leitura: {linhas} linha(s) no fim, esperava 2"
     },
     "esquecer": {
       "divergiu": "depois de esquecer a resposta foi outra: {antes} / {depois}",
@@ -688,7 +767,10 @@
       "porta": "porta",
       "anunciadas": "ferramentas anunciadas",
       "catalogo": "ferramentas do catálogo",
-      "semSegredo": "pedido sem token"
+      "semSegredo": "pedido sem token",
+      "bancosLidas": "linhas lidas",
+      "bancosRecusadas": "escritas recusadas",
+      "bancosFicaram": "linhas no fim"
     }
   },
   "erros": {
@@ -933,7 +1015,35 @@
     "servidorMcpOuvir": "não foi possível ouvir a placa de retorno: {detalhe}",
     "servidorMcpPorta": "não foi possível ler a porta do servidor MCP",
     "servidorMcpParar": "o servidor MCP não parou",
-    "servidorMcpToken": "não foi possível sortear o token do servidor MCP: {detalhe}"
+    "servidorMcpToken": "não foi possível sortear o token do servidor MCP: {detalhe}",
+    "bancoAbrir": "não foi possível abrir a conexão com o banco: {detalhe}",
+    "bancoErro": "o banco recusou a operação: {detalhe}",
+    "bancoArquivoFaltando": "conexão SQLite precisa do arquivo do banco",
+    "bancoValoresVazios": "os valores estão vazios: informe ao menos uma coluna",
+    "bancoOndeObrigatorio": "filtro obrigatório para esta operação: sem ele, todas as linhas seriam atingidas",
+    "bancoSqlVazio": "a declaração SQL está vazia",
+    "bancoSqlMultipla": "uma declaração SQL por chamada: o texto tem mais de uma",
+    "bancoSqlSemNome": "o banco não devolveu o nome de uma coluna do resultado",
+    "bancoUsuarioFaltando": "a conexão precisa de um usuário",
+    "bancoNomeBancoFaltando": "a conexão precisa do nome do banco",
+    "filtroInvalido": "o filtro precisa ser um objeto de coluna → valor ou coluna → comparação",
+    "filtroNuloSemComparacao": "nulo só é aceito dentro de uma comparação, como {\"op\": \"igual\", \"valor\": null}",
+    "filtroValorInvalido": "o valor da comparação não cabe no tipo da coluna",
+    "bancoNomeVazio": "o nome da conexão é obrigatório",
+    "bancoHostFaltando": "a conexão precisa do endereço do servidor",
+    "bancoSemSql": "{tipo} não executa SQL",
+    "filtroComparacao": "comparação desconhecida no filtro: {op}",
+    "dpapiCifrar": "não foi possível cifrar o segredo: {detalhe}",
+    "dpapiBase64": "o segredo cifrado não está em base 64 válida: {detalhe}",
+    "dpapiDecifrar": "não foi possível decifrar o segredo: {detalhe}",
+    "dpapiTexto": "o segredo decifrado não é texto: {detalhe}",
+    "dpapiSohWindows": "o cofre de segredos (DPAPI) só existe no Windows",
+    "bancoNomeDuplicado": "já existe uma conexão com o nome {nome}",
+    "bancoConexaoInexistente": "não existe a conexão {nome} no cadastro. Chame bancos_listar para ver os nomes.",
+    "bancoOperacaoNegada": "o dono não autorizou {op} na tabela {fonte} da conexão {conexao}",
+    "bancoSqlBloqueado": "a conexão {conexao} não tem SQL livre ligado",
+    "bancoColunaInexistente": "a tabela não tem a coluna {coluna}",
+    "bancoFonteInexistente": "a tabela {fonte} não está exposta nesta conexão"
   },
   "servidorMcp": {
     "nome": "Aether (MCP local)",
@@ -947,5 +1057,47 @@
     "fechar": "Fechar conexão",
     "endereco": "Endereço",
     "token": "Token"
+  },
+  "bancos": {
+    "nenhumaConexao": "O dono ainda não cadastrou nenhuma conexão de banco de dados.",
+    "nenhumaFonte": "A conexão {conexao} não tem nenhuma tabela exposta.",
+    "contagem": "{total} linha(s) em {fonte} casam com o filtro.",
+    "linhasInseridas": "{total} linha(s) inserida(s) em {fonte}.",
+    "linhasAtualizadas": "{total} linha(s) atualizada(s) em {fonte}.",
+    "linhasApagadas": "{total} linha(s) apagada(s) em {fonte}.",
+    "linhasAfetadas": "{total} linha(s) afetada(s).",
+    "titulo": "Bancos de dados",
+    "conexoes": "Conexões",
+    "adicionar": "Adicionar conexão",
+    "nova": "Nova conexão",
+    "editando": "Editar conexão",
+    "editar": "Editar",
+    "remover": "Remover conexão",
+    "campoNome": "Nome",
+    "campoTipo": "Tipo",
+    "campoHost": "Endereço",
+    "campoPorta": "Porta",
+    "campoUsuario": "Usuário",
+    "campoBanco": "Banco",
+    "campoArquivo": "Arquivo",
+    "campoSenha": "Senha",
+    "senhaGuardada": "deixar vazio mantém a senha salva",
+    "campoLimite": "Limite de linhas",
+    "campoSqlLivre": "SQL livre",
+    "descobrir": "Descobrir tabelas",
+    "descobrindo": "Descobrindo…",
+    "salvando": "Salvando…",
+    "tabelas": "Tabelas",
+    "opLer": "Ler",
+    "opInserir": "Inserir",
+    "opAtualizar": "Atualizar",
+    "opApagar": "Apagar",
+    "tipoSqlite": "SQLite",
+    "tipoPostgres": "PostgreSQL",
+    "tipoMysql": "MySQL",
+    "tipoMssql": "SQL Server",
+    "tipoMongo": "MongoDB",
+    "tipoOracle": "Oracle",
+    "fontesN": "{n} tabela(s) exposta(s)"
   }
 }

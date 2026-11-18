@@ -30,7 +30,17 @@ use crate::runtime;
 use crate::state::{AiRuntime, LoadedModel};
 
 /// Os casos da suíte, na ordem em que a tela os mostra.
-pub const CASOS: &[&str] = &["placa", "runtime", "mcp", "esquecer", "prefixo", "parada", "fluxo", "dobrar"];
+pub const CASOS: &[&str] = &[
+    "placa",
+    "runtime",
+    "mcp",
+    "bancos",
+    "esquecer",
+    "prefixo",
+    "parada",
+    "fluxo",
+    "dobrar",
+];
 
 /// Quanto a bancada espera uma resposta crua da porta publicada antes de dizer
 /// que ela não respondeu. Um handshake local leva milissegundos; dez segundos já
@@ -354,7 +364,7 @@ async fn porta_sem_token(porta: u16) -> anyhow::Result<u16> {
 /// favor a ninguém: o que ela mede é a conexão. O que o caso abriu, o caso fecha.
 async fn medir_mcp(gerente: &McpManager, antes: bool) -> anyhow::Result<(Vec<Medida>, Option<String>)> {
     let aberto = gerente.publicar().await?;
-    let esperadas = crate::local::catalogo().len();
+    let esperadas = crate::local::catalogo().len() + crate::bancos::ferramentas::catalogo().len();
     let anunciadas = gerente.anunciadas(servidor::CONECTOR).len();
     let recusado = match tokio::time::timeout(ESPERA_PORTA, porta_sem_token(aberto.porta)).await {
         Ok(Ok(status)) => Ok(status),
@@ -404,6 +414,147 @@ fn caso_mcp(gerente: &Arc<McpManager>, inicio: Instant) -> Resultado {
         Err(e) => quebrou("mcp", &e.to_string(), inicio),
         Ok((medidas, Some(motivo))) => veredito("mcp", Estado::Reprovado, medidas, Some(motivo), inicio),
         Ok((medidas, None)) => veredito("mcp", Estado::Aprovado, medidas, None, inicio),
+    }
+}
+
+/// A política de leitura é a que toda conexão nova traz, e o caso mede o que
+/// ela de fato faz num banco real de SQLite: a leitura passa e é cortada pelo
+/// teto que o cadastro determina, cada escrita é recusada antes de o motor
+/// abrir, e o banco sai com as linhas de onde começou — recusa que escreve
+/// seria o pior defeito desta porta.
+fn caso_bancos(inicio: Instant) -> Resultado {
+    use crate::bancos::config::{Config, Conexao, Fonte, Tipo};
+    use crate::bancos::ferramentas::executar;
+    use std::collections::BTreeMap;
+
+    let raiz = std::env::temp_dir().join(format!("aether-bancada-bancos-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raiz);
+    let limpar = || {
+        let _ = std::fs::remove_dir_all(&raiz);
+    };
+
+    let montagem = || -> anyhow::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(&raiz)?;
+        let arquivo = raiz.join("estoque.db");
+        let sqlite = rusqlite::Connection::open(&arquivo)?;
+        sqlite.execute_batch(
+            "CREATE TABLE clientes (id INTEGER PRIMARY KEY, nome TEXT NOT NULL);
+             INSERT INTO clientes (nome) VALUES ('Ana'), ('Bruno');",
+        )?;
+        drop(sqlite);
+        let mut config = Config::default();
+        let mut conexao = Conexao {
+            id: "bd-bancada".into(),
+            nome: "Estoque".into(),
+            tipo: Tipo::Sqlite,
+            host: String::new(),
+            porta: None,
+            usuario: String::new(),
+            banco: String::new(),
+            arquivo: arquivo.display().to_string(),
+            senha_cifrada: None,
+            senha_clara: None,
+            // O teto de uma linha é o que deixa a medida do corte visível: o
+            // pedido pede tudo, o cadastro devolve uma.
+            limite_linhas: 1,
+            sql_livre: false,
+            fontes: BTreeMap::new(),
+        };
+        conexao.fontes.insert("clientes".into(), Fonte::default());
+        config.conexoes.push(conexao);
+        let caminho = raiz.join("bancos.json");
+        config.save(&caminho)?;
+        Ok(caminho)
+    }();
+
+    let caminho = match montagem {
+        Ok(caminho) => caminho,
+        Err(e) => {
+            limpar();
+            return quebrou("bancos", &e.to_string(), inicio);
+        }
+    };
+
+    // Cada passo vira uma medida ou um motivo de reprovação: o caso continua
+    // mesmo depois de um passo falhar, para o veredito carregar tudo o que deu.
+    let mut medidas = Vec::new();
+    let mut motivo: Option<String> = None;
+
+    let leitura = executar(
+        "bancos_consultar",
+        serde_json::json!({ "conexao": "Estoque", "fonte": "clientes", "limite": 9999 }),
+        &caminho,
+    );
+    match leitura {
+        Err(e) => motivo = Some(e.to_string()),
+        Ok(saida) => {
+            let json = saida.vista.para_json();
+            let lidas = json["total"].as_u64().unwrap_or(0);
+            let cortado = json["truncado"].as_bool().unwrap_or(false);
+            medidas.push(medida("bancada.medida.bancosLidas", inteiro(lidas as usize)));
+            if lidas != 1 && motivo.is_none() {
+                motivo = Some(tr(
+                    "bancada.bancos.leitura",
+                    &[("lidas", &lidas.to_string())],
+                ));
+            }
+            if !cortado && motivo.is_none() {
+                motivo = Some(t("bancada.bancos.teto"));
+            }
+        }
+    }
+
+    let mut recusadas = 0usize;
+    for (op, argumentos) in [
+        (
+            "inserir",
+            serde_json::json!({ "conexao": "Estoque", "fonte": "clientes", "valores": { "nome": "Recusada" } }),
+        ),
+        (
+            "atualizar",
+            serde_json::json!({ "conexao": "Estoque", "fonte": "clientes", "valores": { "nome": "Recusada" }, "filtro": { "id": 1 } }),
+        ),
+        ("apagar", serde_json::json!({ "conexao": "Estoque", "fonte": "clientes", "filtro": { "id": 1 } })),
+        (
+            "sql",
+            serde_json::json!({ "conexao": "Estoque", "sql": "INSERT INTO clientes (nome) VALUES ('Livre')" }),
+        ),
+    ] {
+        let ferramenta = format!("bancos_{op}");
+        let negada = executar(&ferramenta, argumentos, &caminho).is_err();
+        if negada {
+            recusadas += 1;
+        } else if motivo.is_none() {
+            motivo = Some(tr("bancada.bancos.escrita", &[("op", op)]));
+        }
+    }
+    medidas.push(medida("bancada.medida.bancosRecusadas", inteiro(recusadas)));
+    if recusadas != 4 && motivo.is_none() {
+        motivo = Some(tr("bancada.bancos.recusas", &[("recusadas", &recusadas.to_string())]));
+    }
+
+    let contagem = executar(
+        "bancos_contar",
+        serde_json::json!({ "conexao": "Estoque", "fonte": "clientes" }),
+        &caminho,
+    );
+    match contagem {
+        Err(e) if motivo.is_none() => motivo = Some(e.to_string()),
+        Err(_) => {}
+        Ok(saida) => {
+            let json = saida.vista.para_json();
+            let ficaram = json["linhas"].as_u64().unwrap_or(0);
+            medidas.push(medida("bancada.medida.bancosFicaram", inteiro(ficaram as usize)));
+            if ficaram != 2 && motivo.is_none() {
+                motivo = Some(tr("bancada.bancos.bancoMudou", &[("linhas", &ficaram.to_string())]));
+            }
+        }
+    }
+
+    limpar();
+    match motivo {
+        Some(motivo) => veredito("bancos", Estado::Reprovado, medidas, Some(motivo), inicio),
+        None => veredito("bancos", Estado::Aprovado, medidas, None, inicio),
     }
 }
 
@@ -799,9 +950,10 @@ pub fn rodar(
 ) -> Vec<Resultado> {
     emit(Evento::Iniciou { total: CASOS.len(), modelo: spec.map(|s| s.display.to_string()) });
     let capacidade = if spec.is_some() { crate::ai::alojamento::capacidade(&ai.dlls).ok().flatten() } else { None };
-    // `runtime` confere arquivos em disco e `mcp` fala com a própria aplicação:
-    // nenhum dos dois pede motor, e nenhum dos dois espera pesos na placa.
-    let outros = || CASOS.iter().filter(|id| **id != "runtime" && **id != "mcp");
+    // `runtime` confere arquivos em disco, `mcp` fala com a própria aplicação e
+    // `bancos` abre um SQLite da bancada: nenhum dos três pede motor, e nenhum
+    // deles espera pesos na placa.
+    let outros = || CASOS.iter().filter(|id| !matches!(**id, "runtime" | "mcp" | "bancos"));
 
     let mut resultados = Vec::new();
     let inicio = Instant::now();
@@ -813,6 +965,12 @@ pub fn rodar(
     let inicio = Instant::now();
     emit(Evento::Caso { id: "mcp".to_string() });
     let r = caso_mcp(gerente, inicio);
+    emit(Evento::Resultado(r.clone()));
+    resultados.push(r);
+
+    let inicio = Instant::now();
+    emit(Evento::Caso { id: "bancos".to_string() });
+    let r = caso_bancos(inicio);
     emit(Evento::Resultado(r.clone()));
     resultados.push(r);
 
@@ -864,4 +1022,21 @@ pub fn rodar(
         resultados.push(resultado);
     }
     resultados
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    #[test]
+    fn o_caso_de_bancos_aprova_a_politica_padrao_de_leitura() {
+        let r = caso_bancos(Instant::now());
+        assert_eq!(
+            r.estado,
+            Estado::Aprovado,
+            "{}",
+            r.detalhe.unwrap_or_default()
+        );
+        assert_eq!(r.medidas.len(), 3, "{:?}", r.medidas);
+    }
 }

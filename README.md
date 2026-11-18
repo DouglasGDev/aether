@@ -107,12 +107,24 @@ movido se um hash divergir. Veja
   laço de conversa, com o mesmo id de conector, e a recusa volta como erro de
   ferramenta — o motivo é o mesmo que o chat mostra. Medido nesta máquina com um
   cliente fora do aplicativo: sem o cabeçalho a porta respondeu `401`, com ele o
-  `initialize` respondeu `200` (`serverInfo.name = aether`), `tools/list` devolveu
-  as 11 ferramentas e um `tools/call` de `info_sistema` ficou parado até a pessoa
+  `initialize` respondeu `200` (`serverInfo.name = aether`), `tools/list`
+  devolveu o catálogo do momento (as 11 ferramentas locais, antes dos bancos
+  entrarem) e um `tools/call` de `info_sistema` ficou parado até a pessoa
   clicar *Aprovar* no cartão da tela — depois disso devolveu o sistema, a placa e
-  as pastas concedidas de verdade. O servidor anuncia as 11 ferramentas do
-  catálogo; `criar_mcp_local` não é anunciada por ele, porque publicar de dentro
-  de uma publicação seria outra porta para a mesma sala.
+  as pastas concedidas de verdade. O servidor anuncia o catálogo inteiro — as 11
+  ferramentas locais e as 9 de banco de dados; `criar_mcp_local` não é anunciada
+  por ele, porque publicar de dentro de uma publicação seria outra porta para a
+  mesma sala.
+- **Bancos de dados** — conexões com SQLite, PostgreSQL, MySQL, SQL Server,
+  MongoDB e Oracle cadastradas na tela *Bancos de dados* (o Oracle fala o
+  protocolo do driver oficial em modo thin, sem Instant Client instalado). A
+  política é por tabela: ler, inserir, atualizar e apagar, um toggle para cada,
+  e toda conexão nova nasce só de leitura. O cadastro é relido do disco a cada
+  chamada — o gate aprova o ato, o cadastro aprova o alvo: o que não está
+  exposto o modelo nem descreve, e a escrita sem permissão é recusada antes de o
+  motor abrir. O teto de linhas por leitura e o SQL livre são da conexão. São 9
+  ferramentas (`bancos_listar` a `bancos_sql`) no mesmo catálogo, na mesma
+  allowlist e no mesmo gate que as locais; só `bancos_apagar` é destrutiva.
 - **Memória (RAG)** — índice das pastas concedidas com busca híbrida (BM25 +
   vetorial com fusão), peças com sobreposição e piso de similaridade. A injeção
   automática e a ferramenta `buscar_memoria` obedecem ao mesmo fio do grafo.
@@ -122,11 +134,13 @@ movido se um hash divergir. Veja
   esquece o KV: a conversa seguinte não herda o estado da anterior. O índice e as
   mensagens ficam em `%APPDATA%\ai.aether.core\conversas` e voltam onde estavam
   depois de fechar e abrir o aplicativo.
-- **Bancada** — uma suíte de oito casos que roda dentro do aplicativo, contra o
-  modelo carregado e a placa real, e mede cada um: motor na placa, bibliotecas do
-  runtime, conexão MCP local, esquecimento do KV entre conversas, reaproveitamento
-  do prefixo, parada da resposta, texto em fluxo e compactação da conversa longa.
-  Cada caso traz suas medidas e um veredito
+- **Bancada** — uma suíte de nove casos que roda dentro do aplicativo e mede
+  cada um: motor na placa, bibliotecas do runtime, conexão MCP local, bancos de
+  dados (com política só de leitura e um SQLite real montado na hora), esquecimento
+  do KV entre conversas, reaproveitamento do prefixo, parada da resposta, texto
+  em fluxo e compactação da conversa longa. Os três casos sem modelo — runtime,
+  MCP local e bancos — rodam sem carregar pesos. Cada caso traz suas medidas e
+  um veredito
   aprovado/reprovado; nenhum caso é aprovado por suposição — ele aprova o que o
   motor devolveu naquela rodada. A bancada não começa com um turno de conversa em
   curso, e o botão *Parar* dela usa o mesmo interruptor de cancelamento do chat.
@@ -219,7 +233,9 @@ src/                 interface React + TypeScript
                      grafo, memória, voz, bancada
 src-tauri/src/       núcleo Rust
   ai/                motor, catálogo, download, alojamento, roteador, sessão, memória
-  bancada.rs         os oito casos medidos dentro do aplicativo
+  bancada.rs         os nove casos medidos dentro do aplicativo
+  bancos/            cadastro de conexões, os seis motores de banco de dados
+                     e as 9 ferramentas, com a política por tabela
   mcp/               cliente MCP, catálogo instalável, gate de aprovação e o
                      servidor que publica as ferramentas do próprio Aether
   local/             ferramentas locais e contenção de pastas
@@ -232,15 +248,18 @@ src-tauri/vendor/    cabeçalhos, licenças e somas dos binários de terceiros
 ## Estado em disco
 
 O aplicativo grava em `%APPDATA%\ai.aether.core` (ajustes, conectores,
-allowlists, pastas concedidas, grafo, voz, RAG), em
-`%APPDATA%\ai.aether.core\conversas` (o índice e as mensagens de cada conversa) e
-em `%LOCALAPPDATA%\ai.aether.core\models` (pesos, índice e os pacotes de runtime
-instalados). Nenhum desses arquivos sai da máquina.
+allowlists, pastas concedidas, grafo, voz, RAG e o cadastro de bancos de dados),
+em `%APPDATA%\ai.aether.core\conversas` (o índice e as mensagens de cada
+conversa) e em `%LOCALAPPDATA%\ai.aether.core\models` (pesos, índice e os pacotes
+de runtime instalados). Nenhum desses arquivos sai da máquina.
 
 Segredo não vai para disco: o `mcp.json` guarda no máximo a referência
 `${AETHER_MCP_TOKEN}`, e o valor dela vive só na memória do aplicativo enquanto a
 conexão MCP local está aberta. Fechar o aplicativo, ou o botão da tela, esquece o
-token; reabrir a conexão gera outro.
+token; reabrir a conexão gera outro. O `bancos.json` segue a mesma regra por
+outro caminho: a senha de cada conexão é cifrada pelo DPAPI do Windows no escopo
+do usuário — a cifra não abre em outra máquina nem em outro usuário — e o valor
+real só existe na memória do aplicativo, na hora de abrir a conexão.
 
 ## Limites conhecidos
 

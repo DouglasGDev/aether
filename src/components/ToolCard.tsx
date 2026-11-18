@@ -337,5 +337,163 @@ export function ToolCard({ vista, falha = false }: Props) {
           </ul>
         </div>
       );
+
+    case "bancoConexoes":
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone="banco"
+            tipo={t("cartao.bancoConexoes")}
+            fatos={[inteiro(vista.itens.length, id)]}
+          />
+          {vista.itens.length === 0 ? (
+            <p className="card-note">{t("cartao.nadaEncontrado")}</p>
+          ) : (
+            <ul className="card-rows">
+              {vista.itens.map((item) => (
+                <li key={item.nome} className="card-row">
+                  <Icon name="banco" />
+                  <span className="row-label">{item.nome}</span>
+                  <span className="row-value">{`${item.tipo} · ${item.destino}`}</span>
+                  <span className="row-size">
+                    {t("cartao.bancoFontesN", { n: item.fontes })}
+                    {item.sqlLivre ? ` · ${t("cartao.bancoSqlLivre")}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+
+    case "bancoFontes": {
+      const operacoes = [
+        { flag: "ler", chave: "cartao.bancoLer" },
+        { flag: "inserir", chave: "cartao.bancoInserir" },
+        { flag: "atualizar", chave: "cartao.bancoAtualizar" },
+        { flag: "apagar", chave: "cartao.bancoApagar" },
+      ] as const;
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone="banco"
+            tipo={t("cartao.bancoFontes")}
+            alvo={vista.conexao}
+            fatos={[inteiro(vista.itens.length, id)]}
+          />
+          {vista.itens.length === 0 ? (
+            <p className="card-note">{t("cartao.nadaEncontrado")}</p>
+          ) : (
+            <ul className="card-rows">
+              {vista.itens.map((item) => {
+                const ativas = operacoes
+                  .filter((op) => item[op.flag])
+                  .map((op) => t(op.chave));
+                return (
+                  <li key={item.nome} className="card-row">
+                    <Icon name="banco" />
+                    <span className="row-label">{item.nome}</span>
+                    <span className="row-value">
+                      {ativas.length > 0 ? ativas.join(" · ") : "—"}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      );
+    }
+
+    case "bancoEsquema":
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone="banco"
+            tipo={t("cartao.bancoEsquema")}
+            alvo={vista.fonte}
+            fatos={[vista.conexao, inteiro(vista.colunas.length, id)]}
+          />
+          <ul className="card-rows">
+            {vista.colunas.map((coluna) => (
+              <li key={coluna.nome} className="card-row">
+                <span className="row-label">{coluna.nome}</span>
+                <span className="row-value">{coluna.tipo}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+
+    case "bancoConsulta": {
+      const celula = (valor: unknown): string => {
+        if (valor === null) return "null";
+        if (typeof valor === "object") return JSON.stringify(valor);
+        return String(valor);
+      };
+      const alvo =
+        vista.fonte !== "" ? `${vista.conexao} · ${vista.fonte}` : vista.conexao;
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone="banco"
+            tipo={t("cartao.bancoConsulta")}
+            alvo={alvo}
+            fatos={[
+              t("cartao.bancoLinhasN", { n: inteiro(vista.total, id) }),
+              duracao(vista.duracaoMs, id),
+            ]}
+          />
+          {vista.linhas.length === 0 ? (
+            <p className="card-note">{t("cartao.nadaEncontrado")}</p>
+          ) : (
+            <div className="card-tabela">
+              <table>
+                <thead>
+                  <tr>
+                    {vista.colunas.map((coluna) => (
+                      <th key={coluna}>{coluna}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {vista.linhas.map((linha, at) => (
+                    <tr key={at}>
+                      {linha.map((valor, col) => (
+                        <td key={col}>{celula(valor)}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {vista.truncado && <p className="card-note">{t("geral.truncado")}</p>}
+        </div>
+      );
+    }
+
+    case "bancoLinhas": {
+      const titulos: Record<string, string> = {
+        contar: "cartao.bancoContadas",
+        inserir: "cartao.bancoInseridas",
+        atualizar: "cartao.bancoAtualizadas",
+        apagar: "cartao.bancoApagadas",
+        sql: "cartao.bancoAfetadas",
+      };
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone="banco"
+            tipo={t(titulos[vista.operacao] ?? "cartao.bancoAfetadas")}
+            alvo={vista.fonte ?? vista.conexao}
+            fatos={[
+              t("cartao.bancoLinhasN", { n: inteiro(vista.linhas, id) }),
+              duracao(vista.duracaoMs, id),
+            ]}
+          />
+        </div>
+      );
+    }
   }
 }

@@ -51,7 +51,8 @@
     "parar": "Stop",
     "voz": "Voice",
     "bancada": "Workbench",
-    "ajusteFino": "Fine tuning"
+    "ajusteFino": "Fine tuning",
+    "bancos": "Databases"
   },
   "voz": {
     "titulo": "Voice",
@@ -418,7 +419,23 @@
     "nadaEncontrado": "nothing found",
     "modificado": "Modified",
     "linguagem": "Language",
-    "em": "in {pasta}"
+    "em": "in {pasta}",
+    "bancoConexoes": "Database connections",
+    "bancoFontes": "Exposed tables",
+    "bancoEsquema": "Columns",
+    "bancoConsulta": "Query",
+    "bancoContadas": "Counted rows",
+    "bancoInseridas": "Inserted rows",
+    "bancoAtualizadas": "Updated rows",
+    "bancoApagadas": "Deleted rows",
+    "bancoAfetadas": "Affected rows",
+    "bancoLinhasN": "{n} row(s)",
+    "bancoFontesN": "{n} table(s)",
+    "bancoSqlLivre": "Free SQL",
+    "bancoLer": "read",
+    "bancoInserir": "insert",
+    "bancoAtualizar": "update",
+    "bancoApagar": "delete"
   },
   "ferramentas": {
     "lerArquivo": {
@@ -468,6 +485,42 @@
     "criarMcpLocal": {
       "titulo": "Open a local MCP connection",
       "descricao": "Publishes the Aether tools as an MCP server on the app local address and connects Aether itself to it. Nothing listens outside the machine, and every call goes through approval."
+    },
+    "bancosListar": {
+      "titulo": "List database connections",
+      "descricao": "Lists the database connections registered by the Aether owner, with type, target, how many tables are exposed, the row limit and whether free SQL is allowed. Never reveals passwords."
+    },
+    "bancosTabelas": {
+      "titulo": "List exposed tables",
+      "descricao": "Lists the tables the owner exposed on a connection and what each one allows (read, insert, update, delete). Only shows what is in the registry."
+    },
+    "bancosColunas": {
+      "titulo": "View table columns",
+      "descricao": "Shows the columns of an exposed table with each one's type, so filters and inserts can be built correctly."
+    },
+    "bancosConsultar": {
+      "titulo": "Query table",
+      "descricao": "Reads rows from an exposed table, with chosen columns, optional filter, ordering and limit. The requested limit never exceeds the cap the owner registered."
+    },
+    "bancosContar": {
+      "titulo": "Count rows",
+      "descricao": "Counts how many rows of an exposed table match the filter, without bringing the data."
+    },
+    "bancosInserir": {
+      "titulo": "Insert row",
+      "descricao": "Inserts one row into an exposed table with the given values. Only works if the owner allowed inserts on that table."
+    },
+    "bancosAtualizar": {
+      "titulo": "Update rows",
+      "descricao": "Updates the rows of an exposed table that match the filter. The filter is required: without it nothing is updated. Only works if the owner allowed updates on that table."
+    },
+    "bancosApagar": {
+      "titulo": "Delete rows",
+      "descricao": "Deletes the rows of an exposed table that match the filter. The filter is required and the action is irreversible. Only works if the owner allowed deletes on that table."
+    },
+    "bancosSql": {
+      "titulo": "Run SQL",
+      "descricao": "Runs one SQL statement on a connection with free SQL enabled. One statement per call. The connection decides whether it returns a query or affected rows."
     }
   },
   "argumentos": {
@@ -502,7 +555,25 @@
     "consulta": "Query",
     "consultaDescricao": "Natural-language question to look up in the index of the granted folders.",
     "trechos": "Passages",
-    "trechosDescricao": "How many passages to return. Zero uses the saved setting and the ceiling is 8."
+    "trechosDescricao": "How many passages to return. Zero uses the saved setting and the ceiling is 8.",
+    "conexao": "Connection name",
+    "conexaoDescricao": "Exact name of one of the owner's registered connections. Call bancos_listar to see the names.",
+    "fonte": "Table",
+    "fonteDescricao": "Name of a table exposed on that connection. Call bancos_tabelas to see what is exposed.",
+    "colunas": "Columns",
+    "colunasDescricao": "Columns to return, in the requested order. Omit to bring all of them.",
+    "filtro": "Filter",
+    "filtroDescricao": "Conditions the rows must satisfy. Example: {\"coluna\": \"valor\"}. With a comparison: {\"coluna\": {\"op\": \"maior\", \"valor\": 10}}. Operations: igual, diferente, maior, maiorigual, menor, menorigual, contendo. An empty filter matches every row.",
+    "ordem": "Order by",
+    "ordemDescricao": "Column to order the result by.",
+    "ordemDesc": "Descending order",
+    "ordemDescDescricao": "Orders from highest to lowest when true.",
+    "limite": "Limit",
+    "limiteDescricao": "How many rows to bring. The cap registered by the owner always wins.",
+    "valores": "Values",
+    "valoresDescricao": "Object of column → value to store. Example: {\"nome\": \"Ana\", \"idade\": 30}. Call bancos_colunas to see the types.",
+    "sql": "SQL",
+    "sqlDescricao": "One SQL statement per call, without a trailing semicolon."
   },
   "sistema": {
     "sistemaOperacional": "Operating system",
@@ -597,6 +668,7 @@
       "placa": "Engine on the card",
       "runtime": "Runtime libraries",
       "mcp": "Local MCP connection",
+      "bancos": "Databases",
       "esquecer": "Forgetting between chats",
       "prefixo": "Reusing the prefix",
       "parada": "Where the answer stops",
@@ -631,6 +703,13 @@
       "semResposta": "the published port did not answer",
       "abriuSemSegredo": "an unkeyed request got in: the port answered {status}",
       "anuncioFalso": "the client received {anunciadas} of {esperadas} tools"
+    },
+    "bancos": {
+      "leitura": "the capped read returned {lidas} row(s)",
+      "teto": "the registered cap did not truncate the read",
+      "escrita": "a write that should have been refused went through: {op}",
+      "recusas": "expected 4 refused writes, got {recusadas}",
+      "bancoMudou": "the database changed under a read-only policy: {linhas} row(s) at the end, expected 2"
     },
     "esquecer": {
       "divergiu": "after forgetting the answer was different: {antes} / {depois}",
@@ -688,7 +767,10 @@
       "porta": "port",
       "anunciadas": "tools announced",
       "catalogo": "catalogue tools",
-      "semSegredo": "unguarded request"
+      "semSegredo": "unguarded request",
+      "bancosLidas": "rows read",
+      "bancosRecusadas": "refused writes",
+      "bancosFicaram": "rows at the end"
     }
   },
   "erros": {
@@ -933,7 +1015,35 @@
     "servidorMcpOuvir": "could not listen on the loopback adapter: {detalhe}",
     "servidorMcpPorta": "could not read the MCP server port",
     "servidorMcpParar": "the MCP server did not stop",
-    "servidorMcpToken": "could not draw the MCP server token: {detalhe}"
+    "servidorMcpToken": "could not draw the MCP server token: {detalhe}",
+    "bancoAbrir": "could not open the database connection: {detalhe}",
+    "bancoErro": "the database refused the operation: {detalhe}",
+    "bancoArquivoFaltando": "a SQLite connection needs the database file",
+    "bancoValoresVazios": "the values are empty: provide at least one column",
+    "bancoOndeObrigatorio": "a filter is required for this operation: without it, every row would be affected",
+    "bancoSqlVazio": "the SQL statement is empty",
+    "bancoSqlMultipla": "one SQL statement per call: the text has more than one",
+    "bancoSqlSemNome": "the database did not return the name of a result column",
+    "bancoUsuarioFaltando": "the connection needs a user",
+    "bancoNomeBancoFaltando": "the connection needs the database name",
+    "filtroInvalido": "the filter must be an object of column → value or column → comparison",
+    "filtroNuloSemComparacao": "null is only accepted inside a comparison, like {\"op\": \"igual\", \"valor\": null}",
+    "filtroValorInvalido": "the comparison value does not fit the column's type",
+    "bancoNomeVazio": "the connection name is required",
+    "bancoHostFaltando": "the connection needs the server address",
+    "bancoSemSql": "{tipo} does not run SQL",
+    "filtroComparacao": "unknown comparison in the filter: {op}",
+    "dpapiCifrar": "could not encrypt the secret: {detalhe}",
+    "dpapiBase64": "the encrypted secret is not valid base 64: {detalhe}",
+    "dpapiDecifrar": "could not decrypt the secret: {detalhe}",
+    "dpapiTexto": "the decrypted secret is not text: {detalhe}",
+    "dpapiSohWindows": "the secret vault (DPAPI) only exists on Windows",
+    "bancoNomeDuplicado": "there is already a connection named {nome}",
+    "bancoConexaoInexistente": "there is no connection named {nome} in the registry. Call bancos_listar to see the names.",
+    "bancoOperacaoNegada": "the owner did not allow {op} on table {fonte} of connection {conexao}",
+    "bancoSqlBloqueado": "connection {conexao} does not have free SQL enabled",
+    "bancoColunaInexistente": "the table has no column {coluna}",
+    "bancoFonteInexistente": "table {fonte} is not exposed on this connection"
   },
   "servidorMcp": {
     "nome": "Aether (local MCP)",
@@ -947,5 +1057,47 @@
     "fechar": "Close connection",
     "endereco": "Address",
     "token": "Token"
+  },
+  "bancos": {
+    "nenhumaConexao": "The owner has not registered any database connection yet.",
+    "nenhumaFonte": "Connection {conexao} has no exposed tables.",
+    "contagem": "{total} row(s) in {fonte} match the filter.",
+    "linhasInseridas": "{total} row(s) inserted into {fonte}.",
+    "linhasAtualizadas": "{total} row(s) updated in {fonte}.",
+    "linhasApagadas": "{total} row(s) deleted from {fonte}.",
+    "linhasAfetadas": "{total} row(s) affected.",
+    "titulo": "Databases",
+    "conexoes": "Connections",
+    "adicionar": "Add connection",
+    "nova": "New connection",
+    "editando": "Edit connection",
+    "editar": "Edit",
+    "remover": "Remove connection",
+    "campoNome": "Name",
+    "campoTipo": "Type",
+    "campoHost": "Address",
+    "campoPorta": "Port",
+    "campoUsuario": "User",
+    "campoBanco": "Database",
+    "campoArquivo": "File",
+    "campoSenha": "Password",
+    "senhaGuardada": "leave empty to keep the saved password",
+    "campoLimite": "Row limit",
+    "campoSqlLivre": "Free SQL",
+    "descobrir": "Discover tables",
+    "descobrindo": "Discovering…",
+    "salvando": "Saving…",
+    "tabelas": "Tables",
+    "opLer": "Read",
+    "opInserir": "Insert",
+    "opAtualizar": "Update",
+    "opApagar": "Delete",
+    "tipoSqlite": "SQLite",
+    "tipoPostgres": "PostgreSQL",
+    "tipoMysql": "MySQL",
+    "tipoMssql": "SQL Server",
+    "tipoMongo": "MongoDB",
+    "tipoOracle": "Oracle",
+    "fontesN": "{n} exposed table(s)"
   }
 }

@@ -15,6 +15,7 @@
 //! `${AETHER_MCP_TOKEN}` — o segredo fica na memória, nunca no `mcp.json`.
 
 use super::execucao::{Execucao, resultado_local};
+use crate::bancos;
 use crate::connectors::{Connector, ConnectorCategory, ConnectorKind, McpAuth, McpEntry};
 use crate::idiomas::tr;
 use crate::local::{self, Ferramenta};
@@ -79,7 +80,7 @@ impl Estado {
             ativa: false,
             url: String::new(),
             porta: 0,
-            ferramentas: local::catalogo().len(),
+            ferramentas: catalogo_publicado().len(),
         }
     }
 }
@@ -171,7 +172,7 @@ impl Publicador {
             ativa: true,
             url: format!("http://127.0.0.1:{porta}/mcp"),
             porta,
-            ferramentas: local::catalogo().len(),
+            ferramentas: catalogo_publicado().len(),
         };
         *self.ativa.lock().expect("publicador envenenado") = Some(Ativa {
             estado: estado.clone(),
@@ -294,12 +295,12 @@ impl ServerHandler for Manipulador {
             };
             // O efeito vem do catálogo, e a resposta de um nome que não está nele
             // diz quais são as ferramentas: a mesma regra do laço de conversa.
-            let Some(efeito) = local::catalogo()
+            let Some(efeito) = catalogo_publicado()
                 .into_iter()
                 .find(|f| f.nome == nome)
                 .map(|f| f.efeito)
             else {
-                let lista = local::catalogo()
+                let lista = catalogo_publicado()
                     .into_iter()
                     .map(|t| format!("{CONECTOR}__{}", t.nome))
                     .collect::<Vec<_>>()
@@ -330,10 +331,21 @@ impl ServerHandler for Manipulador {
     }
 }
 
+/// O catálogo que este servidor anuncia: as ferramentas locais e as de banco de
+/// dados, no idioma da vez. `criar_mcp_local` fica de fora — dentro do servidor
+/// publicado a conexão já estaria de pé, e anunciá-la seria um convite para
+/// abrir a porta outra vez.
+fn catalogo_publicado() -> Vec<Ferramenta> {
+    local::catalogo()
+        .into_iter()
+        .chain(bancos::ferramentas::catalogo())
+        .collect()
+}
+
 /// O catálogo como ferramenta MCP. As anotações vão porque um cliente precisa
 /// poder dizer leitura de escrita; a decisão do gate, aqui dentro, não usa elas.
 fn ferramentas_anunciadas() -> Vec<Tool> {
-    local::catalogo()
+    catalogo_publicado()
         .into_iter()
         .map(|ferramenta| {
             let mut anotacoes = ToolAnnotations::default();
@@ -496,6 +508,7 @@ mod tests {
                 raiz.join("rag.json"),
                 Arc::clone(&pastas),
             )),
+            Arc::new(raiz.join("bancos.json")),
         );
         (Publicador::novo(execucao), raiz)
     }
@@ -521,7 +534,11 @@ mod tests {
         assert!(!estado.ativa);
         assert_eq!(estado.url, "");
         assert_eq!(estado.porta, 0);
-        assert_eq!(estado.ferramentas, 11);
+        assert_eq!(estado.ferramentas, catalogo_publicado().len());
+        assert!(
+            estado.ferramentas > local::catalogo().len(),
+            "as ferramentas de banco entram na contagem publicada"
+        );
     }
 
     #[test]
@@ -606,6 +623,11 @@ mod tests {
         let nomes: Vec<&str> = anunciadas.iter().map(|t| t.name.as_ref()).collect();
         assert!(nomes.contains(&"ler_arquivo"), "{nomes:?}");
         assert!(nomes.contains(&"executar_comando"), "{nomes:?}");
+        assert!(nomes.contains(&"bancos_listar"), "{nomes:?}");
+        assert!(
+            !nomes.contains(&super::FERRAMENTA),
+            "publicar o servidor dentro dele mesmo não é anúncio"
+        );
 
         let resposta = cliente
             .call_tool(CallToolRequestParams::new("info_sistema"))

@@ -38,6 +38,10 @@ pub struct AppState {
     /// `mcp.json` (allowlists) e `pastas.json` (concessões), que é o que o núcleo
     /// cobra em cada chamada.
     pub ligacoes_path: PathBuf,
+    /// O cadastro de conexões de banco de dados em `bancos.json`. O gerente
+    /// entrega o caminho às ferramentas de banco, que o leem na hora da chamada:
+    /// a política que a tela salvou vale na chamada seguinte, sem cache.
+    pub bancos_path: PathBuf,
     /// A voz do aplicativo: fala, escuta e as escolhas de `voz.json`. Vive atrás
     /// de um Arc porque a thread de fala e os comandos a leem ao mesmo tempo.
     pub voz: Arc<crate::voz::MotorVoz>,

@@ -11,6 +11,8 @@ import type {
   CallToolResult,
   ChatEvent,
   ChatMessage,
+  ConexaoBanco,
+  ConexaoRegistro,
   Connector,
   EstadoAdaptadores,
   EstadoConversas,
@@ -103,6 +105,12 @@ export const api = {
   mcpServidorPublicar: () => invoke<ServidorMcpEstado>("mcp_servidor_publicar"),
   mcpServidorFechar: () => invoke<boolean>("mcp_servidor_fechar"),
   mcpServidorToken: () => invoke<string | null>("mcp_servidor_token"),
+  bancosListar: () => invoke<ConexaoBanco[]>("bancos_listar"),
+  bancosSalvar: (conexao: ConexaoRegistro, senha: string | null) =>
+    invoke<ConexaoBanco[]>("bancos_salvar", { conexao, senha }),
+  bancosRemover: (id: string) => invoke<ConexaoBanco[]>("bancos_remover", { id }),
+  bancosDescobrir: (conexao: ConexaoRegistro, senha: string | null) =>
+    invoke<string[]>("bancos_descobrir", { conexao, senha }),
   definirIdioma: (id: string) => invoke<string>("set_locale", { id }),
   vozEstado: () => invoke<EstadoVoz>("voz_estado"),
   vozMedidor: () => invoke<MedidorVoz>("voz_medidor"),

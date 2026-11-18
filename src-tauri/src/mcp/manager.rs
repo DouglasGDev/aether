@@ -3,6 +3,7 @@ use super::catalog::{CatalogBudget, CatalogEntry, render};
 use super::execucao::{Execucao, resultado_local};
 use super::servidor::{self, Publicador};
 use super::tool::ToolInfo;
+use crate::bancos;
 use crate::config::{McpConfig, Segredos};
 use crate::connectors::{ConnectorKind, DesktopOs, McpEntry, Registry, ToolMeta, parse_qualified_name};
 use crate::idiomas::tr;
@@ -90,10 +91,13 @@ pub struct McpManager {
 }
 
 /// As ferramentas que o próprio aplicativo sabe executar, na ordem do catálogo.
-/// Sem filtro aqui: a allowlist é aplicada na leitura, por `permitidas`.
+/// Os bancos entram porque o conector embutido é quem os executa: as duas
+/// famílias passam pelo mesmo gate e pela mesma fila de aprovação. Sem filtro
+/// aqui: a allowlist é aplicada na leitura, por `permitidas`.
 fn ferramentas_locais() -> Vec<ToolInfo> {
     let mut ferramentas: Vec<ToolInfo> = local::catalogo()
         .iter()
+        .chain(bancos::ferramentas::catalogo().iter())
         .map(|f| ToolInfo::local(local::CONECTOR, f))
         .collect();
     // Abrir a conexão MCP é uma ferramenta como as outras: o agente pede, o
@@ -125,9 +129,10 @@ impl McpManager {
         config: Arc<Mutex<McpConfig>>,
         config_path: Arc<PathBuf>,
         segredos: Arc<Segredos>,
+        bancos_path: Arc<PathBuf>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
-        let execucao = Execucao::nova(gate, events.clone(), pastas, memoria);
+        let execucao = Execucao::nova(gate, events.clone(), pastas, memoria, bancos_path);
         let publicador = Arc::new(Publicador::novo(Arc::clone(&execucao)));
         Self {
             registry: RwLock::new(registry),
@@ -684,8 +689,18 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect();
-        assert_eq!(nomes.len(), local::catalogo().len() + 1);
+        assert_eq!(
+            nomes.len(),
+            local::catalogo().len() + bancos::ferramentas::catalogo().len() + 1
+        );
         assert!(nomes.contains(&servidor::FERRAMENTA.to_string()), "{nomes:?}");
+        assert!(nomes.contains(&"bancos_listar".to_string()), "{nomes:?}");
+        assert!(nomes.contains(&"bancos_apagar".to_string()), "{nomes:?}");
+        let apagar = ferramentas_locais()
+            .into_iter()
+            .find(|t| t.name == "bancos_apagar")
+            .expect("bancos_apagar anunciada");
+        assert_eq!(apagar.effect, ToolEffect::Destructive);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod bancada;
+pub mod bancos;
 pub mod commands;
 pub mod config;
 pub mod connectors;
@@ -53,6 +54,9 @@ pub fn run() {
             ));
             let servidores_root = app.path().app_local_data_dir()?.join("mcp-servers");
             let ligacoes_path = app.path().app_config_dir()?.join("ligacoes.json");
+            // O cadastro de conexões de banco: conexões, senhas cifradas e a
+            // política por tabela que o dono escolheu.
+            let bancos_path = Arc::new(app.path().app_config_dir()?.join("bancos.json"));
             // A memória tem pasta própria dentro de `models`: apagar um LLM de
             // conversa não leva o índice nem o codificador junto.
             let memoria = Arc::new(ai::memoria::Custodio::novo(
@@ -70,6 +74,7 @@ pub fn run() {
                 Arc::clone(&config),
                 Arc::clone(&config_path),
                 Arc::clone(&segredos),
+                Arc::clone(&bancos_path),
             ));
             // Os modelos de voz têm pasta própria dentro de `models`: apagar um
             // LLM não leva o Kokoro junto, e vice-versa.
@@ -97,6 +102,7 @@ pub fn run() {
                 servidores_root,
                 instalacoes: mcp::instalador::Instalacoes::novo(),
                 ligacoes_path,
+                bancos_path: (*bancos_path).clone(),
                 voz,
                 runtime_dir,
                 runtime_job: Mutex::new(None),
@@ -162,6 +168,10 @@ pub fn run() {
             commands::mcp_servidor_publicar,
             commands::mcp_servidor_fechar,
             commands::mcp_servidor_token,
+            commands::bancos_listar,
+            commands::bancos_salvar,
+            commands::bancos_remover,
+            commands::bancos_descobrir,
             commands::ligacoes_obter,
             commands::ligacoes_aplicar,
             commands::ligacoes_layout,

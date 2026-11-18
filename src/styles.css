@@ -1448,6 +1448,69 @@ button.small {
   overflow-wrap: anywhere;
 }
 
+.banco-fontes {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.banco-fonte {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(8, 12, 20, 0.5);
+}
+
+.banco-fonte-nome {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: #cdd8ea;
+}
+
+.banco-ops {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+}
+
+.banco-op {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+}
+
+.banco-op-rotulo {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.banco-op .toggle {
+  width: 40px;
+  height: 22px;
+}
+
+.banco-op .toggle-knob {
+  width: 16px;
+  height: 16px;
+  top: 2px;
+  left: 2px;
+}
+
+.banco-op .toggle.on .toggle-knob {
+  transform: translateX(18px);
+}
+
 .connector-form {
   display: grid;
   gap: 12px;
@@ -2517,6 +2580,42 @@ button.small {
   color: var(--muted);
   font-size: 11.5px;
   line-height: 1.45;
+}
+
+.card-tabela {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.card-tabela table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.card-tabela th,
+.card-tabela td {
+  padding: 5px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-tabela th {
+  position: sticky;
+  top: 0;
+  background: rgba(4, 8, 14, 0.92);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.card-tabela tr:last-child td {
+  border-bottom: 0;
 }
 
 .card-rows,

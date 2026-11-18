@@ -21,6 +21,7 @@ use crate::state::{AiRuntime, AppState};
 use crate::voz::{self, Ajustes, EstadoVoz, VozEvento};
 use rmcp::model::CallToolResult;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -460,6 +461,118 @@ pub async fn mcp_servidor_fechar(state: State<'_, AppState>) -> Result<bool, Str
 #[tauri::command]
 pub fn mcp_servidor_token(state: State<'_, AppState>) -> Option<String> {
     state.manager.token_servidor()
+}
+
+// ---------------------------------------------------------------------------
+// Bancos de dados: o cadastro que a tela edita e o que as ferramentas cobram.
+// ---------------------------------------------------------------------------
+
+/// Uma conexão como a tela a vê: sem senha, nem cifra — `temSenha` diz apenas
+/// que existe uma guardada. É o que a lista mostra e o que o formulário de
+/// edição recebe de volta; a cifra nunca atravessa a fronteira de novo.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConexaoView {
+    pub id: String,
+    pub nome: String,
+    pub tipo: String,
+    pub host: String,
+    pub porta: Option<u16>,
+    pub usuario: String,
+    pub banco: String,
+    pub arquivo: String,
+    pub tem_senha: bool,
+    pub limite_linhas: u32,
+    pub sql_livre: bool,
+    pub fontes: BTreeMap<String, crate::bancos::config::Fonte>,
+}
+
+fn vista_conexoes(config: &crate::bancos::config::Config) -> Vec<ConexaoView> {
+    config
+        .conexoes
+        .iter()
+        .map(|c| ConexaoView {
+            id: c.id.clone(),
+            nome: c.nome.clone(),
+            tipo: c.tipo.rotulo().to_string(),
+            host: c.host.clone(),
+            porta: c.porta,
+            usuario: c.usuario.clone(),
+            banco: c.banco.clone(),
+            arquivo: c.arquivo.clone(),
+            tem_senha: c.senha_cifrada.as_ref().is_some_and(|s| !s.is_empty()),
+            limite_linhas: c.limite_linhas,
+            sql_livre: c.sql_livre,
+            fontes: c.fontes.clone(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn bancos_listar(state: State<'_, AppState>) -> Result<Vec<ConexaoView>, String> {
+    let config = crate::bancos::config::Config::load(&state.bancos_path).map_err(report)?;
+    Ok(vista_conexoes(&config))
+}
+
+/// Salvar é o ato do dono: validar, cifrar a senha que chegou em claro e gravar.
+/// A senha nunca volta para a tela — numa edição vazia vale a que já está.
+#[tauri::command]
+pub fn bancos_salvar(
+    state: State<'_, AppState>,
+    conexao: crate::bancos::config::Conexao,
+    senha: Option<String>,
+) -> Result<Vec<ConexaoView>, String> {
+    let mut config = crate::bancos::config::Config::load(&state.bancos_path).map_err(report)?;
+    let mut entrada = conexao;
+    entrada.senha_clara = senha;
+    config.upsert(&mut entrada).map_err(report)?;
+    config.save(&state.bancos_path).map_err(report)?;
+    Ok(vista_conexoes(&config))
+}
+
+#[tauri::command]
+pub fn bancos_remover(state: State<'_, AppState>, id: String) -> Result<Vec<ConexaoView>, String> {
+    let mut config = crate::bancos::config::Config::load(&state.bancos_path).map_err(report)?;
+    config.remover(&id);
+    config.save(&state.bancos_path).map_err(report)?;
+    Ok(vista_conexoes(&config))
+}
+
+/// Descobrir é um ato do dono pela tela: abre o banco de verdade e lista todas
+/// as tabelas, inclusive as que ainda não estão expostas — é desta lista que o
+/// dono escolhe o que o modelo pode ver. Sem política aqui: a política é o que
+/// se salva depois, e é o conector que a cobra na chamada.
+#[tauri::command]
+pub async fn bancos_descobrir(
+    state: State<'_, AppState>,
+    conexao: crate::bancos::config::Conexao,
+    senha: Option<String>,
+) -> Result<Vec<String>, String> {
+    let caminho = state.bancos_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut entrada = conexao;
+        if let Some(clara) = senha.filter(|s| !s.is_empty()) {
+            entrada.senha_cifrada =
+                Some(crate::bancos::sigilo::cifrar(&clara).map_err(report)?);
+        } else if entrada.senha_cifrada.is_none() {
+            // Edição sem senha nova: o que está cifrado e salvo é o que vale.
+            let salvo = crate::bancos::config::Config::load(&caminho).map_err(report)?;
+            let velha = salvo.conexoes.iter().find(|c| {
+                if entrada.id.trim().is_empty() {
+                    c.nome.eq_ignore_ascii_case(entrada.nome.trim())
+                } else {
+                    c.id == entrada.id
+                }
+            });
+            if let Some(velha) = velha {
+                entrada.senha_cifrada = velha.senha_cifrada.clone();
+            }
+        }
+        let mut motor = crate::bancos::motor::abrir(&entrada).map_err(report)?;
+        motor.fontes().map_err(report)
+    })
+    .await
+    .map_err(|e| report(anyhow::anyhow!("{e}")))?
 }
 
 /// Trocar o idioma remonta o cadastro e o catálogo embutido: o nome e a

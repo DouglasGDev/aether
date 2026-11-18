@@ -9,11 +9,13 @@
 use super::approval::{ApprovalBroker, ApprovalOutcome, ApprovalRequest, wait_for_decision};
 use super::manager::McpEvent;
 use crate::ai::memoria::Custodio;
+use crate::bancos;
 use crate::idiomas::tr;
 use crate::local::{self, pastas::Pastas};
 use crate::permissions::{Decision, PendingApproval, PermissionGate, ToolEffect};
 use anyhow::{Result, anyhow, bail};
 use rmcp::model::{CallToolResult, ContentBlock};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -29,6 +31,10 @@ pub struct Execucao {
     /// `buscar_memoria` é uma ferramenta local, e uma ferramenta local roda numa
     /// tarefa bloqueante que não pode prender o runtime.
     memoria: Arc<Custodio>,
+    /// Onde está o cadastro de bancos de dados. A política por tabela é lida do
+    /// disco na hora da chamada, dentro da tarefa bloqueante: o que a tela salvou
+    /// agora vale na chamada seguinte, sem cache a invalidar.
+    bancos_path: Arc<PathBuf>,
 }
 
 impl Execucao {
@@ -37,6 +43,7 @@ impl Execucao {
         events: broadcast::Sender<McpEvent>,
         pastas: Arc<RwLock<Pastas>>,
         memoria: Arc<Custodio>,
+        bancos_path: Arc<PathBuf>,
     ) -> Arc<Self> {
         Self::nova_com_aprovacoes(
             gate,
@@ -44,6 +51,7 @@ impl Execucao {
             events,
             pastas,
             memoria,
+            bancos_path,
         )
     }
 
@@ -53,6 +61,7 @@ impl Execucao {
         events: broadcast::Sender<McpEvent>,
         pastas: Arc<RwLock<Pastas>>,
         memoria: Arc<Custodio>,
+        bancos_path: Arc<PathBuf>,
     ) -> Arc<Self> {
         Self {
             gate,
@@ -61,6 +70,7 @@ impl Execucao {
             next_id: AtomicU64::new(1),
             pastas,
             memoria,
+            bancos_path,
         }
         .into()
     }
@@ -163,7 +173,9 @@ impl Execucao {
         Ok(())
     }
 
-    /// Roda uma ferramenta local depois de o gate decidir sobre ela.
+    /// Roda uma ferramenta local depois de o gate decidir sobre ela. Ferramentas
+    /// de banco seguem por aqui também, mas com o cadastro do dono no lugar das
+    /// pastas: a política por tabela é conferida dentro, antes de o motor abrir.
     pub async fn ferramenta(
         &self,
         connector_id: &str,
@@ -177,6 +189,16 @@ impl Execucao {
         };
         self.aprovar(connector_id, ferramenta, efeito, &args)
             .await?;
+
+        if bancos::ferramentas::e_ferramenta(ferramenta) {
+            let caminho = Arc::clone(&self.bancos_path);
+            let nome = ferramenta.to_string();
+            return tokio::task::spawn_blocking(move || {
+                bancos::ferramentas::executar(&nome, serde_json::Value::Object(args), &caminho)
+            })
+            .await
+            .map_err(|e| anyhow!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])))?;
+        }
 
         // Uma cópia das pastas, nunca o lock atravessando o await: a concessão de
         // uma pasta não pode ficar presa atrás de um comando.
@@ -296,6 +318,7 @@ mod tests {
                 raiz.join("rag.json"),
                 pastas,
             )),
+            Arc::new(raiz.join("bancos.json")),
         );
         let alvo = raiz.join("proibido.txt");
         let erro = execucao

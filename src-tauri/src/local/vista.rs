@@ -69,6 +69,38 @@ pub struct Par {
     pub unidade: Option<String>,
 }
 
+/// Uma conexão como o cartão a mostra: sem senha, nem cifra — o que aqui está é
+/// o que o dono já sabe que cadastrou.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConexaoCartao {
+    pub nome: String,
+    pub tipo: String,
+    pub destino: String,
+    pub fontes: usize,
+    pub limite_linhas: u32,
+    pub sql_livre: bool,
+}
+
+/// Uma fonte exposta e a política de cada ato nela. Os quatro flags são o que a
+/// tela de configuração mostra e o que a chamada conferiu de fato.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FonteCartao {
+    pub nome: String,
+    pub ler: bool,
+    pub inserir: bool,
+    pub atualizar: bool,
+    pub apagar: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColunaCartao {
+    pub nome: String,
+    pub tipo: String,
+}
+
 impl Par {
     pub fn texto(rotulo: impl Into<String>, valor: impl Into<String>) -> Self {
         Self { rotulo: rotulo.into(), valor: valor.into(), numero: None, unidade: None }
@@ -162,6 +194,45 @@ pub enum Vista {
     Sistema {
         linhas: Vec<Par>,
     },
+    /// As conexões de banco cadastradas. Nada de segredo aqui: o cartão mostra o
+    /// que o dono já sabe que cadastrou.
+    BancoConexoes {
+        itens: Vec<ConexaoCartao>,
+    },
+    /// As fontes que uma conexão expõe, com a política de cada uma.
+    BancoFontes {
+        conexao: String,
+        itens: Vec<FonteCartao>,
+    },
+    /// As colunas de uma fonte, na ordem que o banco declara.
+    BancoEsquema {
+        conexao: String,
+        fonte: String,
+        colunas: Vec<ColunaCartao>,
+    },
+    /// As linhas de uma consulta. Cada linha segue a ordem de `colunas`, e
+    /// `truncado` diz que o teto de linhas cortou antes do fim — leitura
+    /// limitada, não incompleta por erro.
+    BancoConsulta {
+        conexao: String,
+        fonte: String,
+        colunas: Vec<String>,
+        linhas: Vec<Vec<serde_json::Value>>,
+        total: usize,
+        truncado: bool,
+        duracao_ms: u64,
+    },
+    /// O número de linhas que o banco reportou numa operação: contadas,
+    /// inseridas, atualizadas, apagadas ou afetadas por um SQL livre. A fonte
+    /// fica de fora quando a operação não tem uma (SQL que o modelo escreveu).
+    BancoLinhas {
+        conexao: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fonte: Option<String>,
+        operacao: String,
+        linhas: u64,
+        duracao_ms: u64,
+    },
 }
 
 impl Vista {
@@ -244,5 +315,44 @@ mod tests {
         let json = Vista::Sistema { linhas: vec![Par::texto("Núcleos", "16")] }.para_json();
         assert!(json["linhas"][0].get("numero").is_none());
         assert_eq!(json["linhas"][0]["valor"], "16");
+    }
+
+    #[test]
+    fn a_consulta_do_banco_chega_com_a_duracao_em_camel_case() {
+        let vista = Vista::BancoConsulta {
+            conexao: "Estoque".into(),
+            fonte: "clientes".into(),
+            colunas: vec!["id".into(), "nome".into()],
+            linhas: vec![vec![serde_json::json!(1), serde_json::json!("Ana")]],
+            total: 1,
+            truncado: false,
+            duracao_ms: 12,
+        };
+        let json = vista.para_json();
+        assert_eq!(json["type"], "bancoConsulta");
+        assert_eq!(json["duracaoMs"], 12);
+        assert_eq!(json["linhas"][0][1], "Ana");
+        assert!(json.get("duracao_ms").is_none());
+    }
+
+    #[test]
+    fn as_linhas_do_banco_guardam_a_fonte_so_quando_ha_uma() {
+        let com_fonte = Vista::BancoLinhas {
+            conexao: "Estoque".into(),
+            fonte: Some("clientes".into()),
+            operacao: "inserir".into(),
+            linhas: 1,
+            duracao_ms: 3,
+        };
+        assert_eq!(com_fonte.para_json()["fonte"], "clientes");
+
+        let sem_fonte = Vista::BancoLinhas {
+            conexao: "Estoque".into(),
+            fonte: None,
+            operacao: "sql".into(),
+            linhas: 0,
+            duracao_ms: 3,
+        };
+        assert!(sem_fonte.para_json().get("fonte").is_none());
     }
 }

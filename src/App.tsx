@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AdaptadoresDialog } from "./components/AdaptadoresDialog";
 import { ApprovalCard } from "./components/ApprovalCard";
 import { BancadaDialog } from "./components/BancadaDialog";
+import { BancosDialog } from "./components/BancosDialog";
 import { ArgumentForm } from "./components/ArgumentForm";
 import { CapabilityCards } from "./components/CapabilityCards";
 import { Chats } from "./components/Chats";
@@ -72,6 +73,7 @@ export default function App() {
   const [showVoz, setShowVoz] = useState(false);
   const [showRuntime, setShowRuntime] = useState(false);
   const [showBancada, setShowBancada] = useState(false);
+  const [showBancos, setShowBancos] = useState(false);
   /// O runtime nativo nas pastas do carregador. Incompleto é o estado de um PC
   /// novo: os pesos baixam e a inferência não abre porque a DLL não está lá.
   const [runtime, setRuntime] = useState<RuntimePacote[]>([]);
@@ -742,6 +744,15 @@ export default function App() {
             </button>
             <button
               type="button"
+              className="icon-only"
+              onClick={() => setShowBancos(true)}
+              aria-label={t("app.bancos")}
+              title={t("app.bancos")}
+            >
+              <Icon name="banco" />
+            </button>
+            <button
+              type="button"
               className={medidor.falando ? "icon-only voz-ligada" : "icon-only"}
               onClick={() => setShowVoz(true)}
               aria-label={t("app.voz")}
@@ -973,6 +984,8 @@ export default function App() {
         )}
 
         {showBancada && <BancadaDialog onClose={() => setShowBancada(false)} />}
+
+        {showBancos && <BancosDialog onClose={() => setShowBancos(false)} />}
 
         {showVoz && (
           <VozDialog

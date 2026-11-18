@@ -32,7 +32,7 @@ http-body-util = "0.1"
 bytes = "1"
 # O cancelador do laço de aceitação: fechar o servidor é mandar o laço sair e
 # esperar a tarefa, não abandonar a porta aberta com um token solto por aí.
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }
 # O token do servidor é aleatório de verdade, e vem do gerador do sistema: um
 # endpoint que escreve arquivos na máquina não pode ser adivinhado por vizinho.
 getrandom = "0.4"
@@ -53,11 +53,28 @@ libloading = "0.9.1"
 # O instalador de runtime confere cada DLL contra o SHA256SUMS.txt versionado
 # antes de pô-la no lugar: sem isto o aplicativo carregaria binário não conferido.
 sha2 = "0.10"
+# Conector de bancos de dados: um driver por família, todos em Rust puro —
+# nenhum cliente nativo no meio, na mesma regra dos motores de inferência.
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+mysql_async = { version = "0.35", default-features = false, features = ["minimal", "derive"] }
+tiberius = "0.12"
+mongodb = "3.2"
+# Oracle pelo driver oficial da Oracle em modo thin: protocolo TNS/TTC em Rust
+# puro, sem Instant Client e sem OCI — a mesma regra dos demais motores. É
+# beta e saiu há dias; a alternativa (crate `oracle`) exige o Instant Client
+# nativo, que o aplicativo não pode embutir nem pedir.
+oracledb = "=26.0.0-beta.6"
+# A senha de conexão é cifrada com DPAPI antes de tocar o disco; o texto cifrado
+# viaja em base64 dentro do bancos.json.
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
 ] }
 
 [[bin]]

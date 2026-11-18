@@ -52,7 +52,7 @@ pub struct Ferramenta {
 
 /// Um campo do esquema. `title` é o nome legível no idioma atual, e a interface
 /// o usa no lugar de adivinhar a partir da chave; `description` é o que o modelo lê.
-fn campo(tipo: &str, chave: &str) -> Value {
+pub(crate) fn campo(tipo: &str, chave: &str) -> Value {
     json!({
         "type": tipo,
         "title": tr(&format!("argumentos.{chave}"), &[]),
@@ -60,7 +60,7 @@ fn campo(tipo: &str, chave: &str) -> Value {
     })
 }
 
-fn objeto(propriedades: Value, obrigatorios: &[&str]) -> Value {
+pub(crate) fn objeto(propriedades: Value, obrigatorios: &[&str]) -> Value {
     json!({
         "type": "object",
         "properties": propriedades,
@@ -69,7 +69,12 @@ fn objeto(propriedades: Value, obrigatorios: &[&str]) -> Value {
     })
 }
 
-fn ferramenta(nome: &'static str, chave: &str, efeito: ToolEffect, esquema: Value) -> Ferramenta {
+pub(crate) fn ferramenta(
+    nome: &'static str,
+    chave: &str,
+    efeito: ToolEffect,
+    esquema: Value,
+) -> Ferramenta {
     Ferramenta {
         nome,
         titulo: tr(&format!("ferramentas.{chave}.titulo"), &[]),
