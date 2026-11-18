@@ -11,13 +11,20 @@ inferência é parte deste repositório, e o aplicativo é o dono da placa.
 ## A tela
 
 As capturas abaixo são do aplicativo real rodando no Windows com a placa Vulkan,
-em 17 de novembro de 2026. Nada nelas é montado: as medidas saem do motor e da
+em 18 de novembro de 2026. Nada nelas é montado: as medidas saem do motor e da
 bancada.
 
 **O núcleo** — o orbe, as 11 ferramentas do conector embutido com o efeito de
-cada uma (`Só lê`, `Altera`, `Pode apagar`) e a faixa de conectores embaixo.
+cada uma (`Só lê`, `Altera`, `Pode apagar`) e a faixa de conectores embaixo. Na
+barra ficam os controles de um turno — conversas, ligações e confiança; o resto
+do aplicativo está no menu.
 
 ![Tela inicial do Aether](docs/capturas/tela-inicial.png)
+
+**O menu** — as onze telas de ajuste em quatro seções: motor, conexões, local e
+sistema. O ponto verde marca a tela cujo ajuste está valendo agora.
+
+![Menu de configurações do Aether](docs/capturas/menu.png)
 
 **Um turno medido** — a resposta do Ornith 1.5 9B Q4_K_M com tokens de entrada e
 saída, tokens/s de prefill e de leitura, tempo no motor e o motivo da parada.
@@ -37,8 +44,8 @@ chamada (`Origem · Aether (MCP local)`) e o que o efeito dela é.
 ![Card de aprovação de uma chamada recebida pelo servidor MCP local](docs/capturas/mcp-aprovacao.png)
 
 **A bancada** — a suíte que roda dentro do aplicativo. O caso `Conexão MCP
-local` mede a porta sorteada, quantas ferramentas o fio anuncia contra as 11 do
-catálogo e o `401` de quem chega sem token.
+local` mede a porta sorteada, quantas ferramentas o fio anuncia contra as 20 do
+catálogo (11 locais + 9 de banco de dados) e o `401` de quem chega sem token.
 
 ![Bancada com os casos aprovados](docs/capturas/bancada.png)
 
@@ -205,7 +212,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 392 testes
+cd src-tauri && cargo test --lib     # 441 testes
 npm run build                        # tsc + vite
 ```
 
@@ -223,7 +230,7 @@ cd src-tauri && cargo run --bin engine-probe -- <pasta-do-modelo> <arquivo.gguf>
 ```
 
 O mesmo conjunto de verificações, feito dentro do aplicativo e contra o modelo
-carregado, é a tela **Bancada** — seis casos, um veredito medido por caso.
+carregado, é a tela **Bancada** — nove casos, um veredito medido por caso.
 
 ## Estrutura
 

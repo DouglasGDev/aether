@@ -35,24 +35,21 @@
     "listaValores": "valor, valor, valor"
   },
   "app": {
-    "modelos": "Modelos",
-    "servidores": "Servidores",
     "grafo": "Ver as ligações",
     "orbe": "Voltar ao núcleo",
-    "escalas": "Escalas de geração",
-    "pastas": "Pastas",
-    "memoria": "Memória",
-    "idioma": "Idioma",
     "semServidor": "Nenhum servidor conectado",
     "semFerramenta": "Nenhuma ferramenta disponível",
     "fale": "Fale com o Aether",
     "pedido": "Pedido ao Aether",
     "enviar": "Enviar",
-    "parar": "Parar",
-    "voz": "Voz",
-    "bancada": "Bancada",
-    "ajusteFino": "Ajuste fino",
-    "bancos": "Bancos de dados"
+    "parar": "Parar"
+  },
+  "menu": {
+    "titulo": "Configurações",
+    "motor": "Motor",
+    "conexoes": "Conexões",
+    "local": "Local",
+    "sistema": "Sistema"
   },
   "voz": {
     "titulo": "Voz",

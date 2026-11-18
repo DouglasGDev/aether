@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AdaptadoresDialog } from "./components/AdaptadoresDialog";
+import { AppMenu, type Marca, type TelaAjuste } from "./components/AppMenu";
 import { ApprovalCard } from "./components/ApprovalCard";
 import { BancadaDialog } from "./components/BancadaDialog";
 import { BancosDialog } from "./components/BancosDialog";
@@ -650,6 +651,37 @@ export default function App() {
   /// instalador, em vez de deixar o erro do carregador ser a única pista.
   const runtimeFalta = runtime.some((pacote) => !pacote.completo);
 
+  /// O que está valendo agora, levado ao menu para que o estado não suma junto
+  /// com os botões que mostravam cada ajuste na barra.
+  const marcasMenu: Partial<Record<TelaAjuste, Marca>> = {};
+  if (runtimeFalta) marcasMenu.runtime = "aviso";
+  if (medidor.falando) marcasMenu.voz = "pulso";
+  if (ajustado) marcasMenu.ajuste = "ligada";
+  if (
+    ajustes !== null &&
+    (ajustes.modelo !== "" || ajustes.pensamento || ajustes.semente !== 0)
+  )
+    marcasMenu.geracao = "ligada";
+
+  /// Uma linha por tela: o Record completo é o que impede o menu de anunciar
+  /// uma porta que o app não abre.
+  function abrirAjuste(tela: TelaAjuste) {
+    const aberturas: Record<TelaAjuste, () => void> = {
+      modelos: () => setShowModels(true),
+      runtime: () => setShowRuntime(true),
+      geracao: () => setShowGeracao(true),
+      ajuste: () => setShowAjuste(true),
+      servidores: () => setShowServers(true),
+      bancos: () => setShowBancos(true),
+      pastas: () => setShowPastas(true),
+      memoria: () => setShowMemoria(true),
+      voz: () => setShowVoz(true),
+      idioma: () => setShowIdioma(true),
+      bancada: () => setShowBancada(true),
+    };
+    aberturas[tela]();
+  }
+
   return (
     <div className={showChats ? "app app--chats" : "app"}>
       {showChats && (
@@ -691,112 +723,7 @@ export default function App() {
             >
               <Icon name="nodes" />
             </button>
-            <button
-              type="button"
-              className={
-                ajustes !== null &&
-                (ajustes.modelo !== "" || ajustes.pensamento || ajustes.semente !== 0)
-                  ? "icon-only ligado"
-                  : "icon-only"
-              }
-              onClick={() => setShowGeracao(true)}
-              aria-label={t("app.escalas")}
-              title={t("app.escalas")}
-            >
-              <Icon name="escalas" />
-            </button>
-            <button
-              type="button"
-              className={ajustado ? "icon-only ligado" : "icon-only"}
-              onClick={() => setShowAjuste(true)}
-              aria-pressed={ajustado}
-              aria-label={t("app.ajusteFino")}
-              title={t("app.ajusteFino")}
-            >
-              <Icon name="camadas" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => setShowModels(true)}
-              aria-label={t("app.modelos")}
-              title={t("app.modelos")}
-            >
-              <Icon name="cube" />
-            </button>
-            <button
-              type="button"
-              className={runtimeFalta ? "icon-only falta" : "icon-only"}
-              onClick={() => setShowRuntime(true)}
-              aria-label={t("runtime.titulo")}
-              title={t("runtime.titulo")}
-            >
-              <Icon name="cpu" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => setShowBancada(true)}
-              aria-label={t("app.bancada")}
-              title={t("app.bancada")}
-            >
-              <Icon name="bancada" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => setShowBancos(true)}
-              aria-label={t("app.bancos")}
-              title={t("app.bancos")}
-            >
-              <Icon name="banco" />
-            </button>
-            <button
-              type="button"
-              className={medidor.falando ? "icon-only voz-ligada" : "icon-only"}
-              onClick={() => setShowVoz(true)}
-              aria-label={t("app.voz")}
-              title={t("app.voz")}
-            >
-              <Icon name="wave" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => setShowPastas(true)}
-              aria-label={t("app.pastas")}
-              title={t("app.pastas")}
-            >
-              <Icon name="folder" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => setShowMemoria(true)}
-              aria-label={t("app.memoria")}
-              title={t("app.memoria")}
-            >
-              <Icon name="memoria" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => setShowIdioma(true)}
-              aria-label={t("app.idioma")}
-              title={t("app.idioma")}
-            >
-              <Icon name="globe" />
-            </button>
-            <button
-              type="button"
-              className="icon-only"
-              onClick={() => void novaConversa()}
-              disabled={talking}
-              aria-label={t("conversas.nova")}
-              title={t("conversas.nova")}
-            >
-              <Icon name="plus" />
-            </button>
+            <AppMenu onAbrir={abrirAjuste} marcas={marcasMenu} />
             {mode !== null && (
               <TrustDial
                 mode={mode}

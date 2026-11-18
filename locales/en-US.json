@@ -35,24 +35,21 @@
     "listaValores": "value, value, value"
   },
   "app": {
-    "modelos": "Models",
-    "servidores": "Servers",
     "grafo": "Show the wiring",
     "orbe": "Back to the core",
-    "escalas": "Generation scales",
-    "pastas": "Folders",
-    "memoria": "Memory",
-    "idioma": "Language",
     "semServidor": "No server connected",
     "semFerramenta": "No tool available",
     "fale": "Talk to Aether",
     "pedido": "Request to Aether",
     "enviar": "Send",
-    "parar": "Stop",
-    "voz": "Voice",
-    "bancada": "Workbench",
-    "ajusteFino": "Fine tuning",
-    "bancos": "Databases"
+    "parar": "Stop"
+  },
+  "menu": {
+    "titulo": "Settings",
+    "motor": "Engine",
+    "conexoes": "Connections",
+    "local": "Local",
+    "sistema": "System"
   },
   "voz": {
     "titulo": "Voice",
