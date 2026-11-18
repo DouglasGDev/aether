@@ -873,6 +873,7 @@
     "falhaPedir": "falha ao pedir {url}",
     "servidorRespondeu": "o servidor respondeu {status} para {url}",
     "conexaoCaiu": "a conexão caiu ao baixar {url}",
+    "tentativasEsgotadas": "a conexão caiu {tentativas} vezes seguidas",
     "retomouDeOutroPonto": "o servidor retomou de outro ponto ({inicio}, esperado {esperado})",
     "maisBytesQuePublicado": "o servidor mandou mais bytes que o arquivo publicado ({recebidos} > {esperados})",
     "downloadIncompleto": "download incompleto: {recebidos} de {esperados} bytes",

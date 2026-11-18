@@ -873,6 +873,7 @@
     "falhaPedir": "the request for {url} failed",
     "servidorRespondeu": "the server answered {status} for {url}",
     "conexaoCaiu": "the connection dropped while downloading {url}",
+    "tentativasEsgotadas": "the connection dropped {tentativas} times in a row",
     "retomouDeOutroPonto": "the server resumed from another point ({inicio}, expected {esperado})",
     "maisBytesQuePublicado": "the server sent more bytes than the published file ({recebidos} > {esperados})",
     "downloadIncompleto": "incomplete download: {recebidos} of {esperados} bytes",

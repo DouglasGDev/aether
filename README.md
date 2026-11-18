@@ -83,8 +83,13 @@ movido se um hash divergir. Veja
   programação), mais 2 quants do Qwen3-Embedding 0.6B. Cada tamanho é lido do
   `tree/main` do HuggingFace, arquivo por arquivo, e cada família é conferida
   contra a tabela de arquiteturas da `llama.dll` vendorizada. Download
-  retomável, cancelamento e estado medido em disco. Um arquivo de apoio que
-  chegou como ponteiro Git LFS é tratado como ausente, não como instalado.
+  retomável, cancelamento e estado medido em disco. Uma conexão que cai no meio
+  do corpo levanta a pedida do ponto onde parou — quatro pedidas no total, com
+  1s, 2s e 4s entre elas — e o mesmo caminho serve os pesos, o runtime e a voz;
+  um 404, um disco cheio ou um *Parar* devolvem o motivo na primeira conexão,
+  porque retentar o que não é da rede só atrasaria a resposta certa. Um arquivo
+  de apoio que chegou como ponteiro Git LFS é tratado como ausente, não como
+  instalado.
 - **Roteador** — classifica o pedido e escolhe o modelo pela capacidade real da
   placa; a escolha é exibida com o motivo auditável e os sinais que a produziram.
   Um modelo fixado nas Escalas passa na frente do roteador.
@@ -154,7 +159,7 @@ movido se um hash divergir. Veja
   dela (contagem de mensagens e instante da última), então um turno sem histórico
   novo não custa um vetor. O trabalho de conversa paga um teto de tokens por turno
   (8.192) e sempre entrega ao menos uma conversa inteira; a varredura, que corre
-  fora do turno com barra de progresso, drena o resto. Medido na suíte: 456 testes
+  fora do turno com barra de progresso, drena o resto. Medido na suíte: 461 testes
   de unidade, incluindo os que provam o isolamento das duas fontes e a
   idempotência da prova.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
@@ -236,7 +241,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 461 testes (456 passam, 5 com `#[ignore]`)
+cd src-tauri && cargo test --lib     # 466 testes (461 passam, 5 com `#[ignore]`)
 npm run build                        # tsc + vite
 ```
 
