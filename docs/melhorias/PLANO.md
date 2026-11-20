@@ -218,17 +218,21 @@ o derrotam:
   não traz TLS): hoje recusa com motivo. Ligaria de verdade com a feature `rustls`
   do crate — mesma decisão pendente do postgres, e o mesmo motivo para esperar:
   sem servidor, nada é medido.
-- **A8** recovery de mutex envenenado — **andamento medido na quarta passagem,
-  não nos números antigos**: o `expect` do histórico e do resumo saiu do
-  produção (`session.rs:293` `trava_historico` e `:299` `trava_resumo` fazem
-  `into_inner`), e o `ffi.rs` não tem nenhum. O que resta é conta lida do crate
-  inteiro: **100** ocorrências de `expect("… envenenad…")` em 14 arquivos —
-  `memoria.rs` 46, `voz/escuta.rs` 8, `conversas.rs` 8, `state.rs` 7 (essas
-  dentro do bloco de testes, que envenena a trava de propósito), `voz/mod.rs` 6,
-  `mcp/servidor.rs` 5, `mcp/instalador.rs` 4, `voz/fala.rs` 3, `mcp/execucao.rs`
-  3, `idiomas.rs` 3, `config.rs` 3, `session.rs` 2 (comentário + teste),
-  `mcp/manager.rs` 1, `lib.rs` 1. Fechar por arquivo, não em varredura: cada um
-  precisa dizer se o dado é recuperável (`into_inner`) ou se o motivo vira erro.
+- **A8** recovery de mutex envenenado — **fechado na produção, e é instrumento
+  que diz isso, não conta de `grep`**: a regra passou a ser conferida crate a
+  crate por `contrato::testes::trava_de_dado_puro_recupera_do_envenenamento`,
+  que varre os **65** arquivos `.rs` de `src-tauri/src` (`find . -name "*.rs" | wc -l`),
+  recorta todo bloco aberto depois de `#[cfg(test)]` e procura `.lock()` /
+  `.read()` / `.write()` seguidos de `.expect(`/`.unwrap(`. Verdir com **zero**
+  violações (`cargo test --lib contrato` → 2 passaram). Dos **18** literais
+  `expect("… envenenad…")` que ainda ocorrem — `grep -rnE "expect\(\"[^\"]*envenenad"
+  --include="*.rs" src-tauri/src | wc -l`, baixado de 100 na conta antiga — **16**
+  estão dentro de `#[cfg(test)]` (é assim que o teste segura a trava de propósito:
+  `state.rs` :678–:830, `memoria.rs` :2573–:2711, `session.rs` :837, `config.rs`
+  :360, `conversas.rs` :1020, `idiomas.rs` :371, todos acima da linha do
+  `cfg(test)` do próprio arquivo) e **2** são comentário de doc (`contrato.rs:5`,
+  `session.rs:821`). O que a frente tinha como "fechar por arquivo, não em
+  varredura" foi fechado assim, arquivo por arquivo, na leva CONTRATO.
 - **A9** dead code `Motor::versao`/`Ggml::versao` — **fechado na segunda leva**
   (`FFI.md`): `grep -rn "fn versao" src/ai/` não devolve nada hoje, e a opção de
   ligar a diagnóstico ficou registrada como follow-up no doc deles (o lugar seria
@@ -652,3 +656,38 @@ magnitude não tem API nesta biblioteca (`llama_set_adapters_lora` soma deltas
 escaladas no grafo; a normalização por linha pede o peso já fundido), então
 fechar isso é um conversor que funda adaptador em GGUF, conferido contra um DoRA
 conhecido — frente nova, não um número a mais na tela.
+
+## Passagem do maintainer sobre a oitava leva (medido 2026-11-20)
+
+Sem frente delegada: dois restos que a leitura da sétima deixou apontados, e a
+re-medição de uma recomendação que estava escrita com números de outra árvore.
+
+- **A prosa que saiu da tela levou o que ela usava.** `servidores.catalogoNota`
+  (dos dois JSON) e `.sheet-hint` (de `src/styles.css`) não tinham nenhum
+  consumidor — `grep -rn catalogoNota src src-tauri/src` e
+  `grep -rn "sheet-hint" src` devolviam, cada um, só o próprio arquivo. Cortados
+  os dois lados do locale na mesma batida, a paridade medida passou de 1007 para
+  **1006 chaves achatadas de cada lado**, e o guarda dela
+  (`idiomas.rs:150 todos_os_idiomas_tem_exatamente_as_mesmas_chaves`) continua
+  verde. Detalhado em `FRONT.md`, F7.
+- **A8 deixou de ser conta e passou a ser instrumento.** A recomendação citava
+  100 ocorrências em 14 arquivos, número da quarta passagem; re-medido hoje:
+  **18** literais `expect("… envenenad…")` no crate, dos quais **16** dentro de
+  `#[cfg(test)]` (o teste envenena a trava de propósito) e **2** comentário de
+  doc. Em produção, **zero**: `contrato::testes::trava_de_dado_puro_recupera_do_envenenamento`
+  varre os 65 `.rs` de `src-tauri/src`, corta o que é bloco de testes e exige que
+  nenhuma aquisição de `.lock()`/`.read()`/`.write()` seja seguida de
+  `expect`/`unwrap` — verdir com o crate inteiro sob os olhos, não com a minha
+  conta de `grep`. A recomendação fechou por aí.
+- **Um `grep` que quase entrou no doc por engano.** Ao medir as 18 linhas, a
+  primeira passada contava 65 ocorrências de `envenenad` — porque
+  `unwrap_or_else(|envenenado| …)`, a recuperação que a regra pede, usa a mesma
+  palavra no nome da variável. A conta que importa é a do literal de `expect`, e
+  o que decide produção x teste é o `#[cfg(test)]` do arquivo, lido um por um.
+
+Gates desta passagem (árvore com os três cortes de arquivo): `cd src-tauri &&
+cargo test --lib` → **567 passaram, 0 falharam, 11 ignored, finished in 4,79 s**;
+`cargo test --lib contrato` → **2 passaram, 0 falharam**; `cargo check
+--all-targets` → **Finished, zero avisos**; `npm run build` → **OK, `✓ built in
+196 ms`**, maior bloco `react` a 210,53 kB, sem aviso de chunk. Nada do Rust
+mudou: `git diff --stat` fecha em 3 arquivos e 8 linhas removidas.

@@ -191,7 +191,6 @@
     "erroEnderecoObrigatorio": "Informe o endereço",
     "erroLinhaInvalida": "Linha inválida: {linha}",
     "catalogo": "Servidores do catálogo",
-    "catalogoNota": "Instalados pelo Aether nesta máquina, sem serviço de terceiro.",
     "cadastrados": "Cadastrados à mão",
     "naoInstalado": "Não instalado",
     "nadaParaCancelar": "Não há nada em curso para {nome}",

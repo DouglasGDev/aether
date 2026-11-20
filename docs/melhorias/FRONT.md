@@ -120,14 +120,15 @@ copiada desta página.
 
 ## Follow-ups: o que esta passagem deixou, e onde cada um está hoje (lido 2026-11-20)
 
-- **Prosa na UI (F7) — a prosa saiu, e sobrou o que ela usava.** Nenhuma tela lê
-  `sheet-hint` (`grep -rn "sheet-hint" src` devolve só `src/styles.css`), e
-  `servidores.catalogoNota` não tem consumidor nenhum fora dos dois JSON
-  (`grep -rn catalogoNota src src-tauri/src` → zero linhas). As duas coisas são
-  órfãs hoje: a classe no CSS e a chave nos dois locales. Tirá-las é lote próprio
-  — chave de locale sai dos dois idiomas ao mesmo tempo, porque
-  `idiomas.rs:150 todos_os_idiomas_tem_exatamente_as_mesmas_chaves` confere a
-  paridade. Os `sheet-note` de estado vazio continuam legítimos: `App.tsx:920` é
+- **Prosa na UI (F7) — fechado nesta passagem: saiu a prosa e saiu o que ela
+  usava.** `servidores.catalogoNota` foi cortada dos dois JSON ao mesmo tempo
+  (`locales/pt-BR.json` e `locales/en-US.json`, mesma linha `:194` antes do corte)
+  e `.sheet-hint` saiu de `src/styles.css` — as duas ausências medidas antes do
+  corte: `grep -rn "sheet-hint" src` devolvia só a regra do próprio CSS, e
+  `grep -rn catalogoNota src src-tauri/src` devolvia zero linhas. Paridade
+  conferida depois: `idiomas.rs:150 todos_os_idiomas_tem_exatamente_as_mesmas_chaves`
+  verde, e o total achatado passou de 1007 para **1006 chaves de cada lado**. Os
+  `sheet-note` de estado vazio continuam legítimos e intocados: `App.tsx:920` é
   "carregando" e `App.tsx:973-977` escolhe entre `app.semServidor` e
   `app.semFerramenta` — estado, não explicação.
 - **Marca hardcoded — fechado.** `App.tsx:874-879` renderiza `{t("ligacoes.aether")}`

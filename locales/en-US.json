@@ -191,7 +191,6 @@
     "erroEnderecoObrigatorio": "Enter the address",
     "erroLinhaInvalida": "Invalid line: {linha}",
     "catalogo": "Catalog servers",
-    "catalogoNota": "Installed by Aether on this machine, with no third-party service.",
     "cadastrados": "Registered by hand",
     "naoInstalado": "Not installed",
     "nadaParaCancelar": "Nothing is running for {nome}",
