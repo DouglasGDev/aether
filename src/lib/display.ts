@@ -1,4 +1,6 @@
+import type { Traduzir } from "./i18n";
 import type {
+  Alojamento,
   FonteMemoria,
   GeneroVoz,
   ModoMemoria,
@@ -135,4 +137,26 @@ export function medida(linha: VistaPar, idioma: string): string {
   if (linha.numero === undefined) return linha.valor;
   const valor = numero(linha.numero, idioma, 1);
   return linha.unidade === undefined ? valor : `${valor} ${linha.unidade}`;
+}
+
+/// As palavras do veredito de alojamento. Uma só versão porque o gerenciador de
+/// modelos e a tela de memória mostram a mesma conta — duas formulações do mesmo
+/// número é como uma delas envelhece torto.
+export function previsao(
+  previsto: Alojamento,
+  traduzir: Traduzir,
+  idioma: string,
+): string {
+  return previsto.tipo === "inteira"
+    ? traduzir("modelos.placaInteira", {
+        pesos: bytes(previsto.pesos, idioma),
+        kv: bytes(previsto.kv, idioma),
+      })
+    : previsto.tipo === "dividida"
+      ? traduzir("modelos.placaDividida", {
+          camadas: inteiro(previsto.camadas, idioma),
+          total: inteiro(previsto.total, idioma),
+          emRam: bytes(previsto.emRam, idioma),
+        })
+      : traduzir("modelos.placaSistema", { pesos: bytes(previsto.pesos, idioma) });
 }

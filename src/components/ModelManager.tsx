@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, message, onModelEvent } from "../lib/api";
-import { bytes, inteiro, numero } from "../lib/display";
+import { bytes, numero, previsao } from "../lib/display";
 import { useIdioma, useT, type Traduzir } from "../lib/i18n";
 import { useJobs, type Job } from "../lib/jobs";
 import type { Acelerador, Alojado, ModelEvent, ModelStatus } from "../lib/types";
@@ -18,31 +18,16 @@ interface Props {
 type Fase = "preparando" | "pesos" | "apoio";
 
 /// Onde os bytes ficaram, nas palavras do dono da máquina. O texto é a previsão
-/// feita com o cabeçalho do GGUF antes da carga; o título é a VRAM que a carga
-/// de fato levou, medida nos dois lados do `llama_load_model_from_file`.
+/// feita com o cabeçalho do GGUF antes da carga — a mesma formulação da tela de
+/// memória; o título é a VRAM que a carga de fato levou, medida nos dois lados
+/// do `llama_load_model_from_file`.
 function alojamento(
   alojado: Alojado,
   traduzir: Traduzir,
   idioma: string,
 ): { texto: string; medida: string } {
-  const previsto = alojado.previsto;
-  const texto =
-    previsto.tipo === "inteira"
-      ? traduzir("modelos.placaInteira", {
-          pesos: bytes(previsto.pesos, idioma),
-          kv: bytes(previsto.kv, idioma),
-        })
-      : previsto.tipo === "dividida"
-        ? traduzir("modelos.placaDividida", {
-            camadas: inteiro(previsto.camadas, idioma),
-            total: inteiro(previsto.total, idioma),
-            emRam: bytes(previsto.emRam, idioma),
-          })
-        : traduzir("modelos.placaSistema", {
-            pesos: bytes(previsto.pesos, idioma),
-          });
   return {
-    texto,
+    texto: previsao(alojado.previsto, traduzir, idioma),
     medida: traduzir("modelos.vramCedida", { cedido: bytes(alojado.cedido, idioma) }),
   };
 }

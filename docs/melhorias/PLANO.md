@@ -479,3 +479,39 @@ teste, não o `conectar` vivo. As sondas exigem placa e editor fechado. Os 11
   com teto de 2 s (`:411`) antes de cortar o resto. A pendência tinha nota de "só
   verificável com o app aberto" — falsa: o teste novo usa o `publicador()` da
   suíte e viu o vermelho (1 falhou, 2,13 s) antes do verde.
+
+## Passagem do maintainer sobre a quinta leva (medido 2026-11-20)
+
+Duas frentes, ambas fechadas sem abrir o aplicativo, sem delegação e sem dono
+novo de arquivo.
+
+- **MCP M5** — `aceitar` lançava uma tarefa por soquete e não registrava ninguém:
+  o `fechar()` esperava só o laço, devolvia "parado", e a conexão aberta antes
+  dele continuava sendo atendida, autenticada pelo token que a tela já esqueceu.
+  Agora o conjunto é do laço, cada conexão cai com o `CancellationToken` e o fecho
+  drena com teto de 2 s dentro dos 5 s da saída (`MCP.md`, M5). O teste novo é
+  auto-provado: exige resposta antes do fecho (prova a aceitação), exige a
+  conexão de pé depois dela (prova que há o que drenar) e decide pelo que o
+  cliente lê, não pelo que a tarefa devolve.
+- **FFI #39, continuação** — o `Embutidor` calcula o `Despacho` desde o lote e
+  nenhum byte dele chegava à tela: os dois `git grep -c` medidos em `FFI.md`
+  (núcleo e frente, na HEAD `3a4dc4c`) não devolvem nenhuma linha. O chip de
+  memória dizia "na placa" igual para a carga contada na VRAM livre e para a que
+  subiu inteira porque o cabeçalho não fechou — tentativa apresentada como medida.
+  O veredito agora atravessa o espelho, o `Estado`, o JSON e a tela, com a
+  formulação do `ModelManager` extraída para `previsao()` em `display.ts` em vez
+  de copiada (`FFI.md`, "#39 (continuação)"). Nenhuma chave de i18n nova; nenhum
+  número inventado quando a conta não pôde ser feita — o chip mostra o motivo
+  real do parser, na classe de aviso que o `AdaptadoresDialog` já usa.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **560 passaram, 0
+falharam, 11 ignored, finished in 4.28 s** (um teste por item);
+`cargo test --lib ai::memoria` → **33, 0,41 s**; `cargo test --lib mcp::servidor`
+→ **12, 0,12 s**; `cargo check --all-targets` → **zero avisos**;
+`npm run build` → **OK, `✓ built in 182 ms`**, sem aviso de chunk.
+
+O que continua fora do alcance, e não foi tocado: a carga real do codificador e
+do LLM (pesos + placa + `llama.dll`), o pino das DLLs com as três bibliotecas em
+disco, o `desligar` de 5 s contra um servidor teimoso e qualquer verificação no
+aplicativo aberto. Os 11 `ignored` são os do aperto de mão TLS, que pedem servidor
+na rede.

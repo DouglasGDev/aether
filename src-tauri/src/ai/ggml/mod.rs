@@ -449,7 +449,8 @@ fn device_de_embutir(dispositivos: &[InfoDevice]) -> Option<(usize, String, bool
 /// houve conta, o motivo real dela não ter acontecido. É o espelho do
 /// `Acelerador` do caminho de conversa (`engine.rs`): número medido e motivo
 /// retido, nunca um `-1` sem procedência.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Despacho {
     /// O `n_gpu_layers` que vai para `llama_model_default_params`.
     pub camadas_gpu: c_int,

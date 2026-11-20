@@ -3,8 +3,10 @@
 Itens: **#39** (despacho do embutidor medido, não prescrito), **A9** (dead code
 `Motor::versao` / `Ggml::versao`), **A8** (o `expect` do pino das DLLs).
 
-Dono dos arquivos: só `src-tauri/src/ai/ggml/`. Nada fora deste diretório foi
-editado; o que precisa de edição fora está em *Follow-ups* no fim.
+Dono dos arquivos do lote: só `src-tauri/src/ai/ggml/`. Nada fora deste diretório
+foi editado pelo lote; o que precisava de edição fora está em *Follow-ups* no fim
+— e a continuação do maintainer, logo abaixo do #39, é justamente essa edição
+fora, feita depois do lote.
 
 ## Linha de base medida antes do lote
 
@@ -171,6 +173,78 @@ panicar. Comandos e saídas em *Medições do lote*.
 Sem chave i18n nova: o motivo reusa `erros.motorDllNaoAbriu`, que já está nos dois
 idiomas.
 
+## #39 (continuação, maintainer) — o veredito do codificador chega à tela
+
+O item 1 dos *Follow-ups* abaixo, fechado. Não é edição deste diretório: o
+`Despacho` nasce aqui, mas quem o escondeia é `ai/memoria.rs` e a frente.
+
+**Defeito (lido).** #39 pôs no `Embutidor` o `despacho` com as três coisas que
+importam — o `n_gpu_layers` entregue à biblioteca, o veredito que o contou e o
+motivo de ele não ter sido contado. Nada disso saía do processo: baseline medida
+antes desta passagem, `git grep -c "despacho" HEAD -- src-tauri/src/ai/memoria.rs`
+e `git grep -c "despacho\|camadasGpu" HEAD -- src/lib src/components src/App.tsx`
+não devolvem **nenhuma linha**. O espelho que a tela de memória lê (`InfoMotor`)
+copiava cinco campos e não o sexto, então o chip dizia "na placa" do mesmo jeito
+para duas cargas que não significam a mesma coisa: a que dividiu as camadas por
+conta feita na VRAM livre, e a que jogou todas para cima porque o cabeçalho do
+GGUF não fechou — o caso em que `engine.rs:386` decide "placa primeiro, com o
+motivo na mão", e o motivo era perdido exatamente aqui.
+
+**Correção.** O veredito atravessa os três degraus que faltavam, sem vocabulário
+novo:
+
+- `Despacho` entra para o serde com o mesmo camelCase do resto (`mod.rs:452`);
+- `InfoMotor` ganha `despacho: Despacho` (`memoria.rs:1552`), copiado de
+  `c.embutidor.despacho` no mesmo bloco que já copia o dispositivo, no instante
+  da carga (`memoria.rs:1762`) — a ordem `carregado` → `info_motor` do task #40
+  está preservada, porque a cópia continua dentro do `if let Some(c)`;
+- `Estado` ganha `despacho: Option<Despacho>` (`memoria.rs:1514`), lido do
+  espelho (`memoria.rs:2112`) e nunca do lock do motor — a lição de #40 continua
+  valendo: `estado()` não espera a varredura;
+- a frente espelha o contrato: `Despacho` em `types.ts:239`, `despacho` em
+  `EstadoMemoria` (`types.ts:887`);
+- a **formulação** do veredito sai de dentro do `ModelManager` e vira
+  `previsao()` em `display.ts:145`. Era uma função local com as três frases
+  (`modelos.placaInteira` / `placaDividida` / `placaSistema`); duplicá-la na tela
+  de memória seria ter duas versões para a mesma conta — o mesmo motivo pelo qual
+  `useJobs` e `Regua` existem. `ModelManager.tsx:24-33` agora só acrescenta a
+  `medida` (o `vramCedida`, que é do LLM e não do codificador);
+- `MemoriaDialog.tsx:296-300` mostra o chip ao lado do de dispositivo: veredito
+  lido → a frase de sempre; veredito ausente → o motivo do núcleo, com o ícone de
+  aviso e a classe `memoria-chip aviso` que o `AdaptadoresDialog.tsx:235` já usa
+  para "aparece, mas não se faz de capacidade" (`styles.css:4135`).
+
+Nenhuma chave de i18n nova, nenhum texto inventado: quando a conta não pôde ser
+feita a tela repete o erro real que `alojamento::fichar` devolveu, já traduzido
+pelas chaves do próprio parser.
+
+**Medido.** Vermelho desta vez é compilação, não asserção: sem o campo não havia
+o que conferir, e o teste novo (`o_despacho_do_codificador_aparece_no_estado`,
+`memoria.rs:2591`) não existia antes dele. O que o teste confere, agora:
+
+- carga nenhuma → `despacho` é `None`, e a tela não tem o que inventar;
+- o espelho escrito com um `Dividida` de 10 de 24 camadas → o `estado()` devolve
+  o mesmo `Despacho`, byte a byte (`assert_eq!`), e o JSON traz `camadasGpu`,
+  `previsto.tipo = "dividida"` e `previsto.emRam` — os nomes que `types.ts`
+  declara, pinados aqui porque o chip escolhe a palavra por eles;
+- `previsto: None` com o sentinela `CAMADAS_NA_GPU` e um motivo → o motivo chega
+  junto. É a asserção que impede a regressão que abriu este item: perder o motivo
+  é o que faria uma tentativa parecer medida.
+
+Gates: `cd src-tauri && cargo test --lib ai::memoria` → **33 passaram, 0
+falharam, finished in 0.41 s**; `cargo test --lib` → **560 passaram, 0 falharam,
+11 ignored, finished in 4.28 s**; `cargo check --all-targets` → **zero avisos**;
+`npm run build` → **OK, `✓ built in 182 ms`**, sem aviso de chunk.
+
+**ALEGADO, não medido aqui:** (1) a linha que copia o despacho na carga
+(`memoria.rs:1762`) só roda quando um codificador entra na memória — pesos,
+`llama.dll` e placa, tudo proibido nesta passagem; o que está provado é o trecho
+espelho → estado → JSON, e a cópia é leitura de código. (2) O chip nunca foi visto
+num navegador: sem abrir o aplicativo não há render. O que se sabe dele é o CSS
+citado e o type-check; a contagem de como ele quebra em `memoria-chips` (que tem
+`flex-wrap`, `styles.css:4106`) com um motivo comprido é inferida do estilo, não
+observada.
+
 ## O que eu não pude medir, e por quê
 
 - **A carga real do codificador não rodou.** O task proíbe abrir o aplicativo,
@@ -206,18 +280,15 @@ motivo do pino; o motivo do codificador sem ficha é o texto que o próprio
 
 ## Follow-ups fora da minha posse
 
-1. **`src/ai/memoria.rs:1537` (`struct InfoMotor`) e `1483` (`struct Estado`)** —
-   o `Embutidor` agora carrega `despacho: Despacho` (`camadas_gpu`, `previsto`,
-   `motivo`) e a tela não mostra nada disso. Faltam: um `previsto: Option<Alojamento>`
-   e um `motivo: Option<String>` em `InfoMotor`, copiados de
-   `c.embutidor.despacho` no bloco que já copia `dispositivo`/`na_placa`
-   (memoria.rs:1746-1752), e os dois campos correspondentes em `Estado`,
-   preenchidos em `estado()` (memoria.rs:2087-2091). O texto do veredito dividido
-   não precisa de chave nova: `bancada.previsao.dividida` / `modelos.placaDividida`
-   já formatam um `Alojamento`.
-2. **`src/ai/memoria.rs:1723`** — se o mantenedor quiser o motivo do codificador
-   na tela de memória sem mexer em `Estado`, o `erro` já existe lá
-   (memoria.rs:2104) e é o canal natural para o `motivo` de um despacho não medido.
+1. ~~**`src/ai/memoria.rs:1537` (`struct InfoMotor`) e `1483` (`struct Estado`)**~~
+   — **fechado pelo maintainer**, na seção "#39 (continuação)" acima. Os campos
+   vieram como um `Despacho` inteiro (`Option<Despacho>` no `Estado`), não como
+   `previsto` + `motivo` soltos: é a mesma estrutura que o núcleo já calcula, e a
+   frente não precisa de duas declarações para uma coisa só. Nenhuma chave nova.
+2. ~~**`src/ai/memoria.rs:1723`** — o `erro` do `Estado` como canal para o motivo
+   de um despacho não medido~~ — **não usado**: com o item 1 fechado o motivo tem
+   campo próprio, e o `erro` da tela de memória continua sendo só o da varredura.
+   Misturar os dois faria uma recusa de placa parecer falha de índice.
 3. **Versão da biblioteca na tela** — se a opção ligada do A9 for desejada, o
    lugar é `Acelerador` (engine.rs:258) e `InfoMotor` (memoria.rs:1537), com o
    `llama_version` voltando como campo de `Ggml`. Eu removi porque, sem esses dois

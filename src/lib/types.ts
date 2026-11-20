@@ -231,6 +231,17 @@ export interface Alojado {
   cedido: number;
 }
 
+/// O despacho de um carregamento: o `n_gpu_layers` entregue à biblioteca, a
+/// conta que o produziu e, quando a conta não pôde ser feita, o motivo dela.
+/// Espelho do `Despacho` do núcleo — as duas pontas do mesmo número, o do
+/// modelo de conversa (`acelerador`) e o do codificador (`despacho`), nunca com
+/// vocabulários diferentes.
+export interface Despacho {
+  camadasGpu: number;
+  previsto: Alojamento | null;
+  motivo: string | null;
+}
+
 export interface Acelerador {
   /** "gpu" ou "cpu" — o que foi usado, não o que foi pedido. */
   tipo: "gpu" | "cpu";
@@ -870,6 +881,10 @@ export interface EstadoMemoria {
   conversas: number;
   /// Dos `indexados`, quantos saíram de conversa e não de arquivo.
   trechosConversas: number;
+  /// Quantas camadas do codificador foram para a placa, com a conta que as
+  /// contou ou o motivo de não ter havido conta. `null` é "nenhum codificador
+  /// carregado nesta execução" — não é zero, e não é placa.
+  despacho: Despacho | null;
   bytes: number;
   indexando: boolean;
   progresso: ProgressoMemoria;

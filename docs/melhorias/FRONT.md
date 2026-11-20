@@ -71,7 +71,7 @@ nenhum `.rs`, nenhum outro componente foi editado.
   `useCallback([])` inalterado; ref estável. tsc OK.
 
 ### F4 [MED] `message()` mostrava `"{}"` para um `Error`
-- `src/lib/api.ts:215-221` — trata `string`, depois `Error` (`error.message`), depois
+- `src/lib/api.ts:210-216` — trata `string`, depois `Error` (`error.message`), depois
   o fallback `JSON.stringify(error)` para as outras formas.
 - **Por quê:** `JSON.stringify(new Error(...))` devolve `"{}"`, exibido verbatim em
   toda faixa de falha. A mensagem real do `Error` é o que a pessoa precisa ler.

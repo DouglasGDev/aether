@@ -14,7 +14,7 @@
 //! de `pastas.json`.
 
 use super::catalog::{self, ModelSpec};
-use super::ggml::Embutidor;
+use super::ggml::{Despacho, Embutidor};
 use crate::idiomas::tr;
 use crate::local::pastas::Pastas;
 use anyhow::{Context, Result, bail};
@@ -1507,6 +1507,11 @@ pub struct Estado {
     /// Dos `indexados`, quantos vieram de conversa e não de arquivo. É o número
     /// que diz se a memória de conversa está realmente montada.
     pub trechos_conversas: usize,
+    /// Quantas camadas do codificador subiram para a placa, com o veredito que as
+    /// contou e, quando não houve conta, o motivo. `None` é "nenhum codificador
+    /// carregado nesta execução" — a mesma distinção que `Acelerador` faz no
+    /// caminho de conversa: número medido e tentativa sem medida não se parecem.
+    pub despacho: Option<Despacho>,
     /// Bytes do arquivo de índice, medidos no disco.
     pub bytes: u64,
     pub indexando: bool,
@@ -1540,6 +1545,11 @@ struct InfoMotor {
     agrupamento: String,
     dimensao: usize,
     lote: usize,
+    /// O despacho com que este codificador foi carregado. Copiado do próprio
+    /// `Embutidor` no mesmo bloco que copia o dispositivo: é a prova de onde o
+    /// `n_gpu_layers` dele saiu, e sem ela a tela mostra a placa sem dizer se a
+    /// carga foi medida ou tentada.
+    despacho: Despacho,
 }
 
 /// O dono da memória. Vive atrás de um `Arc`, porque a varredura corre numa
@@ -1749,6 +1759,7 @@ impl Custodio {
                     agrupamento: c.embutidor.agrupamento.to_string(),
                     dimensao: c.embutidor.dimensao(),
                     lote: c.embutidor.limite(),
+                    despacho: c.embutidor.despacho.clone(),
                 });
             }
         }
@@ -2098,6 +2109,7 @@ impl Custodio {
             arquivos: disco.arquivos,
             conversas: disco.conversas,
             trechos_conversas: disco.trechos_conversas,
+            despacho: vivo.as_ref().map(|c| c.despacho.clone()),
             bytes: std::fs::metadata(&self.caminho_indice).map(|m| m.len()).unwrap_or(0),
             indexando: self.esta_indexando(),
             progresso: self.progresso(),
@@ -2567,6 +2579,84 @@ mod testes {
                 .is_ok();
             assert!(chegou, "estado() deve ler o espelho, não o lock do motor");
         });
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// O veredito do codificador chega à tela. O `Embutidor` carrega o
+    /// `Despacho` desde #39, mas o espelho que `estado()` lê não tinha o campo:
+    /// a chip dizia "na placa" sem distinguir as camadas contadas na VRAM livre
+    /// das jogadas para cima por os pesos não terem sido lidos. Vermelho desta
+    /// vez é compilação — o campo não existia, e não havia o que asserir.
+    #[test]
+    fn o_despacho_do_codificador_aparece_no_estado() {
+        use crate::ai::alojamento;
+        use crate::ai::ggml::ffi::CAMADAS_NA_GPU;
+
+        let base =
+            std::env::temp_dir().join(format!("aether-memoria-despacho-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let pastas = Arc::new(RwLock::new(Pastas::default()));
+        let custodio = Custodio::novo(&[], &base, &base, base.join("rag.json"), pastas);
+
+        // Sem codificador carregado não há veredito nenhum, e a tela não pode
+        // inventar um: `None` é a resposta, não um zero ou um `-1`.
+        assert!(
+            custodio.estado(false).despacho.is_none(),
+            "sem carga não há despacho para mostrar"
+        );
+
+        let espelho = |despacho: Despacho| InfoMotor {
+            dispositivo: "AMD Radeon RX 9060 XT".to_string(),
+            na_placa: true,
+            agrupamento: "média".to_string(),
+            dimensao: 768,
+            lote: 512,
+            despacho,
+        };
+
+        // A placa medida e a conta feita: o estado devolve o mesmo despacho, com
+        // as camadas que a carga recebeu.
+        let dividido = Despacho {
+            camadas_gpu: 10,
+            previsto: Some(alojamento::Alojamento::Dividida {
+                camadas: 10,
+                total: 24,
+                na_placa: 4 << 30,
+                em_ram: 2 << 30,
+                livre: 5 << 30,
+            }),
+            motivo: None,
+        };
+        *custodio.info_motor.write().expect("espelho do motor envenenado") =
+            Some(espelho(dividido.clone()));
+        let lido = custodio
+            .estado(false)
+            .despacho
+            .expect("o despacho do espelho chega ao estado");
+        assert_eq!(lido, dividido, "o estado devolve o despacho carregado");
+
+        // O nome que a frente lê: camelCase, com o `tipo` da variante. Pinado
+        // aqui porque `types.ts` declara as três formas e o card escolhe a
+        // palavra por elas.
+        let json = serde_json::to_value(custodio.estado(false)).expect("estado serializa");
+        assert_eq!(json["despacho"]["camadasGpu"], 10);
+        assert_eq!(json["despacho"]["previsto"]["tipo"], "dividida");
+        assert_eq!(json["despacho"]["previsto"]["emRam"], 2u64 << 30);
+
+        // A conta que não pôde ser feita: o sentinela vai junto com o motivo
+        // real. Perder o motivo é o que faria uma tentativa parecer medida.
+        let sem_conta = Despacho {
+            camadas_gpu: CAMADAS_NA_GPU,
+            previsto: None,
+            motivo: Some("o arquivo não declara block_count".to_string()),
+        };
+        *custodio.info_motor.write().expect("espelho do motor envenenado") =
+            Some(espelho(sem_conta.clone()));
+        let lido = custodio
+            .estado(false)
+            .despacho
+            .expect("uma tentativa também é estado");
+        assert_eq!(lido, sem_conta, "o motivo da conta impossível chega junto");
         std::fs::remove_dir_all(&base).ok();
     }
 

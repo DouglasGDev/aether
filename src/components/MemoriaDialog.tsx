@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, message, onMemoriaEvent, onModelEvent } from "../lib/api";
-import { MODO_KEY, ORIGEM_KEY, bytes, data, dataCurta, numero } from "../lib/display";
+import { MODO_KEY, ORIGEM_KEY, bytes, data, dataCurta, numero, previsao } from "../lib/display";
 import { useIdioma, useT, type Traduzir } from "../lib/i18n";
 import { useJobs, type Job } from "../lib/jobs";
 import type {
@@ -269,6 +269,13 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
   /// que o índice falhou.
   const falha = erro ?? estado.erro;
 
+  /// O veredito com que o codificador foi carregado, nas mesmas palavras do
+  /// gerenciador de modelos. `lugar` nulo com `motivo` cheio é a carga que subiu
+  /// inteira sem que a conta pudesse ser feita — tentativa, não medida, e a tela
+  /// diz isso em vez de mostrar a placa como se estivesse tudo certo.
+  const lugar = estado.despacho?.previsto ?? null;
+  const motivo = estado.despacho?.motivo ?? null;
+
   return (
     <div className="modal" role="dialog" aria-modal="true" aria-label={t("memoria.titulo")}>
       <div className="modal-card memoria">
@@ -286,6 +293,12 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
                 : t("memoria.naPlaca")
               : t("memoria.naCpu")}
           </span>
+          {(lugar !== null || motivo !== null) && (
+            <span className={lugar === null ? "memoria-chip aviso" : "memoria-chip"}>
+              {lugar === null && <Icon name="warning" />}
+              {lugar !== null ? previsao(lugar, t, idioma) : motivo}
+            </span>
+          )}
           <span className="memoria-chip">
             {t("memoria.agrupamento")} {estado.agrupamento}
           </span>
