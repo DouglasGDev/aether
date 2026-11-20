@@ -472,7 +472,10 @@ teste, não o `conectar` vivo. As sondas exigem placa e editor fechado. Os 11
   prazo do comando (`terminal` roda minutos por design). O que falta é
   cancelamento visível na tela, não um `timeout` que mataria o trabalho do
   usuário.
-- **`mcp/servidor.rs` `aceitar`** cria uma tarefa por soquete sem dono nenhum:
-  `fechar()` cancela o token e espera a tarefa do listener, mas as conexões em
-  curso não estão registradas. Fechar pede `JoinSet` + dreno com limite — e é a
-  única pendência que sobra na frente MCP.
+- ~~**`mcp/servidor.rs` `aceitar`** cria uma tarefa por soquete sem dono nenhum~~
+  — **fechado** (`MCP.md`, M5): o `JoinSet` é do laço (`servidor.rs:424`), cada
+  soquete entra por `conectar` (`:445`) e cai junto com o servidor porque a
+  conexão também seleciona `parada.cancelled()` (`:489`); `drenar` (`:497`) espera
+  com teto de 2 s (`:411`) antes de cortar o resto. A pendência tinha nota de "só
+  verificável com o app aberto" — falsa: o teste novo usa o `publicador()` da
+  suíte e viu o vermelho (1 falhou, 2,13 s) antes do verde.

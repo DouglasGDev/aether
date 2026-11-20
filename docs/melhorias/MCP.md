@@ -1,7 +1,7 @@
 # MCP — as duas portas do mesmo cadastro
 
 Dono: maintainer. Frente sobre o servidor MCP que o próprio aplicativo publica e
-sobre o cliente que instala os servidores do catálogo. Três defeitos, cada um
+sobre o cliente que instala os servidores do catálogo. Cinco defeitos, cada um
 visto vermelho antes da correção.
 
 ## M1 — um npm que só fala em stderr prendia o instalador para sempre
@@ -154,6 +154,75 @@ realmente mudo exigem fechar a janela do aplicativo, o que estava proibido nesta
 passagem. O que está medido é o `dentro_do_prazo` com prazos de teste; o valor
 `45` é escolha documentada, não algo que a suíte espera.
 
+## M5 — o servidor caía e a conexão aberta continuava sendo atendida
+
+**Defeito (lido).** `aceitar` ouvia a placa e, para cada soquete aceito, chamava
+`tokio::spawn` sem registrar a tarefa em lugar nenhum. `fechar` (`servidor.rs:198`)
+promete outra coisa — "cancela o laço de aceitação, espera a tarefa sair e só então
+solta a porta" — e essa promessa só alcançava o laço: a tarefa do listener
+(`servidor.rs:204`) voltava, o `fechar` devolvia `true`, a tela registrava
+"parado", e uma conexão aberta antes do fecho continuava viva dentro de uma tarefa
+órfã. Pior: aquela tarefa não selecionava o `CancellationToken` nenhum — o
+cancelamento era conferido entre aceitações, nunca dentro de uma conexão — então
+um cliente keep-alive com a soquete de pé era servido para sempre por um servidor
+que o aplicativo já declarava derrubado, ainda autenticado pelo token antigo que a
+tela esqueceu. Não é só higiene: `desligar` do aplicativo tem 5 s para derrubar o
+gerente inteiro (`lib.rs:252`) e o servidor MCP é uma das coisas que ele derruba.
+
+**Correção.** O conjunto de conexões passa a ser do laço, e o laço é esperado:
+
+- `conexoes: tokio::task::JoinSet<()>` criado no topo do `aceitar`
+  (`servidor.rs:424`) e dreno antes de devolver (`servidor.rs:438`);
+- `conectar` (`servidor.rs:445`) registra em vez de soltar: `conexoes.spawn`
+  (`servidor.rs:460`). Um erro de aceitação continua sendo um pacote fora do
+  lugar, não a morte do servidor — o `let Ok(..) else { return }` preserva o
+  comportamento que já existia no `match` antigo (`servidor.rs:452`);
+- cada conexão também cai com o servidor: o `serve_connection` entra num
+  `tokio::select!` ao lado de `parada.cancelled()` (`servidor.rs:465-490`),
+  porque uma soquete pendurada no meio de um pedido não é razão para o fecho não
+  acontecer;
+- as que terminam saem do conjunto enquanto o laço ainda aceita
+  (`servidor.rs:433`), senão a lista só cresceria até o `fechar`;
+- `drenar` (`servidor.rs:497`) espera o que está em curso com teto
+  (`PRAZO_DRENO`, 2 s em `servidor.rs:411`) e, estourado, corta o resto com
+  `conexoes.shutdown()` (`servidor.rs:503`) — o `fechar` do aplicativo não fica
+  refém de um cliente mudo do outro lado da loopback. Os dois segundos cabem nos
+  cinco de `lib.rs:252` com folga, e é por isso que o valor é 2.
+
+**Medido.** Vermelho, com o teste da árvore contra o comportamento de antes (spawn
+solto, sem `parada` e sem dreno):
+`cd src-tauri && cargo test --lib mcp::servidor::tests::fechar_corta` →
+**`test result: FAILED. 0 passed; 1 failed; finished in 2.13 s`**, pânico
+`fechar devolveu com a conexão em curso viva: nada chegou e nada foi fechado`.
+Verde, hoje: `cargo test --lib mcp::servidor` → **12 passaram, 0 falharam,
+finished in 0.12 s**.
+
+O teste (`fechar_corta_a_conexao_que_ja_estava_aberta`, `servidor.rs:709`) é
+auto-provado de propósito, nas três leituras que faz:
+
+1. um `GET /mcp` com o bearer precisa **ser respondido** antes do `fechar` — sem
+   isso o teste passaria pelo motivo errado, porque a soquete nunca teria chegado
+   ao servidor;
+2. a conexão tem de continuar **de pé** depois da resposta — uma queda antes do
+   fecho não deixaria nada para drenar, e o verde seria a porta do SO;
+3. depois de `fechar`, o que decide é o que o **cliente lê** (EOF ou reset), não o
+   que a tarefa do laço devolve.
+
+A segunda leitura é um laço tolerante porque foi medida, não suposta: um `GET`
+na placa responde `405 Method Not Allowed` com `content-length: 18` e o corpo
+chega numa leitura posterior. Uma asserção ingênua de "o servidor não empurra
+nada sem pedido" reprovava um servidor correto — o `assert!(!caiu, ...)` da
+árvore só conta FIN ou reset como queda.
+
+**Correção de nota anterior.** Esta frente estava registrada como pendência "só
+verificável com o app aberto". **Falso**: `publicador()` + `abrir()` já exercitam
+o laço inteiro numa porta efêmera de loopback, pelo mesmo caminho do teste antigo
+`abrir_e_idempotente_e_fechar_solta_a_porta`. O que continua **ALEGADO**, e não
+medido aqui: o estouro do teto de 2 s contra um `tools/call` comprido de verdade e
+o `desligar` dentro dos 5 s reais de `lib.rs:252` — o teste fecha uma conexão que
+não está no meio de um trabalho, então o ramo do `shutdown()` é lido do fonte, não
+cronometrado.
+
 ## Gates
 
 `cd src-tauri && cargo test --lib` → **548 passaram, 0 falharam, 11 ignored,
@@ -164,3 +233,10 @@ Quarta passagem (medido 2026-11-20, com M4 na árvore):
 `cd src-tauri && cargo test --lib` → **558 passaram, 0 falharam, 11 ignored,
 finished in 4.98 s**; o recorte `mcp::manager` são **4 testes, 0,06 s**.
 `cargo check --all-targets` → **zero avisos**.
+
+Quinta passagem (medido 2026-11-20, com M5 na árvore):
+`cd src-tauri && cargo test --lib` → **559 passaram, 0 falharam, 11 ignored,
+finished in 4.22 s** (o um novo é o teste de M5); `cargo test --lib mcp::servidor`
+→ **12 passaram, 0 falharam, finished in 0.12 s**.
+`cargo check --all-targets` → **zero avisos, zero erros**; `npm run build` →
+**OK, sem aviso** (`✓ built in 176 ms`).

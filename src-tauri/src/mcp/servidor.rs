@@ -46,7 +46,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -403,57 +404,103 @@ fn token_novo() -> Result<String> {
 
 type Servico = StreamableHttpService<Manipulador, LocalSessionManager>;
 
+/// O teto da despedida. `fechar` é chamado pela tela e pela saída do aplicativo,
+/// e a saída tem cinco segundos para o gerente inteiro (`lib.rs:252`): os dois
+/// segundos de cortesia abaixo cabem nesse prazo de fora com folga, e o que
+/// sobrar é cortado antes de estourá-lo.
+const PRAZO_DRENO: Duration = Duration::from_secs(2);
+
 /// O laço de aceitação. Uma conexão por tarefa: um cliente que trava no meio de
-/// um `tools/call` não pode levar a porta junto.
+/// um `tools/call` não pode levar a porta junto. E uma tarefa por conexão não é
+/// uma tarefa sem dono: o conjunto é esperado antes do laço devolver, porque
+/// `fechar` promete que o servidor publicado caiu — a porta e as conexões que já
+/// estavam abertas.
 async fn aceitar(
     listener: TcpListener,
     base: Servico,
     token: Arc<String>,
     cancelamento: CancellationToken,
 ) {
+    let mut conexoes: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = cancelamento.cancelled() => break,
-            aceito = listener.accept() => match aceito {
-                Ok((soquete, _remoto)) => {
-                    let um = base.clone();
-                    let esperado = Arc::clone(&token);
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(soquete);
-                        let _ = Builder::new()
-                            .serve_connection(
-                                io,
-                                service_fn(move |pedido: Request<Incoming>| {
-                                    // O serviço é clonado a cada pedido, como o
-                                    // próprio rmcp faz: é um `Service` de estado
-                                    // compartilhado (fábrica de manipuladores,
-                                    // gerente de sessões, configuração), e um
-                                    // fechamento não pode devolver uma futura que
-                                    // empresta o que ele captura.
-                                    let mut um = um.clone();
-                                    let esperado = Arc::clone(&esperado);
-                                    async move {
-                                        // O token é conferido antes de se ler o
-                                        // corpo: a um pedido negado o servidor nem
-                                        // olha o que lhe mandaram.
-                                        if !autorizado(&esperado, pedido.headers()) {
-                                            return Ok::<_, Infallible>(negado());
-                                        }
-                                        <Servico as tower_service::Service<
-                                            Request<Incoming>,
-                                        >>::call(&mut um, pedido)
-                                        .await
-                                    }
-                                }),
-                            )
-                            .await;
-                    });
-                }
-                // Um erro de aceitação é um pacote fora do lugar, não o fim do
-                // servidor: quem ouve a placa continua ouvindo.
-                Err(_) => continue,
+            aceito = listener.accept() => {
+                conectar(&mut conexoes, aceito, &base, &token, &cancelamento);
+            }
+            // As que se serviram saem do conjunto enquanto o laço continua: sem
+            // isto a lista só cresceria até o fecho.
+            terminou = conexoes.join_next(), if !conexoes.is_empty() => {
+                let _ = terminou;
             }
         }
+    }
+    drenar(&mut conexoes).await;
+}
+
+/// Um soquete aceito vira uma tarefa dentro do conjunto, e o conjunto é do laço.
+/// Uma conexão por tarefa porque um cliente que trava no meio de um `tools/call`
+/// não pode levar a porta junto; a tarefa registrada porque nenhuma delas pode
+/// sobreviver ao `fechar`.
+fn conectar(
+    conexoes: &mut tokio::task::JoinSet<()>,
+    aceito: std::io::Result<(TcpStream, SocketAddr)>,
+    base: &Servico,
+    token: &Arc<String>,
+    cancelamento: &CancellationToken,
+) {
+    let Ok((soquete, _remoto)) = aceito else {
+        // Um erro de aceitação é um pacote fora do lugar, não o fim do servidor:
+        // quem ouve a placa continua ouvindo.
+        return;
+    };
+    let um = base.clone();
+    let esperado = Arc::clone(token);
+    let parada = cancelamento.clone();
+    conexoes.spawn(async move {
+        let io = TokioIo::new(soquete);
+        // A conexão cai junto com o servidor, sem esperar que o cliente pendure
+        // a soquete: um keep-alive parado no meio do pedido não é razão para o
+        // fecho não acontecer.
+        let _ = tokio::select! {
+            servido = Builder::new().serve_connection(
+                io,
+                service_fn(move |pedido: Request<Incoming>| {
+                    // O serviço é clonado a cada pedido, como o próprio rmcp
+                    // faz: é um `Service` de estado compartilhado (fábrica de
+                    // manipuladores, gerente de sessões, configuração), e um
+                    // fechamento não pode devolver uma futura que empresta o
+                    // que ele captura.
+                    let mut um = um.clone();
+                    let esperado = Arc::clone(&esperado);
+                    async move {
+                        // O token é conferido antes de se ler o corpo: a um
+                        // pedido negado o servidor nem olha o que lhe mandaram.
+                        if !autorizado(&esperado, pedido.headers()) {
+                            return Ok::<_, Infallible>(negado());
+                        }
+                        <Servico as tower_service::Service<
+                            Request<Incoming>,
+                        >>::call(&mut um, pedido)
+                        .await
+                    }
+                }),
+            ) => servido,
+            _ = parada.cancelled() => Ok(()),
+        };
+    });
+}
+
+/// Espera as conexões em curso sem prometer esperar por sempre. Cai fora do
+/// prazo, corta o que sobrou e pronto — o `fechar` do aplicativo não fica
+/// refém de um cliente mudo do outro lado da loopback.
+async fn drenar(conexoes: &mut tokio::task::JoinSet<()>) {
+    let coube = tokio::time::timeout(PRAZO_DRENO, async {
+        while conexoes.join_next().await.is_some() {}
+    })
+    .await;
+    if coube.is_err() {
+        conexoes.shutdown().await;
     }
 }
 
@@ -652,6 +699,74 @@ mod tests {
             !publicador.fechar().await.expect("fecha de novo"),
             "não havia o que fechar"
         );
+    }
+
+    /// `fechar` promete a porta solta e nenhum trabalho em curso. A aceitação
+    /// esperava a si mesma, mas cada soquete era uma tarefa órfã: aberta antes do
+    /// fecho, ela sobrevivia e continuava atendendo pela mesma conexão. A prova é
+    /// pelo que o cliente lê depois do `fechar`, não pelo que o laço devolve.
+    #[tokio::test]
+    async fn fechar_corta_a_conexao_que_ja_estava_aberta() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (publicador, _) = publicador(AgentMode::FullAccess);
+        let (estado, token) = publicador.abrir().await.expect("abre");
+        let mut soquete = tokio::net::TcpStream::connect(("127.0.0.1", estado.porta))
+            .await
+            .expect("soquete na placa publicada");
+        // Um pedido completo, com a linha em branco que o fecha. A resposta é a
+        // prova de que a aceitação viu esta soquete antes do fecho: sem ela, o
+        // teste poderia passar porque a conexão nunca chegou ao servidor.
+        soquete
+            .write_all(
+                format!(
+                    "GET /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("escreve o pedido");
+        let mut corpo = [0u8; 256];
+        let respondido = soquete
+            .read(&mut corpo)
+            .await
+            .expect("o servidor responde ao pedido");
+        assert!(
+            respondido > 0,
+            "a conexão não foi aceita: nada respondeu antes do fecho"
+        );
+
+        // E ela continua de pé depois da resposta — é uma conexão aberta,
+        // não um pedido descartado. O que ainda vier é corpo, e corpo não conta
+        // como queda.
+        let mut caiu = false;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), soquete.read(&mut corpo)).await
+            {
+                Err(_) => break,
+                Ok(Ok(0)) => {
+                    caiu = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => {
+                    caiu = true;
+                    break;
+                }
+            }
+        }
+        assert!(!caiu, "a conexão caiu antes de fechar: não havia o que drenar");
+
+        publicador.fechar().await.expect("fecha");
+
+        match tokio::time::timeout(Duration::from_secs(2), soquete.read(&mut corpo)).await {
+            Err(_) => panic!(
+                "fechar devolveu com a conexão em curso viva: nada chegou e nada foi fechado"
+            ),
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("fechar e a conexão ainda entregou {n} bytes"),
+            // Um reset também é o servidor tendo soltado a soquete.
+            Ok(Err(_)) => {}
+        }
     }
 
     #[tokio::test]
