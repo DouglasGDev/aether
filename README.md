@@ -79,11 +79,17 @@ movido se um hash divergir. Veja
 
 ## O que ele faz
 
-- **Catálogo de modelos** — 35 variantes GGUF em duas famílias: Granite 4.2
-  (3B e 8B, Apache-2.0) e Ornith 1.5 9B (MIT, janela de 262 mil, o modelo de
-  programação), mais 2 quants do Qwen3-Embedding 0.6B. Cada tamanho é lido do
-  `tree/main` do HuggingFace, arquivo por arquivo, e cada família é conferida
-  contra a tabela de arquiteturas da `llama.dll` vendorizada. Download
+- **Catálogo de modelos** — 44 variantes GGUF em quatro famílias de conversa:
+  Granite 4.2 (3B e 8B, Apache-2.0), Ornith 1.5 9B (MIT, janela de 262 mil, o
+  modelo de programação), Qwen3.5 (4B e 9B, Apache-2.0, mesma arquitetura
+  `qwen35` do Ornith e o mesmo tokenizador, medido nos dois repositórios) e
+  Gemma 4 12B It (Apache-2.0), mais 2 quants do Qwen3-Embedding 0.6B. Cada
+  tamanho é lido do `tree/main` do HuggingFace, arquivo por arquivo, cada soma
+  é o `lfs.oid` publicado, e cada família é conferida contra a tabela de
+  arquiteturas da `llama.dll` vendorizada. As duas famílias novas ainda não
+  rodaram na placa: o que está medido é o cabeçalho de cada arquivo e a
+  arquitetura no binário, não o alojamento nem a qualidade do texto
+  (`docs/melhorias/CATALOGO.md`). Download
   retomável, cancelamento e estado medido em disco. Uma conexão que cai no meio
   do corpo levanta a pedida do ponto onde parou — quatro pedidas no total, com
   1s, 2s e 4s entre elas — e o mesmo caminho serve os pesos, o runtime e a voz;

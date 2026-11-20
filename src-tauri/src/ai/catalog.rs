@@ -141,6 +141,70 @@ macro_rules! ornith {
     };
 }
 
+/// O que cada arquivo destes GGUF declara sobre si, lido do próprio cabeçalho
+/// com `Range: bytes=0-16777215` no `resolve/main` do HuggingFace em
+/// 2026-11-20 — o script e a saída estão em `docs/melhorias/CATALOGO.md`. Nada
+/// aqui veio do cartão do repositório: `general.architecture`,
+/// `general.size_label`, `general.license` e `*.context_length` são o que o
+/// arquivo que roda carrega. A lição da leitura: no GGUF v3 o tipo de um par
+/// chave → valor é `uint32`, não um byte, e um parser que assume o byte pede um
+/// tokenizador de 100.663.296 bytes e falha em silêncio.
+macro_rules! qwen35 {
+    ($size:literal, $tier:expr, $params:expr, $quant:literal, $bytes:expr, $routable:expr) => {
+        ModelSpec {
+            id: concat!("qwen3.5-", $size, "b-", $quant),
+            display: concat!("Qwen3.5 ", $size, "B ", $quant),
+            series: concat!("Qwen3.5 ", $size, "B"),
+            family: "qwen35",
+            tier: $tier,
+            genero: Genero::Conversa,
+            parameters_b: $params,
+            license: "Apache-2.0",
+            quant: $quant,
+            dir: concat!("qwen3.5-", $size, "b"),
+            weights_repo: concat!("unsloth/Qwen3.5-", $size, "B-GGUF"),
+            weights_file: concat!("Qwen3.5-", $size, "B-", $quant, ".gguf"),
+            weights_bytes: $bytes,
+            support_repo: concat!("Qwen/Qwen3.5-", $size, "B"),
+            support_files: &SUPPORT_TOKENIZADOR,
+            query_prefix: None,
+            context_limit: 262_144,
+            routable: $routable,
+        }
+    };
+}
+
+/// O Gemma 4 12B pelo mesmo caminho: arquitetura `gemma4`, licença `apache-2.0`
+/// e janela de 262.144, todas lidas do cabeçalho do arquivo. O template dele
+/// declara chamada de ferramenta, mas com os marcadores próprios do modelo — o
+/// laço do Aether escreve e lê o XML da família `qwen35`, então o que um Gemma 4
+/// faz nesse laço ainda não foi medido com a placa, e isso está registrado como
+/// pendência em `docs/melhorias/CATALOGO.md`, não como capacidade.
+macro_rules! gemma4 {
+    ($quant:literal, $bytes:expr, $routable:expr) => {
+        ModelSpec {
+            id: concat!("gemma-4-12b-it-", $quant),
+            display: concat!("Gemma 4 12B It ", $quant),
+            series: "Gemma 4 12B It",
+            family: "gemma4",
+            tier: Tier::Pesado,
+            genero: Genero::Conversa,
+            parameters_b: 12.0,
+            license: "Apache-2.0",
+            quant: $quant,
+            dir: "gemma-4-12b-it",
+            weights_repo: "unsloth/gemma-4-12b-it-GGUF",
+            weights_file: concat!("gemma-4-12b-it-", $quant, ".gguf"),
+            weights_bytes: $bytes,
+            support_repo: "google/gemma-4-12B-it",
+            support_files: &SUPPORT_TOKENIZADOR,
+            query_prefix: None,
+            context_limit: 262_144,
+            routable: $routable,
+        }
+    };
+}
+
 /// Os pesos do Granite 4.2 3B com a soma que o HuggingFace publica. Cada linha
 /// é `(arquivo, lfs.oid)` lido de
 /// `curl -s https://huggingface.co/api/models/ibm-granite/granite-4.2-3b-GGUF/tree/main`
@@ -195,34 +259,67 @@ const SHA256_ORNITH_GGUF: [(&str, &str); 5] = [
     ("Ornith-1.5-9B-BF16.gguf", "a72af9b7f34727a49e030627092e7ebd782e9c3459a0c95afa4b9a07a8650f50"),
 ];
 
+/// Os pesos do Qwen3.5, lidos do `tree/main` de cada repositório da `unsloth` em
+/// 2026-11-20. O arquivo entra com a soma do `lfs.oid`, como os outros: o que
+/// confere o download é o sha256 publicado, não o tamanho.
+const SHA256_QWEN35_4B_GGUF: [(&str, &str); 4] = [
+    ("Qwen3.5-4B-Q4_K_M.gguf", "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"),
+    ("Qwen3.5-4B-Q5_K_M.gguf", "8814232b85594dcd46c50e5b8b29324a7efe9e746edbe8a3d1df3d3fce7aad39"),
+    ("Qwen3.5-4B-Q6_K.gguf", "fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66"),
+    ("Qwen3.5-4B-Q8_0.gguf", "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"),
+];
+
+const SHA256_QWEN35_9B_GGUF: [(&str, &str); 3] = [
+    ("Qwen3.5-9B-Q4_K_M.gguf", "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"),
+    ("Qwen3.5-9B-Q5_K_M.gguf", "dc2a39aef291f91a9116ad214058da0d86eb648743a124bd8c333787c4b9c91c"),
+    ("Qwen3.5-9B-Q6_K.gguf", "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59"),
+];
+
+const SHA256_GEMMA4_12B_GGUF: [(&str, &str); 2] = [
+    ("gemma-4-12b-it-Q4_K_M.gguf", "0a270ec9fe6b34f4a0d33992b6135117b484ebc4766ab76b51d4ae8c457e4c42"),
+    ("gemma-4-12b-it-Q6_K.gguf", "6f394336500bb5409bd68c31aa9d75097b5e6104f6cf30c82a09a7b64df41faf"),
+];
+
 /// Os pesos do codificador.
 const SHA256_QWEN_EMBEDS_GGUF: [(&str, &str); 2] = [
     ("Qwen3-Embedding-0.6B-Q8_0.gguf", "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"),
     ("Qwen3-Embedding-0.6B-f16.gguf", "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340"),
 ];
 
-/// O único arquivo de apoio que tem soma publicada: o tokenizador rápido do
-/// Ornith e o do codificador são Git LFS, e o `lfs.oid` deles é o sha256 do
-/// conteúdo — conferido baixando os 11.423.705 bytes do `tokenizer.json` da Qwen
+/// Os arquivos de apoio que têm soma publicada: cada `tokenizer.json` abaixo é
+/// Git LFS, e o `lfs.oid` é o sha256 do conteúdo — conferido baixando o arquivo
 /// e somando os bytes servidos (ver `docs/melhorias/M8.md`).
+///
+/// O `5f9e4d49…` aparece duas vezes de propósito, e é isso que o Ornith e o
+/// Qwen3.5 têm em comum: os 12.807.982 bytes do tokenizador são os mesmos dos
+/// dois repositórios, lidos arquivo por arquivo. Não é cópia confiada — é a
+/// mesma soma medida duas vezes, em caminhos diferentes.
 ///
 /// O tokenizador do Granite **não** está aqui de propósito: com 7.153.414 bytes
 /// ele é um blob git comum, então a API devolve só `oid` — o SHA-1 de
 /// `blob <tamanho>\0<conteúdo>`, que conferi byte a byte contra os bytes
 /// servidos. Não existe sha256 publicado desse arquivo, e calcular um a partir
 /// do que se acabou de baixar é fotografia, não verificação. Fica sem conferência
-/// de conteúdo até a soma sair do repositório (pendência no doc).
-const SHA256_APOIO: [(&str, &[(&str, &str)]); 2] = [
+/// de conteúdo até a soma sair do repositório (pendência no doc). O
+/// `tokenizer_config.json` de todos eles está na mesma situação: blob git, sem
+/// sha256 publicado.
+const SHA256_APOIO: [(&str, &[(&str, &str)]); 5] = [
     ("ornith-ai/Ornith-1.5-9B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
+    ("Qwen/Qwen3.5-4B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
+    ("Qwen/Qwen3.5-9B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
+    ("google/gemma-4-12B-it", &[("tokenizer.json", "9788bdb6a021b3170357cd3587b5d622b1177561ad3c5bf43d73728fd71aeacb")]),
     ("Qwen/Qwen3-Embedding-0.6B", &[("tokenizer.json", "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a")]),
 ];
 
 /// Onde cada tabela de pesos mora, pelo nome do repositório — a mesma chave que
 /// a URL de `resolve/main` usa, então uma linha trocada não confere com nada.
-const SHA256_PESOS: [(&str, &[(&str, &str)]); 4] = [
+const SHA256_PESOS: [(&str, &[(&str, &str)]); 7] = [
     ("ibm-granite/granite-4.2-3b-GGUF", &SHA256_GRANITE_3B_GGUF),
     ("ibm-granite/granite-4.2-8b-GGUF", &SHA256_GRANITE_8B_GGUF),
     ("ornith-ai/Ornith-1.5-9B-GGUF", &SHA256_ORNITH_GGUF),
+    ("unsloth/Qwen3.5-4B-GGUF", &SHA256_QWEN35_4B_GGUF),
+    ("unsloth/Qwen3.5-9B-GGUF", &SHA256_QWEN35_9B_GGUF),
+    ("unsloth/gemma-4-12b-it-GGUF", &SHA256_GEMMA4_12B_GGUF),
     ("Qwen/Qwen3-Embedding-0.6B-GGUF", &SHA256_QWEN_EMBEDS_GGUF),
 ];
 
@@ -248,7 +345,7 @@ pub fn apoio_sha256(spec: &ModelSpec, arquivo: &str) -> Option<&'static str> {
     sha256_publicado(spec.support_repo, arquivo)
 }
 
-pub const CATALOG: [ModelSpec; 35] = [
+pub const CATALOG: [ModelSpec; 44] = [
     granite!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_M", 1_835_968_032, false),
@@ -285,6 +382,15 @@ pub const CATALOG: [ModelSpec; 35] = [
     ornith!("Q8_0", 9_786_060_384, true),
     // 18 GB: baixável numa máquina com mais placa, e o roteador não a escolhe.
     ornith!("BF16", 18_407_321_184, false),
+    qwen35!("4", Tier::Leve, 4.0, "Q4_K_M", 2_740_937_888, true),
+    qwen35!("4", Tier::Leve, 4.0, "Q5_K_M", 3_143_656_608, true),
+    qwen35!("4", Tier::Leve, 4.0, "Q6_K", 3_525_956_768, true),
+    qwen35!("4", Tier::Leve, 4.0, "Q8_0", 4_482_403_488, true),
+    qwen35!("9", Tier::Pesado, 9.0, "Q4_K_M", 5_680_522_464, true),
+    qwen35!("9", Tier::Pesado, 9.0, "Q5_K_M", 6_577_841_376, true),
+    qwen35!("9", Tier::Pesado, 9.0, "Q6_K", 7_458_301_152, true),
+    gemma4!("Q4_K_M", 7_121_861_440, true),
+    gemma4!("Q6_K", 9_786_022_720, true),
 ];
 
 pub const EMBEDS: [ModelSpec; 2] = [
@@ -540,14 +646,34 @@ mod tests {
         }
     }
 
+    /// Toda série do catálogo tem de ter pelo menos uma quant escolhível pelo
+    /// roteador: uma série em que nenhuma linha passa o critério de qualidade é
+    /// um modelo que a pessoa vê na tela e o assistente nunca usa sozinho. A
+    /// lista é lida do catálogo, não escrita à mão — entra série nova, o teste
+    /// cobra série nova.
     #[test]
     fn every_size_has_a_routable_baseline() {
         for id in [
             "granite-4.2-3b-Q4_K_M",
             "granite-4.2-8b-Q4_K_M",
             "ornith-1.5-9b-Q4_K_M",
+            "qwen3.5-4b-Q4_K_M",
+            "qwen3.5-9b-Q4_K_M",
+            "gemma-4-12b-it-Q4_K_M",
         ] {
             assert!(find(id).unwrap().routable, "{id} não é escolhível");
+        }
+        let series: Vec<&str> = {
+            let mut v: Vec<&str> = CATALOG.iter().map(|s| s.series).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        for serie in &series {
+            assert!(
+                CATALOG.iter().any(|s| s.series == *serie && s.routable),
+                "a série {serie} não tem nenhuma quant escolhível"
+            );
         }
     }
 

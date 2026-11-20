@@ -691,3 +691,53 @@ cargo test --lib` → **567 passaram, 0 falharam, 11 ignored, finished in 4,79 s
 --all-targets` → **Finished, zero avisos**; `npm run build` → **OK, `✓ built in
 196 ms`**, maior bloco `react` a 210,53 kB, sem aviso de chunk. Nada do Rust
 mudou: `git diff --stat` fecha em 3 arquivos e 8 linhas removidas.
+
+## Passagem do maintainer sobre a nona leva (medido 2026-11-20)
+
+Frente `CATALOGO` (#27), um escritor: `ai/catalog.rs`. Dossiê em
+`CATALOGO.md`. É a frente que dava para fazer inteira sem abrir o app e sem
+carregar peso na placa, porque o que ela precisava conferir estava em dois
+lugares lidos por rede: a árvore de arquivos do HuggingFace e o cabeçalho GGUF
+de cada arquivo.
+
+- **Entraram nove variantes em duas famílias de 2026**: Qwen3.5 4B (Q4_K_M,
+  Q5_K_M, Q6_K, Q8_0), Qwen3.5 9B (Q4_K_M, Q5_K_M, Q6_K) e Gemma 4 12B It
+  (Q4_K_M, Q6_K). `CATALOG` 35 → **44**, `SHA256_PESOS` 4 → **7** repositórios,
+  `SHA256_APOIO` 2 → **5**. Nenhum número veio de cartão de repositório: bytes e
+  `lfs.oid` do `tree/main`, e arquitetura, licença, janela, EOS e template do
+  corpo servido por `Range: bytes=0-16777215`.
+- **A leitura que quase passou errada.** O primeiro parser devolvia um
+  `general.architecture` de 100.663.296 bytes. No GGUF v3 o tipo do par
+  chave → valor é `uint32`, não um byte; ler um byte desalinha três e o resto do
+  cabeçalho vira lixo convincente — as primeiras chaves ainda saem certas.
+- **O portão de entrada é o binário.** `every_entry_is_an_architecture_the_engine_runs`
+  procura `"<família>\0"` na `llama.dll` vendorizada de 3.877.376 bytes (arquivo,
+  não ponteiro LFS) e passou com `qwen35` e `gemma4` dentro. O que ficou de fora
+  tem motivo medido: os GGUFs oficiais da Qwen e do GLM respondem `401` (gated)
+  à API anônima, e o `GLM-5.3-Flash` vem em partes — `-00001-of-00006.gguf` —
+  que o downloader de um arquivo por entrada não junta.
+- **Instrumento novo, vermelho medido por mutação.** `every_size_has_a_routable_baseline`
+  ganhou o laço que varre as séries do próprio `CATALOG`: série nova sem
+  quant escolhível cai sozinha, sem depender de alguém lembrar de escrever o id
+  na lista. Com as duas linhas do Gemma 4 marcadas como não-escolhíveis o teste
+  caiu em `catalog.rs:664`; retirada a id da lista explícita, caiu em
+  `catalog.rs:672`. Mutações revertidas; diff em 133 linhas adicionadas, 7
+  removidas.
+- **Cross-check que saiu de graça:** os 12.807.982 bytes de `tokenizer.json` de
+  `Qwen/Qwen3.5-4B` têm o mesmo `lfs.oid` (`5f9e4d49…`) dos 12.807.982 bytes de
+  `ornith-ai/Ornith-1.5-9B` — lidos um e outro na mesma passada. É a família
+  mesma, conferida por dois caminhos.
+
+Fora do alcance e registrado como tal, em `CATALOGO.md`: alojamento real dos
+pesos novos (o `kv_por_token` de `alojamento.rs:254-269` é teto em arquitetura
+híbrida, e o `gemma4` declara `sliding_window`, `shared_kv_layers` e
+`sliding_window_pattern` que a conta não modela), qualidade de texto e custo por
+rodada, e o que o laço de ferramentas entrega num Gemma 4, cujo template usa
+marcadores próprios e não o XML que o parser lê.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **567 passaram, 0
+falharam, 11 ignored, finished in 5,92 s**; `cargo test --lib catalog` → **27
+passaram, 0 falharam**; `cargo check --all-targets` → **Finished, zero avisos**;
+`npm run build` → **OK, `✓ built in 250 ms`**, maior bloco `react` a 210,53 kB.
+README: a linha do catálogo passou de "35 variantes em duas famílias" para o que
+existe hoje.
