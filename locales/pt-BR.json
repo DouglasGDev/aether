@@ -372,7 +372,7 @@
     "invocado": "Especialista",
     "invocadoNota": "Age só nos trechos em que o token de invocação dele aparece.",
     "dora": "DoRA",
-    "doraNota": "O arquivo traz magnitudes DoRA. A biblioteca desta versão aplica só os pares de deltas e recusa tensor que não seja delta.",
+    "doraNota": "O arquivo traz magnitudes DoRA. A biblioteca deste computador não lê tensor de magnitude — só os pares de deltas —, então a normalização por magnitude fica de fora da montagem.",
     "apagar": "Apagar {nome}"
   },
   "ligacoes": {

@@ -372,7 +372,7 @@
     "invocado": "Gated",
     "invocadoNota": "Acts only in the spans where its invocation token appears.",
     "dora": "DoRA",
-    "doraNota": "The file carries DoRA magnitudes. This library version applies delta pairs only and refuses a tensor that is not a delta.",
+    "doraNota": "The file carries DoRA magnitudes. This computer's library reads no magnitude tensor — only the delta pairs — so the magnitude normalization is left out of the mount.",
     "apagar": "Delete {nome}"
   },
   "ligacoes": {

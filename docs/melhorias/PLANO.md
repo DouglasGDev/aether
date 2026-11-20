@@ -234,14 +234,36 @@ o derrotam:
 - ~~**M8** integridade do download só por tamanho~~ — **fechado na segunda leva**
   (`M8.md`): `download.rs:149` mede o sha256 do arquivo inteiro e o confere com o
   `lfs.oid` publicado antes do `rename`.
-- **#34 DoRA**: detectado mas NÃO aplicado (`adaptadores.rs:61-66` admite que o
-  loader rejeita `.mag`); task #38 "completed" exagera. LoRA mount é real
-  (`ffi.rs:335-337`, `state.rs:269,456`). Sem treino, por design. Conferido na
-  quarta passagem: a detecção existe e é testada (`dora` preenchido em
-  `adaptadores.rs:224`, assertions em `:547` e `:568`), mas **nada fora de
-  `adaptadores.rs` lê o campo** — procurar por `dora` no crate inteiro devolve
-  só este arquivo. Então a ficha diz a verdade sobre o arquivo, e o que falta é
-  a tela consumir o número (recusar com motivo antes de montar), não o motor.
+- **#34 DoRA**: detectado, rotulado na tela, **e o núcleo não consume a
+  informação**. LoRA mount é real (`ffi.rs:335-337`, `state.rs:269,456`). Sem
+  treino, por design. Conferido de novo na sexta passagem, com instrumento:
+  - a detecção é lida pela frente — `item.ficha.dora` vira o chip `aviso` em
+    `AdaptadoresDialog.tsx:233-238` (a linha desta mesma seção dizia "nada fora
+    de `adaptadores.rs` lê o campo": falsa hoje; `git grep -n dora -- src` devolve
+    `types.ts:933` e o dialog).
+  - no **crate**, `git grep -n dora -- 'src-tauri/src' ':!src-tauri/src/ai/adaptadores.rs' ':!src-tauri/src/voz'`
+    devolve **zero linhas** (medido nesta passagem): a carga do adaptador não
+    olha para o flag, e um DoRA entra pelo mesmo caminho de um LoRA comum sem que
+    nada registre a diferença.
+  - o que a nota da tela alega sobre a biblioteca foi **medido no binário** dele,
+    não recordado do upstream, em `vendor/llama-cpp/lib/llama.dll` (o build
+    `b12387` do `vendor/README.md:37`):
+    `grep -aoE "%s\.[a-z_.]{2,40}" llama.dll | sort -u | wc -l` → **203**
+    modelos de chave, e `… | grep -c magnitude` → **1**, que é
+    `%s.hyper_connection.magnitude` — outro mecanismo, não DoRA. A suíte de
+    literais do adaptador também não aparece:
+    `grep -haoE "\b(mag|mag_b|dora)\b" llama.dll ggml-base.dll ggml-vulkan.dll` →
+    nada, enquanto `grep -haoE "\blora_[ab]\b" llama.dll` devolve `lora_a` (2) e
+    `lora_b` (1). Lido daí: esta biblioteca casa pares de deltas e não tem o que
+    ler de magnitude, e a nota da tela diz a verdade. **É evidência de string em
+    binário, não execução** — provar que a magnitude não entra exige um adaptador
+    DoRA real montado contra pesos, e aí o aplicativo aberto volta a ser o
+    portão.
+  - o que falta, então, não é o motor nem a mentira: é a **decisão** no caminho de
+    carga. Hoje o Aether aplica as deltas de um DoRA e cala que a normalização por
+    magnitude ficou de fora — o modelo que sai é outro, sem aviso além de um chip
+    na ficha. Fechar #34 é isso: levar `dora` até o `aplicar` e gravar no estado,
+    por adaptador, que a magnitude não foi montada.
 - ~~**#39 embedder**: hardcode `-1` (`ggml/mod.rs:515`)~~ — **fechado na segunda
   leva** (`FFI.md`): `despachar_codificador` (`ggml/mod.rs:482`) decide pelo
   veredito de alojamento, e o `-1` só aparece no ramo em que o cabeçalho não

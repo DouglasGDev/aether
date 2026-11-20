@@ -60,10 +60,13 @@ pub struct Ficha {
     pub tensores: usize,
     /// `true` quando o arquivo traz os vetores de magnitude do DoRA junto com
     /// os deltas: um tensor cujo nome termina no componente `mag`. É o que o
-    /// arquivo declara, medido no cabeçalho dele. A biblioteca desta versão não
-    /// aplica magnitude nenhuma — o carregador só casa `.lora_a` com `.lora_b` e
-    /// recusa o resto — então o que a tela mostra aqui é a origem do erro que o
-    /// motor vai dar, e não uma capacidade desta máquina.
+    /// arquivo declara, medido no cabeçalho dele. A biblioteca desta máquina não
+    /// tem o que ler disso — `grep -haoE "\b(mag|mag_b|dora)\b"` no `llama.dll`
+    /// vendorizado (`b12387`, `vendor/README.md:37`) não devolve nenhum literal,
+    /// enquanto `lora_a` e `lora_b` estão lá. Então o adaptador não falha: ele
+    /// monta as deltas e deixa a normalização por magnitude de fora, em silêncio.
+    /// O que este campo marca é o que ficou de fora, não uma capacidade desta
+    /// máquina — e nenhum caminho de carga o lê hoje (`PLANO.md`, #34).
     pub dora: bool,
     /// `true` quando o arquivo declara tokens de invocação
     /// (`adapter.alora.invocation_tokens`) — a mesma chave que a biblioteca lê
