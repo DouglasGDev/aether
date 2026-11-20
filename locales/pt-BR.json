@@ -373,6 +373,8 @@
     "invocadoNota": "Age só nos trechos em que o token de invocação dele aparece.",
     "dora": "DoRA",
     "doraNota": "O arquivo traz magnitudes DoRA. A biblioteca deste computador não lê tensor de magnitude — só os pares de deltas —, então a normalização por magnitude fica de fora da montagem.",
+    "semMagnitude": "Na placa, sem magnitude",
+    "semMagnitudeNota": "As deltas deste DoRA estão sobre os pesos, mas a normalização por magnitude não foi montada — o que roda aqui não é exatamente o arquivo.",
     "apagar": "Apagar {nome}"
   },
   "ligacoes": {

@@ -373,6 +373,8 @@
     "invocadoNota": "Acts only in the spans where its invocation token appears.",
     "dora": "DoRA",
     "doraNota": "The file carries DoRA magnitudes. This computer's library reads no magnitude tensor — only the delta pairs — so the magnitude normalization is left out of the mount.",
+    "semMagnitude": "On the card, no magnitude",
+    "semMagnitudeNota": "This DoRA's deltas are on the weights, but the magnitude normalization was not mounted — what runs here is not exactly the file.",
     "apagar": "Delete {nome}"
   },
   "ligacoes": {

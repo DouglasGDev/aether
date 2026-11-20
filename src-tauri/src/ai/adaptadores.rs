@@ -61,12 +61,13 @@ pub struct Ficha {
     /// `true` quando o arquivo traz os vetores de magnitude do DoRA junto com
     /// os deltas: um tensor cujo nome termina no componente `mag`. É o que o
     /// arquivo declara, medido no cabeçalho dele. A biblioteca desta máquina não
-    /// tem o que ler disso — `grep -haoE "\b(mag|mag_b|dora)\b"` no `llama.dll`
-    /// vendorizado (`b12387`, `vendor/README.md:37`) não devolve nenhum literal,
-    /// enquanto `lora_a` e `lora_b` estão lá. Então o adaptador não falha: ele
-    /// monta as deltas e deixa a normalização por magnitude de fora, em silêncio.
-    /// O que este campo marca é o que ficou de fora, não uma capacidade desta
-    /// máquina — e nenhum caminho de carga o lê hoje (`PLANO.md`, #34).
+    /// tem o que ler disso — os três literais com que uma implementação de DoRA
+    /// nomeia esse tensor não ocorrem no `llama.dll` vendorizado, enquanto os
+    /// símbolos dos pares de deltas estão (`crate::ai::ggml::LE_MAGNITUDE`, e o
+    /// teste que lê o binário). Então o adaptador não falha: ele monta as deltas
+    /// e deixa a normalização por magnitude de fora. O que este campo marca é o
+    /// que vai ficar de fora, não uma capacidade desta máquina, e o caminho de
+    /// carga o lê — é dele que nasce [`Item::magnitude_fora`].
     pub dora: bool,
     /// `true` quando o arquivo declara tokens de invocação
     /// (`adapter.alora.invocation_tokens`) — a mesma chave que a biblioteca lê
@@ -346,9 +347,29 @@ pub struct Item {
     pub forca: f32,
     /// `true` só quando os deltas daquele arquivo estão sobre os pesos agora.
     pub aplicada: bool,
+    /// `true` quando aquilo que está sobre os pesos **não é o arquivo inteiro**:
+    /// um DoRA aplicado cujas magnitudes ficaram de fora. Não é um erro do
+    /// adaptador — as deltas abriram, entraram e funcionam — é a meia montagem
+    /// que a biblioteca desta máquina sabe fazer. Ver [`magnitude_fora`].
+    pub magnitude_fora: bool,
     /// O motivo dito pelo motor, quando ele não aplicou. Nunca um texto nosso:
     /// um adaptador que não abriu tem uma razão, e ela é a resposta.
     pub erro: Option<String>,
+}
+
+/// O que fica de fora da montagem de um adaptador que está sobre os pesos.
+///
+/// A decisão mora aqui, e não no motor, porque o motor não tem do que decidir:
+/// a `llama.dll` vendorizada lê os pares de deltas e não lê tensor de magnitude
+/// nenhum (`crate::ai::ggml::LE_MAGNITUDE`, conferida byte a byte no binário pelo
+/// teste da frente ggml). Somar as deltas de um DoRA e calar a normalização é o
+/// que acontece — antes deste campo, acontecia em silêncio, e a linha "Na placa"
+/// era lida como "o modelo que o arquivo descreve está rodando".
+///
+/// Um adaptador desligado ou que não abriu não tem nada montado, então não tem
+/// nada que tenha ficado de fora: `aplicada == false` responde `false`.
+fn magnitude_fora(ficha: &Ficha, aplicada: bool) -> bool {
+    aplicada && ficha.dora && !crate::ai::ggml::LE_MAGNITUDE
 }
 
 /// Junta disco, escolha e realidade. Os três são coisas diferentes: um
@@ -364,11 +385,13 @@ pub fn itens(pasta: &Path, ajustes: &Ajustes, aplicados: &[Aplicado]) -> Vec<Ite
             let caminho = PathBuf::from(&ficha.caminho);
             let pino = ajustes.pino(&caminho);
             let aplicado = aplicado_de(&caminho);
+            let aplicada = aplicado.map(|a| a.aplicada).unwrap_or(false);
             Item {
                 ficha: ficha.clone(),
                 ativo: pino.map(|p| p.ativo).unwrap_or(false),
                 forca: pino.map(|p| p.forca).unwrap_or(1.0),
-                aplicada: aplicado.map(|a| a.aplicada).unwrap_or(false),
+                aplicada,
+                magnitude_fora: magnitude_fora(ficha, aplicada),
                 erro: aplicado.and_then(|a| a.erro.clone()),
             }
         })
@@ -383,6 +406,7 @@ pub fn itens(pasta: &Path, ajustes: &Ajustes, aplicados: &[Aplicado]) -> Vec<Ite
             continue;
         }
         let aplicado = aplicado_de(&caminho);
+        let aplicada = aplicado.map(|a| a.aplicada).unwrap_or(false);
         let erro = match aplicado {
             Some(a) => a.erro.clone(),
             // Sem resposta do motor é porque ele nem chegou a pedir o arquivo:
@@ -392,24 +416,29 @@ pub fn itens(pasta: &Path, ajustes: &Ajustes, aplicados: &[Aplicado]) -> Vec<Ite
             }
             None => None,
         };
+        // A ficha possível de um arquivo que não está mais ali: sem cabeçalho
+        // lido não há declaração de magnitude, e `magnitude_fora` responde
+        // `false` pelos dois motivos — nada montado e nada declarado.
+        let ficha = Ficha {
+            caminho: pino.caminho.clone(),
+            nome: caminho
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| pino.caminho.clone()),
+            tipo: String::new(),
+            base: String::new(),
+            arquitetura: String::new(),
+            tensores: 0,
+            dora: false,
+            invocado: false,
+            bytes: 0,
+        };
         itens.push(Item {
-            ficha: Ficha {
-                caminho: pino.caminho.clone(),
-                nome: caminho
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| pino.caminho.clone()),
-                tipo: String::new(),
-                base: String::new(),
-                arquitetura: String::new(),
-                tensores: 0,
-                dora: false,
-                invocado: false,
-                bytes: 0,
-            },
+            magnitude_fora: magnitude_fora(&ficha, aplicada),
+            aplicada,
+            ficha,
             ativo: pino.ativo,
             forca: pino.forca,
-            aplicada: aplicado.map(|a| a.aplicada).unwrap_or(false),
             erro,
         });
     }
@@ -706,7 +735,89 @@ mod tests {
         // O pin sem arquivo não some da tela, e o motor é quem responde por ele.
         let orfao = itens.iter().find(|i| i.ficha.caminho == "somente-pin.gguf").unwrap();
         assert!(!orfao.aplicada);
+        assert!(!orfao.magnitude_fora, "sem arquivo lido não há magnitude declarada");
         assert_eq!(orfao.erro.as_deref(), Some("não abriu"));
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// A linha da frente #34. Antes deste caso, um DoRA montado era indistinguível
+    /// de um LoRA comum no estado: as deltas entravam, a normalização por magnitude
+    /// não tinha quem a fizesse, e a tela dizia "Na placa" para um modelo que não é
+    /// o que o arquivo descreve.
+    #[test]
+    fn um_dora_aplicado_registra_que_a_magnitude_ficou_fora() {
+        let pasta = pasta_de_teste("dora-montagem");
+        let nomes = |sufixo: &str| {
+            ["blk.0.attn_q.weight", "blk.0.attn_v.weight"]
+                .iter()
+                .map(|n| format!("{n}.{sufixo}"))
+                .collect::<Vec<String>>()
+        };
+        let mut do_dora = nomes("lora_a");
+        do_dora.extend(nomes("lora_b"));
+        do_dora.extend(nomes("mag"));
+        let dora = escrever(
+            &pasta,
+            "dora.gguf",
+            &gguf_com_nomes(&[("adapter.type", "lora"), ("adapter.name", "DoRA")], &do_dora),
+        );
+        let lora = escrever(
+            &pasta,
+            "lora.gguf",
+            &gguf_com_nomes(
+                &[("adapter.type", "lora"), ("adapter.name", "LoRA")],
+                &[nomes("lora_a"), nomes("lora_b")].concat(),
+            ),
+        );
+        // Os dois arquivos têm de ser o que dizem ser, ou o resto do teste mede
+        // uma montagem que não existe.
+        assert!(ler_ficha(&dora).unwrap().dora);
+        assert!(!ler_ficha(&lora).unwrap().dora);
+
+        let ajustes = Ajustes {
+            pinos: vec![
+                pino(&dora.display().to_string(), 1.0, true),
+                pino(&lora.display().to_string(), 1.0, true),
+            ],
+        }
+        .aprovar();
+        let aplicados = vec![
+            Aplicado { caminho: dora.clone(), aplicada: true, erro: None },
+            Aplicado { caminho: lora.clone(), aplicada: true, erro: None },
+        ];
+        let linhas = itens(&pasta, &ajustes, &aplicados);
+        let montado = |nome: &str| linhas.iter().find(|i| i.ficha.nome == nome).unwrap();
+        assert!(montado("DoRA").magnitude_fora, "as deltas entraram sem a normalização");
+        assert!(!montado("LoRA").magnitude_fora, "um LoRA comum não tem o que ficar fora");
+
+        // O nome no JSON é o contrato com a tela, e um `camelCase` que escapa
+        // aqui escapa invisível: o chip simplesmente some sem ninguém reclamar.
+        let linha = serde_json::to_value(montado("DoRA")).unwrap();
+        assert!(
+            linha.get("magnitudeFora").is_some_and(|v| *v == serde_json::Value::Bool(true)),
+            "o campo saiu torto no JSON: {linha}"
+        );
+
+        // Desligado não é "montado pela metade": é nada montado. A mesma ficha
+        // que dava `true` acima devolve `false` quando o motor não aplicou.
+        for sem_motor in [
+            itens(&pasta, &ajustes, &[]),
+            itens(
+                &pasta,
+                &ajustes,
+                &[Aplicado {
+                    caminho: dora.clone(),
+                    aplicada: false,
+                    erro: Some("o arquivo não abriu".to_string()),
+                }],
+            ),
+        ] {
+            let desligado = sem_motor.iter().find(|i| i.ficha.nome == "DoRA").unwrap();
+            assert!(
+                !desligado.magnitude_fora,
+                "nada sobre os pesos, nada fora da montagem: {desligado:?}"
+            );
+        }
         std::fs::remove_dir_all(&pasta).ok();
     }
 

@@ -928,8 +928,8 @@ export interface FichaAdaptador {
   arquitetura: string;
   tensores: number;
   /// `true` quando o arquivo traz magnitudes DoRA junto dos deltas. É o que o
-  /// cabeçalho dele declara — não uma promessa da biblioteca, que recusa tensor
-  /// que não seja `.lora_a`/`.lora_b`.
+  /// cabeçalho dele declara, não uma promessa da biblioteca: ela monta os pares
+  /// `.lora_a`/`.lora_b` e deixa a normalização por magnitude de fora.
   dora: boolean;
   /// `true` quando o arquivo declara tokens de invocação (a chave alora do
   /// cabeçalho): especialista que só age onde o token dele aparece.
@@ -944,6 +944,10 @@ export interface ItemAdaptador {
   ativo: boolean;
   forca: number;
   aplicada: boolean;
+  /// `true` só nesta linha aplicada sobre os pesos agora (`aplicada`) quando o
+  /// arquivo declara magnitudes DoRA: as deltas entraram e a normalização por
+  /// magnitude ficou de fora da montagem desta linha.
+  magnitudeFora: boolean;
   erro: string | null;
 }
 

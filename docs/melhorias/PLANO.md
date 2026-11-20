@@ -155,8 +155,10 @@ o derrotam:
 - **M3 [MED]** `download.rs:69-75,323-327`: sem `read_timeout` (só connect_timeout);
   cancel só é checado quando chega chunk → transferência travada pendura e *Parar*
   não responde. **Correção:** `.read_timeout(...)` e cancelar contra o stream.
-- Arquivos: `ai/memoria.rs`, `conversas.rs`, `ai/download.rs`. (M8 sha256,
-  catalog header-check, adaptadores DoRA honesty ficam como recomendação no doc.)
+- Arquivos: `ai/memoria.rs`, `conversas.rs`, `ai/download.rs`. (M8 sha256 fechado
+  em `M8.md`; a honestidade dos adaptadores DoRA fechada em `DORA.md`; o
+  header-check do catálogo fechado — `catalog.rs:492` confere cada família
+  declarada contra a `llama.dll` vendorizada.)
 
 ### CONC — concorrência do motor
 - **A1 [HIGH]** `state.rs:390-394` + `commands.rs:1105-1172,806,830,851`: o mutex
@@ -234,17 +236,23 @@ o derrotam:
 - ~~**M8** integridade do download só por tamanho~~ — **fechado na segunda leva**
   (`M8.md`): `download.rs:149` mede o sha256 do arquivo inteiro e o confere com o
   `lfs.oid` publicado antes do `rename`.
-- **#34 DoRA**: detectado, rotulado na tela, **e o núcleo não consume a
-  informação**. LoRA mount é real (`ffi.rs:335-337`, `state.rs:269,456`). Sem
-  treino, por design. Conferido de novo na sexta passagem, com instrumento:
-  - a detecção é lida pela frente — `item.ficha.dora` vira o chip `aviso` em
+- **#34 DoRA**: detectado e rotulado na tela, **e o núcleo não consumia a
+  informação** — a metade honesta **fechada** nesta passagem (`DORA.md`). LoRA
+  mount é real (`ffi.rs:335-337`, `state.rs:269,456`). Sem treino, por design.
+  Conferido de novo na sexta passagem, com instrumento:
+  - a detecção era lida pela frente — `item.ficha.dora` vira o chip `aviso` em
     `AdaptadoresDialog.tsx:233-238` (a linha desta mesma seção dizia "nada fora
     de `adaptadores.rs` lê o campo": falsa hoje; `git grep -n dora -- src` devolve
     `types.ts:933` e o dialog).
   - no **crate**, `git grep -n dora -- 'src-tauri/src' ':!src-tauri/src/ai/adaptadores.rs' ':!src-tauri/src/voz'`
-    devolve **zero linhas** (medido nesta passagem): a carga do adaptador não
-    olha para o flag, e um DoRA entra pelo mesmo caminho de um LoRA comum sem que
-    nada registre a diferença.
+    devolve **zero linhas** (medido nesta passagem, e continua zero: quem lê o
+    flag é o próprio módulo): a carga não olhava para ele, e um DoRA entrava pelo
+    mesmo caminho de um LoRA comum sem que nada registrasse a diferença. É
+    exatamente isso que fecha aqui — `LE_MAGNITUDE` (`ggml/mod.rs:159-172`)
+    declara o que a biblioteca lê, com o próprio binário como instrumento
+    (`ggml/mod.rs:1023-1067`), e `Item::magnitude_fora` (`adaptadores.rs:341-372`)
+    grava por adaptador aplicado que a normalização ficou de fora. A linha da
+    tela para de dizer "Na placa" a seco: diz "Na placa, sem magnitude".
   - o que a nota da tela alega sobre a biblioteca foi **medido no binário** dele,
     não recordado do upstream, em `vendor/llama-cpp/lib/llama.dll` (o build
     `b12387` do `vendor/README.md:37`):
@@ -256,14 +264,15 @@ o derrotam:
     nada, enquanto `grep -haoE "\blora_[ab]\b" llama.dll` devolve `lora_a` (2) e
     `lora_b` (1). Lido daí: esta biblioteca casa pares de deltas e não tem o que
     ler de magnitude, e a nota da tela diz a verdade. **É evidência de string em
-    binário, não execução** — provar que a magnitude não entra exige um adaptador
-    DoRA real montado contra pesos, e aí o aplicativo aberto volta a ser o
+    binário, não execução** — provar o efeito de meio DoRA montado contra pesos
+    exige adaptador, pesos e placa, e aí o aplicativo aberto volta a ser o
     portão.
-  - o que falta, então, não é o motor nem a mentira: é a **decisão** no caminho de
-    carga. Hoje o Aether aplica as deltas de um DoRA e cala que a normalização por
-    magnitude ficou de fora — o modelo que sai é outro, sem aviso além de um chip
-    na ficha. Fechar #34 é isso: levar `dora` até o `aplicar` e gravar no estado,
-    por adaptador, que a magnitude não foi montada.
+  - o que **resta** do título é a outra metade: **montar** a magnitude. Não há
+    API para isso na biblioteca — `llama_set_adapters_lora` soma deltas escaladas
+    no grafo de computação, e a normalização por linha do DoRA pede o peso já
+    fundido. Fazer certo é um conversor que funda o adaptador no GGUF com a
+    magnitude aplicada, conferido contra um DoRA conhecido; é frente nova, com
+    pesos na placa, não um número a mais na tela.
 - ~~**#39 embedder**: hardcode `-1` (`ggml/mod.rs:515`)~~ — **fechado na segunda
   leva** (`FFI.md`): `despachar_codificador` (`ggml/mod.rs:482`) decide pelo
   veredito de alojamento, e o `-1` só aparece no ramo em que o cabeçalho não
@@ -588,3 +597,57 @@ aplicativo aberto — o que existe é a thread de teste que panica segurando a
 trava. O `flush_connector` com processo morto de verdade, e qualquer crash real
 no meio de uma carga de pesos, continuam na rota do motor (descartar e avisar),
 que já tem teste próprio (`state.rs:792`).
+
+## Passagem do maintainer sobre a sétima leva (medido 2026-11-20)
+
+Um item, `DORA` (#98, filho da #34), e ele nasceu da medição da passagem
+anterior: eu escrevi no `PLANO.md` que "a nota da tela diz a verdade" sem ter
+lido a nota no binário. Li. Dossiê em `DORA.md`.
+
+- **A nota mentia sobre o que acontece, e o estado não dizia nada.** A biblioteca
+  vendorizada não recusa tensor de magnitude: ela não tem o que ler, monta as
+  deltas e segue a vida. Um DoRA entrava pelo mesmo caminho de um LoRA comum e a
+  linha da tela respondia "Na placa" para os dois — lido como "o modelo que o
+  arquivo descreve está rodando", quando é metade dele. O `grep` de alcance no
+  texto do produto (`grep -rn magnitude README.md locales/ CONTRIBUTING.md docs/`)
+  devolve, fora as quatro linhas que este lote escreveu, **nada**: o README não
+  fala de DoRA, e a frase errada vivia em dois lugares — a nota do chip e o
+  comentário do tipo em `types.ts`.
+- **A decisão entrou pelo estado, não pelo motor.** `LE_MAGNITUDE`
+  (`ai/ggml/mod.rs:159-172`) declara o que a biblioteca lê, e `Item::magnitude_fora`
+  (`ai/adaptadores.rs:341-372`) grava por adaptador **aplicado** que a
+  normalização ficou de fora. O motor não mudou uma linha: `usar_adaptadores`
+  responde `aplicada`/`erro`, e quem tem a ficha para interpretar isso é o
+  `adaptadores`. O pin órfão passa pela mesma função, não por um `false` copiado.
+- **A capacidade virou instrumento.** `ai/ggml/mod.rs:1023-1067` lê o
+  `llama.dll` vendorizado byte a byte: os dois símbolos com que a ponte fala
+  têm de estar no arquivo (sem eles a comparação seria um ponteiro LFS ou outra
+  release), e os três nomes de tensor de magnitude não podem estar. Clone sem
+  DLL diz "ausente: nada contra o que conferir", o mesmo acordo de
+  `catalog.rs:492`.
+- **Vermelho por mutação, porque não há DoRA para montar.** Não existe aqui um
+  adaptador DoRA real contra pesos, então o que foi virado foi a hipótese: com
+  `LE_MAGNITUDE = true` — exatamente "a biblioteca passou a ler magnitude" — os
+  dois instrumentos caem, cada um com a frase que diz o que revisar. A constante
+  voltou para `false`, e o diff do arquivo fecha em 61 linhas adicionadas e
+  nenhuma alterada: a mutação não deixou rastro.
+- **Frente delegada, um escritor por arquivo.** `types.ts`, o dialog e os dois
+  JSON de locale foram para um agente com contrato fechado (`magnitudeFora` no
+  JSON, `semMagnitude`/`semMagnitudeNota` nos dois idiomas); o Rust ficou comigo,
+  e nenhum dos dois tocou o arquivo do outro.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **567 passaram, 0
+falharam, 11 ignored, finished in 4,03 s** (eram 565; os dois novos são o
+instrumento do binário e o estado do DoRA); `cargo test --lib adaptadores` →
+**13 passaram, 0 falharam, 0,03 s**; `cargo check --all-targets` →
+**zero avisos**; `npm run build` → **OK, `✓ built in 216 ms`**, maior bloco
+`react` a 210,53 kB, sem aviso de chunk. Paridade de locale medida nos dois
+arquivos: **1007 chaves achatadas** de cada lado.
+
+Fora do alcance, e registrado como tal: o efeito de um meio DoRA na resposta do
+modelo não foi medido — é string de binário, não execução, e pesos na placa são
+o portão. E a outra metade do título da #34 continua aberta: **montar** a
+magnitude não tem API nesta biblioteca (`llama_set_adapters_lora` soma deltas
+escaladas no grafo; a normalização por linha pede o peso já fundido), então
+fechar isso é um conversor que funda adaptador em GGUF, conferido contra um DoRA
+conhecido — frente nova, não um número a mais na tela.

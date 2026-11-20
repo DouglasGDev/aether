@@ -271,10 +271,21 @@ export function AdaptadoresDialog({ onClose, onChange }: Props) {
 
                 <span
                   className={item.aplicada ? "adaptador-estado ligada" : "adaptador-estado"}
+                  title={
+                    item.aplicada && item.magnitudeFora
+                      ? t("adaptadores.semMagnitudeNota")
+                      : undefined
+                  }
                 >
-                  <Icon name={item.aplicada ? "check" : "warning"} />
+                  <Icon
+                    name={
+                      item.aplicada && !item.magnitudeFora ? "check" : "warning"
+                    }
+                  />
                   {item.aplicada
-                    ? t("adaptadores.naPlaca")
+                    ? item.magnitudeFora
+                      ? t("adaptadores.semMagnitude")
+                      : t("adaptadores.naPlaca")
                     : t("adaptadores.foraDaPlaca")}
                 </span>
 

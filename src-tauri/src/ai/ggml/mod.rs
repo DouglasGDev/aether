@@ -156,6 +156,21 @@ pub struct Aplicado {
     pub erro: Option<String>,
 }
 
+/// O que a biblioteca vendorizada lê de um arquivo de adaptador: os pares de
+/// deltas. A normalização por magnitude do DoRA não tem quem a faça aqui, e um
+/// DoRA montado nesta máquina entra pela metade — sem erro, porque as deltas
+/// dele abrem e aplicam como as de qualquer LoRA.
+///
+/// O número não vem de memória de changelog nem de README de terceiro: é o
+/// binário que este aplicativo abre, lido byte a byte pelo teste
+/// `a_dll_vendorizada_e_a_que_esta_capacidade_descreve`, abaixo. Lá estão os
+/// dois símbolos que a ponte `ffi` chama (`llama_adapter_lora_init`,
+/// `llama_set_adapters_lora`); não está nenhum nome de tensor de magnitude —
+/// `".mag"` como fim de string, `mag_b` e `dora` não ocorrem uma vez — e dos 203
+/// modelos de chave `"%s.…"` do binário o único que fala de magnitude é
+/// `%s.hyper_connection.magnitude`, que é outro mecanismo.
+pub const LE_MAGNITUDE: bool = false;
+
 /// Os índices de `carregados` que nenhum pedido quer mais. Função separada
 /// porque é dela que depende soltar RAM da placa: errar aqui é vazar memória ou
 /// derrubar um adaptador que ainda está em uso.
@@ -1003,5 +1018,51 @@ mod tests {
             apertado.previsto
         );
         assert!(matches!(apertado.previsto, Some(alojamento::Alojamento::Dividida { .. })));
+    }
+
+    /// `LE_MAGNITUDE` é uma afirmação sobre um binário, e binário se lê. O teste
+    /// abre o `llama.dll` vendorizado e confere os dois lados da frase: os
+    /// símbolos com que a ponte fala têm de estar lá — sem eles o arquivo é outra
+    /// release, ou um ponteiro LFS, e a comparação de baixo não valeria nada — e o
+    /// nome de tensor que uma biblioteca que *lê* DoRA carrega no texto não está.
+    /// Sem as DLLs no disco (clone recém-feito, antes do instalador de runtime)
+    /// não há o que conferir, e ele diz isso em vez de passar fingindo.
+    #[test]
+    fn a_dll_vendorizada_e_a_que_esta_capacidade_descreve() {
+        let dll = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor")
+            .join("llama-cpp")
+            .join("lib")
+            .join("llama.dll");
+        let Ok(binario) = std::fs::read(&dll) else {
+            eprintln!("{} ausente: nada contra o que conferir", dll.display());
+            return;
+        };
+        let contem = |agulha: &[u8]| binario.windows(agulha.len()).any(|janela| janela == agulha);
+
+        assert!(
+            contem(b"llama_adapter_lora_init"),
+            "{} não declara a montagem de adaptador que a ponte chama",
+            dll.display()
+        );
+        assert!(
+            contem(b"llama_set_adapters_lora"),
+            "{} não declara a aplicação de adaptador que a ponte chama",
+            dll.display()
+        );
+
+        // O outro lado, que fundamenta a constante: normalizar por magnitude exige
+        // o tensor de magnitude, e o tensor tem de ser achado pelo nome. Os três
+        // literais com que qualquer implementação de DoRA nomeia esse tensor não
+        // ocorrem uma vez sequer neste binário.
+        let le_magnitude = contem(b".mag\0") || contem(b"mag_b") || contem(b"dora");
+        assert_eq!(
+            LE_MAGNITUDE, le_magnitude,
+            "a biblioteca vendorizada e o que `LE_MAGNITUDE` declara divergiram. Se \
+             ela passou a ler magnitude, a metade montada do DoRA acabou: o campo \
+             `magnitudeFora` da tela de adaptadores e as notas `adaptadores.doraNota` \
+             e `adaptadores.semMagnitudeNota` mentem, e a frente #34 deixa de ser \
+             honestidade para virar montagem inteira."
+        );
     }
 }
