@@ -1,3 +1,4 @@
+use crate::state::trava_estado;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -37,7 +38,7 @@ impl ApprovalBroker {
 
     pub fn register(&self, request: &ApprovalRequest) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().expect("approval broker poisoned").insert(
+        trava_estado(&self.waiters).insert(
             request.id.clone(),
             (request.connector_id.clone(), tx),
         );
@@ -45,11 +46,7 @@ impl ApprovalBroker {
     }
 
     pub fn resolve(&self, id: &str, approved: bool) -> bool {
-        let entry = self
-            .waiters
-            .lock()
-            .expect("approval broker poisoned")
-            .remove(id);
+        let entry = trava_estado(&self.waiters).remove(id);
         match entry {
             Some((_, tx)) => tx.send(approved).is_ok(),
             None => false,
@@ -59,7 +56,7 @@ impl ApprovalBroker {
     // Dropping the sender resolves the waiter as Cancelled, so a stopping
     // server can never leave a tool call resumed against a dead process.
     pub fn cancel_connector(&self, connector_id: &str) -> usize {
-        let mut waiters = self.waiters.lock().expect("approval broker poisoned");
+        let mut waiters = trava_estado(&self.waiters);
         let stale: Vec<String> = waiters
             .iter()
             .filter(|(_, (owner, _))| owner == connector_id)
@@ -72,12 +69,7 @@ impl ApprovalBroker {
     }
 
     pub fn pending_ids(&self) -> Vec<String> {
-        self.waiters
-            .lock()
-            .expect("approval broker poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        trava_estado(&self.waiters).keys().cloned().collect()
     }
 }
 

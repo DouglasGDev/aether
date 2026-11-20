@@ -21,6 +21,7 @@ use crate::ai::ChatMessage;
 use crate::ai::compactacao::Resumo;
 use crate::ai::memoria::{CONVERSAS_MEMORIAIS, CONVERSA_MAX_BYTES, ConversaViva};
 use crate::idiomas::tr;
+use crate::state::trava_estado;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,14 @@ pub struct Estado {
 
 pub struct Conversas {
     raiz: PathBuf,
+    /// O sumário das conversas em memória. Dado puro no sentido da regra de
+    /// `CONTRIBUTING.md`: cada mudança é um `push`, um `retain` ou uma
+    /// atribuição, e ela acontece inteira. O único trecho que toca dois campos
+    /// — `apagar` tira a ficha e depois limpa a `ativa` — não deixa valor
+    /// partido, só uma `ativa` apontando para quem já não está na lista, e todo
+    /// leitor revalida antes de usar. `estado` é comando síncrono da janela:
+    /// panicar ali fecharia o aplicativo com as conversas intactas no disco, que
+    /// é o pior resultado possível para um sumário em memória.
     indice: Mutex<Indice>,
 }
 
@@ -247,7 +256,7 @@ impl Conversas {
     }
 
     pub fn estado(&self) -> Estado {
-        let indice = self.indice.lock().expect("conversas envenenadas");
+        let indice = trava_estado(&self.indice);
         let mut conversas = indice.conversas.clone();
         conversas.sort_by(|a, b| b.atualizada.cmp(&a.atualizada).then(b.id.cmp(&a.id)));
         Estado { ativa: indice.ativa.clone(), conversas }
@@ -264,7 +273,7 @@ impl Conversas {
     /// A conversa ativa, criando uma se não houver: o primeiro pedido que a
     /// pessoa escreve já tem onde ficar, sem um clique antes.
     pub fn garantir(&self) -> Result<String> {
-        let ativa = self.indice.lock().expect("conversas envenenadas").ativa.clone();
+        let ativa = trava_estado(&self.indice).ativa.clone();
         match ativa {
             Some(id) => Ok(id),
             None => self.criar().map(|ficha| ficha.id),
@@ -283,7 +292,7 @@ impl Conversas {
         };
         gravar_json(&arquivo(&self.raiz, &conversa.id), &conversa)?;
         let ficha = conversa.ficha();
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let mut indice = trava_estado(&self.indice);
         indice.conversas.push(ficha.clone());
         indice.ativa = Some(conversa.id);
         self.salvar_indice(&indice)?;
@@ -296,13 +305,13 @@ impl Conversas {
         if !id_valido(id) {
             bail!(tr("erros.conversaIdInvalido", &[("id", id)]));
         }
-        let indice = self.indice.lock().expect("conversas envenenadas");
+        let indice = trava_estado(&self.indice);
         if !indice.conversas.iter().any(|f| f.id == id) {
             bail!(tr("erros.conversaDesconhecida", &[("id", id)]));
         }
         drop(indice);
         let conversa: Conversa = ler_json(&arquivo(&self.raiz, id))?;
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let mut indice = trava_estado(&self.indice);
         indice.ativa = Some(id.to_string());
         self.salvar_indice(&indice)?;
         Ok(Aberta { mensagens: conversa.mensagens, resumo: conversa.resumo })
@@ -322,7 +331,7 @@ impl Conversas {
         // e cada um escreve o arquivo inteiro: o último apagou o efeito do
         // outro — o título, ou as mensagens do turno. Gravar é atômico no disco,
         // mas não contra uma segunda escrita que começou antes desta.
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let mut indice = trava_estado(&self.indice);
         let Some(pos) = indice.conversas.iter().position(|f| f.id == id) else {
             bail!(tr("erros.conversaDesconhecida", &[("id", id)]));
         };
@@ -360,7 +369,7 @@ impl Conversas {
         // pôr, e as duas escritas ainda se atropelam no mesmo arquivo .tmp.
         // Gravar é atômico no disco contra um leitor, não contra uma segunda
         // escrita que começou lendo um estado anterior.
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let mut indice = trava_estado(&self.indice);
         let Some(pos) = indice.conversas.iter().position(|f| f.id == id) else {
             bail!(tr("erros.conversaDesconhecida", &[("id", id)]));
         };
@@ -393,7 +402,7 @@ impl Conversas {
                 ))
             })?;
         }
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let mut indice = trava_estado(&self.indice);
         let antes = indice.conversas.len();
         indice.conversas.retain(|f| f.id != id);
         if indice.conversas.len() == antes {
@@ -991,6 +1000,50 @@ mod testes {
             0,
             "renomear e gravar no mesmo id se atropelaram: um efeito sumiu do arquivo"
         );
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    /// Vermelho-primeiro (CONTRATO): o `expect` na trava do índice derrubava a
+    /// thread que lesse a lista, e `estado` é comando síncrono da tela — um panic
+    /// ali fecha o aplicativo com as conversas intactas no disco, que é o pior
+    /// resultado possível para um sumário em memória. O índice é dado puro: cada
+    /// campo muda inteiro por vez, então atrás de uma trava envenenada está a
+    /// lista de sempre, e a política certa é `into_inner`.
+    #[test]
+    fn o_indice_envenenado_devolve_as_conversas_em_vez_de_panicar() {
+        use std::sync::Arc;
+        let conversas = Arc::new(temporaria("indice-envenenado"));
+        let ficha = conversas.criar().unwrap();
+
+        let dentro = Arc::clone(&conversas);
+        let envenenador = std::thread::spawn(move || {
+            let _guard = dentro.indice.lock().expect("índice envenenado");
+            panic!("um panic segurando a trava do índice");
+        });
+        let _ = envenenador.join();
+        assert!(
+            conversas.indice.is_poisoned(),
+            "o teste não envenenou a trava do índice"
+        );
+
+        let estado = conversas.estado();
+        assert_eq!(
+            estado.conversas.len(),
+            1,
+            "a lista perdeu uma conversa no envenenamento"
+        );
+        assert_eq!(estado.ativa.as_deref(), Some(ficha.id.as_str()));
+        // Recuperação de verdade é ler e escrever: o próximo turno grava-se por
+        // cima do índice envenenado em vez de panicar na thread da janela.
+        conversas
+            .gravar(&ficha.id, &pedido("pedido depois do panic"), None)
+            .unwrap();
+        let depois = conversas.estado();
+        assert_eq!(depois.conversas[0].mensagens, 3);
+        // A marca de que um panic aconteceu fica onde ela pode ser lida: o que
+        // `trava_estado` devolve é o estado de verdade, não uma lavagem da
+        // memória de que a thread caiu.
+        assert!(conversas.indice.is_poisoned());
         let _ = std::fs::remove_dir_all(&conversas.raiz);
     }
 }

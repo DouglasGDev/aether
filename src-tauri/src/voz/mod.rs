@@ -16,6 +16,7 @@ pub mod ffi;
 pub mod modelos;
 
 use crate::idiomas::tr;
+use crate::state::trava_estado;
 use escuta::Escuta;
 use fala::Parlante;
 use ffi::Sherpa;
@@ -242,7 +243,10 @@ impl MotorVoz {
     }
 
     pub fn ajustes(&self) -> Ajustes {
-        self.ajustes.lock().expect("ajustes de voz envenenados").clone()
+        // Dado puro: `Ajustes` só muda pela atribuição inteira de `ajustar`, e
+        // isto é lido por comando síncrono da tela (`estado`), onde um panic
+        // fecharia o aplicativo em vez de mostrar a voz.
+        trava_estado(&self.ajustes).clone()
     }
 
     /// Grava as escolhas e as devolve. Cada modelo é conferido contra o
@@ -254,7 +258,7 @@ impl MotorVoz {
             ..novos
         };
         guardados.salvar(&self.ajustes_path)?;
-        *self.ajustes.lock().expect("ajustes de voz envenenados") = guardados.clone();
+        *trava_estado(&self.ajustes) = guardados.clone();
         Ok(guardados)
     }
 
@@ -422,7 +426,7 @@ impl MotorVoz {
     /// Registra um download. Devolve None se este modelo já está baixando: duas
     /// tarefas escreveriam no mesmo `.part`.
     pub fn iniciar_download(&self, id: &str) -> Option<Arc<AtomicBool>> {
-        let mut cursos = self.downloads.lock().expect("downloads de voz envenenados");
+        let mut cursos = trava_estado(&self.downloads);
         if cursos.contains_key(id) {
             return None;
         }
@@ -432,19 +436,11 @@ impl MotorVoz {
     }
 
     pub fn encerrar_download(&self, id: &str) {
-        self.downloads
-            .lock()
-            .expect("downloads de voz envenenados")
-            .remove(id);
+        trava_estado(&self.downloads).remove(id);
     }
 
     pub fn cancelar_download(&self, id: &str) -> bool {
-        match self
-            .downloads
-            .lock()
-            .expect("downloads de voz envenenados")
-            .get(id)
-        {
+        match trava_estado(&self.downloads).get(id) {
             Some(cancel) => {
                 cancel.store(true, Ordering::Relaxed);
                 true
@@ -454,13 +450,7 @@ impl MotorVoz {
     }
 
     pub fn baixando(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .downloads
-            .lock()
-            .expect("downloads de voz envenenados")
-            .keys()
-            .cloned()
-            .collect();
+        let mut ids: Vec<String> = trava_estado(&self.downloads).keys().cloned().collect();
         ids.sort();
         ids
     }

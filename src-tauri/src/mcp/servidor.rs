@@ -20,6 +20,7 @@ use crate::connectors::{Connector, ConnectorCategory, ConnectorKind, McpAuth, Mc
 use crate::idiomas::tr;
 use crate::local::{self, Ferramenta};
 use crate::permissions::ToolEffect;
+use crate::state::trava_estado;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use http::header::{ALLOW, AUTHORIZATION};
@@ -111,9 +112,7 @@ impl Publicador {
 
     /// O estado de agora, sem levantar nada. É o que a tela lê a cada aberto.
     pub fn estado(&self) -> Estado {
-        self.ativa
-            .lock()
-            .expect("publicador envenenado")
+        trava_estado(&self.ativa)
             .as_ref()
             .map(|ativa| ativa.estado.clone())
             .unwrap_or_else(|| Estado::inativa(self.ferramentas()))
@@ -130,9 +129,7 @@ impl Publicador {
     /// O token em memória, para quem precisa apresentá-lo a um cliente externo.
     /// `None` com o servidor fechado: sem servidor não há segredo.
     pub fn token(&self) -> Option<String> {
-        self.ativa
-            .lock()
-            .expect("publicador envenenado")
+        trava_estado(&self.ativa)
             .as_ref()
             .map(|ativa| ativa.token.as_str().to_string())
     }
@@ -141,7 +138,7 @@ impl Publicador {
     /// Idempotente por construção: pedir de pé é responder com o que já está de
     /// pé, não abrir uma segunda porta nem trocar o segredo no meio do caminho.
     pub async fn abrir(&self) -> Result<(Estado, String)> {
-        if let Some(ativa) = self.ativa.lock().expect("publicador envenenado").as_ref() {
+        if let Some(ativa) = trava_estado(&self.ativa).as_ref() {
             return Ok((ativa.estado.clone(), ativa.token.as_str().to_string()));
         }
 
@@ -183,7 +180,7 @@ impl Publicador {
             porta,
             ferramentas: self.ferramentas(),
         };
-        *self.ativa.lock().expect("publicador envenenado") = Some(Ativa {
+        *trava_estado(&self.ativa) = Some(Ativa {
             estado: estado.clone(),
             token: Arc::clone(&token),
             cancelamento,
@@ -196,7 +193,7 @@ impl Publicador {
     /// então solta a porta. Devolver antes disso deixaria um ouvinte vivendo de
     /// um token que a tela já não conhece.
     pub async fn fechar(&self) -> Result<bool> {
-        let antiga = self.ativa.lock().expect("publicador envenenado").take();
+        let antiga = trava_estado(&self.ativa).take();
         let Some(antiga) = antiga else {
             return Ok(false);
         };

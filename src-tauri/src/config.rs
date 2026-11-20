@@ -1,5 +1,6 @@
 use crate::connectors::{Connector, McpEntry, Registry, RegistryError};
 use crate::idiomas::tr;
+use crate::state::trava_estado;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,25 +145,15 @@ pub struct Segredos {
 
 impl Segredos {
     pub fn guardar(&self, chave: &str, valor: &str) {
-        self.valores
-            .lock()
-            .expect("segredos envenenados")
-            .insert(chave.to_string(), valor.to_string());
+        trava_estado(&self.valores).insert(chave.to_string(), valor.to_string());
     }
 
     pub fn esquecer(&self, chave: &str) {
-        self.valores
-            .lock()
-            .expect("segredos envenenados")
-            .remove(chave);
+        trava_estado(&self.valores).remove(chave);
     }
 
     pub fn obter(&self, chave: &str) -> Option<String> {
-        self.valores
-            .lock()
-            .expect("segredos envenenados")
-            .get(chave)
-            .cloned()
+        trava_estado(&self.valores).get(chave).cloned()
     }
 }
 
@@ -352,5 +343,34 @@ mod tests {
             config.servers[0].entry.as_ref().unwrap(),
             McpEntry::Stdio { command, .. } if command == "new"
         ));
+    }
+
+    /// Vermelho-primeiro (CONTRATO): o `expect` na trava dos segredos derrubava a
+    /// thread no meio de uma conexão, e o que ela segurava era o token sorteado
+    /// do servidor publicado — perdido junto com o panic. Cada chave entra e sai
+    /// inteira do `HashMap`, então atrás da trava envenenada está o segredo de
+    /// sempre, e a política certa é `into_inner`.
+    #[test]
+    fn os_segredos_envenenados_devolvem_o_token_em_vez_de_panicar() {
+        let segredos = std::sync::Arc::new(Segredos::default());
+        segredos.guardar("AETHER_MCP_TOKEN", "sorteado");
+
+        let dentro = std::sync::Arc::clone(&segredos);
+        let envenenador = std::thread::spawn(move || {
+            let _guard = dentro.valores.lock().expect("segredos envenenados");
+            panic!("um panic segurando a trava dos segredos");
+        });
+        let _ = envenenador.join();
+        assert!(segredos.valores.is_poisoned(), "o teste não envenenou a trava dos segredos");
+
+        // Recuperar é ler e escrever: o token tem de continuar sendo o mesmo, e
+        // a próxima conexão tem de poder guardar outro sem panicar.
+        assert_eq!(
+            segredos.obter("AETHER_MCP_TOKEN").as_deref(),
+            Some("sorteado"),
+            "o token se perdeu no envenenamento"
+        );
+        segredos.guardar("OUTRA", "valor");
+        assert_eq!(segredos.obter("OUTRA").as_deref(), Some("valor"));
     }
 }

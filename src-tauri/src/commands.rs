@@ -145,7 +145,7 @@ pub async fn call_tool(
 #[tauri::command]
 pub fn pending_approvals(state: State<'_, AppState>) -> Vec<PendingApprovalView> {
     let now = Instant::now();
-    let gate = state.gate.lock().expect("permission gate poisoned");
+    let gate = crate::state::trava_estado(&state.gate);
     let mut pending: Vec<PendingApprovalView> = gate
         .pending()
         .map(|(id, approval)| PendingApprovalView {
@@ -168,43 +168,27 @@ pub fn resolve_approval(state: State<'_, AppState>, id: String, approved: bool) 
 
 #[tauri::command]
 pub fn permission_mode(state: State<'_, AppState>) -> AgentMode {
-    state.gate.lock().expect("permission gate poisoned").mode()
+    crate::state::trava_estado(&state.gate).mode()
 }
 
 #[tauri::command]
 pub fn set_permission_mode(state: State<'_, AppState>, mode: AgentMode) {
-    state
-        .gate
-        .lock()
-        .expect("permission gate poisoned")
-        .set_mode(mode);
+    crate::state::trava_estado(&state.gate).set_mode(mode);
 }
 
 #[tauri::command]
 pub fn session_grants(state: State<'_, AppState>) -> Vec<String> {
-    state
-        .gate
-        .lock()
-        .expect("permission gate poisoned")
-        .session_grants()
+    crate::state::trava_estado(&state.gate).session_grants()
 }
 
 #[tauri::command]
 pub fn grant_session(state: State<'_, AppState>, connector_id: String) {
-    state
-        .gate
-        .lock()
-        .expect("permission gate poisoned")
-        .grant_session(&connector_id);
+    crate::state::trava_estado(&state.gate).grant_session(&connector_id);
 }
 
 #[tauri::command]
 pub fn revoke_session(state: State<'_, AppState>, connector_id: String) {
-    state
-        .gate
-        .lock()
-        .expect("permission gate poisoned")
-        .revoke_session(&connector_id);
+    crate::state::trava_estado(&state.gate).revoke_session(&connector_id);
 }
 
 #[derive(Debug, Serialize)]

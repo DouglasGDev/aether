@@ -9,6 +9,7 @@ use crate::connectors::{ConnectorKind, DesktopOs, McpEntry, Registry, ToolMeta, 
 use crate::idiomas::tr;
 use crate::local::{self, pastas::Pastas};
 use crate::permissions::{PermissionGate, ToolEffect};
+use crate::state::{trava_estado, trava_escrita, trava_leitura};
 use anyhow::{Context, Result, anyhow, bail};
 use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
@@ -163,14 +164,14 @@ impl McpManager {
     pub fn recarregar_embutido(&self) {
         let anunciadas = ferramentas_locais();
         let tools = {
-            let registry = self.registry.read().expect("registry lock poisoned");
+            let registry = trava_leitura(&self.registry);
             if registry.get(local::CONECTOR).is_none() {
                 return;
             }
             permitidas(&registry, local::CONECTOR, &anunciadas)
         };
         {
-            let mut connections = self.connections.write().expect("connections lock poisoned");
+            let mut connections = trava_escrita(&self.connections);
             let Some(connection) = connections.get_mut(local::CONECTOR) else { return };
             connection.anunciadas = anunciadas;
         }
@@ -189,25 +190,17 @@ impl McpManager {
     }
 
     pub fn registry_snapshot(&self) -> Registry {
-        self.registry
-            .read()
-            .expect("registry lock poisoned")
-            .clone()
+        trava_leitura(&self.registry).clone()
     }
 
     // Registering a server from the UI must not tear down live connections, so
     // the allowlist is swapped in place rather than rebuilding the manager.
     pub fn replace_registry(&self, registry: Registry) {
-        *self.registry.write().expect("registry lock poisoned") = registry;
+        *trava_escrita(&self.registry) = registry;
     }
 
     pub fn connected_ids(&self) -> Vec<String> {
-        self.connections
-            .read()
-            .expect("connections lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        trava_leitura(&self.connections).keys().cloned().collect()
     }
 
     fn pastas_concedidas(&self) -> Vec<String> {
@@ -222,10 +215,7 @@ impl McpManager {
     /// última pasta, por exemplo, deixa o servidor de arquivos desconectado, e
     /// isso é um fato que a interface precisa poder mostrar.
     pub async fn recarregar_pastas(&self) -> Vec<(String, String)> {
-        let alvos: Vec<String> = self
-            .connections
-            .read()
-            .expect("connections lock poisoned")
+        let alvos: Vec<String> = trava_leitura(&self.connections)
             .keys()
             .filter(|id| {
                 super::instalador::pronto(id)
@@ -249,7 +239,7 @@ impl McpManager {
 
     pub fn tools(&self, connector_id: &str) -> Vec<ToolInfo> {
         let anunciadas = self.anunciadas(connector_id);
-        let registry = self.registry.read().expect("registry lock poisoned");
+        let registry = trava_leitura(&self.registry);
         permitidas(&registry, connector_id, &anunciadas)
     }
 
@@ -267,9 +257,7 @@ impl McpManager {
     /// portas que o grafo desenha: o que está desligado precisa continuar
     /// visível para poder ser religado.
     pub fn anunciadas(&self, connector_id: &str) -> Vec<ToolInfo> {
-        self.connections
-            .read()
-            .expect("connections lock poisoned")
+        trava_leitura(&self.connections)
             .get(connector_id)
             .map(|c| c.anunciadas.clone())
             .unwrap_or_default()
@@ -299,17 +287,12 @@ impl McpManager {
     }
 
     pub async fn connect(&self, connector_id: &str) -> Result<Vec<ToolInfo>> {
-        if self
-            .connections
-            .read()
-            .expect("connections lock poisoned")
-            .contains_key(connector_id)
-        {
+        if trava_leitura(&self.connections).contains_key(connector_id) {
             bail!(tr("erros.servidorJaConectado", &[("id", connector_id)]));
         }
 
         let stored = {
-            let registry = self.registry.read().expect("registry lock poisoned");
+            let registry = trava_leitura(&self.registry);
             registry.get(connector_id).cloned().ok_or_else(|| {
                 anyhow!(tr("erros.servidorNaoRegistrado", &[("id", connector_id)]))
             })?
@@ -320,10 +303,10 @@ impl McpManager {
         if stored.kind == ConnectorKind::Builtin {
             let anunciadas = ferramentas_locais();
             let tools = {
-                let registry = self.registry.read().expect("registry lock poisoned");
+                let registry = trava_leitura(&self.registry);
                 permitidas(&registry, connector_id, &anunciadas)
             };
-            self.connections.write().expect("connections lock poisoned").insert(
+            trava_escrita(&self.connections).insert(
                 connector_id.to_string(),
                 Connection { canal: Canal::Local, anunciadas },
             );
@@ -391,9 +374,7 @@ impl McpManager {
             Canal::Remoto(sender)
         };
 
-        self.connections
-            .write()
-            .expect("connections lock poisoned")
+        trava_escrita(&self.connections)
             .insert(connector_id.to_string(), Connection { canal, anunciadas });
 
         let _ = self.events.send(McpEvent::ToolsDiscovered {
@@ -406,12 +387,7 @@ impl McpManager {
     // An unanswered approval must not suspend a tool call forever, and expiring
     // it has to resume the waiter as denied rather than leave it parked.
     pub fn expire_approvals(&self) -> Vec<String> {
-        let expired = self
-            .execucao
-            .gate()
-            .lock()
-            .expect("permission gate poisoned")
-            .expire_pending(Instant::now());
+        let expired = trava_estado(&self.execucao.gate()).expire_pending(Instant::now());
         let approvals = self.execucao.aprovacoes();
         for id in &expired {
             approvals.resolve(id, false);
@@ -424,22 +400,14 @@ impl McpManager {
     }
 
     pub async fn disconnect(&self, connector_id: &str) -> Result<()> {
-        let connection = self
-            .connections
-            .write()
-            .expect("connections lock poisoned")
-            .remove(connector_id);
+        let connection = trava_escrita(&self.connections).remove(connector_id);
         let Some(connection) = connection else {
             bail!(tr("erros.servidorNaoConectado", &[("id", connector_id)]));
         };
 
         // Revoke before the process dies, so no waiter can resume against it.
         self.execucao.aprovacoes().cancel_connector(connector_id);
-        self.execucao
-            .gate()
-            .lock()
-            .expect("permission gate poisoned")
-            .flush_connector(connector_id);
+        trava_estado(&self.execucao.gate()).flush_connector(connector_id);
 
         match connection.canal {
             Canal::Remoto(sender) | Canal::Publicado(sender) => {
@@ -459,7 +427,7 @@ impl McpManager {
         arguments: serde_json::Value,
     ) -> Result<CallToolResult> {
         let meta = {
-            let registry = self.registry.read().expect("registry lock poisoned");
+            let registry = trava_leitura(&self.registry);
             ToolMeta::resolve(&registry, qualified_name)
         };
         let meta = match meta {
@@ -497,7 +465,7 @@ impl McpManager {
         };
 
         let (canal, effect) = {
-            let connections = self.connections.read().expect("connections lock poisoned");
+            let connections = trava_leitura(&self.connections);
             let connection = connections.get(&meta.connector_id).ok_or_else(|| {
                 anyhow!(tr("erros.servidorNaoConectado", &[("id", &meta.connector_id)]))
             })?;
@@ -585,7 +553,7 @@ impl McpManager {
         self.segredos.guardar(servidor::VARIAVEL_TOKEN, &token);
 
         let registry = {
-            let mut config = self.config.lock().expect("config envenenada");
+            let mut config = trava_estado(&self.config);
             config.upsert(servidor::conector(&estado));
             config.save(&self.config_path)?;
             config.registry()?
@@ -594,12 +562,7 @@ impl McpManager {
 
         // Uma ligação velha cai com a porta velha; sem isto o conector ficaria
         // "conectado" apontando para um endereço que já não escuta.
-        if self
-            .connections
-            .read()
-            .expect("connections lock poisoned")
-            .contains_key(servidor::CONECTOR)
-        {
+        if trava_leitura(&self.connections).contains_key(servidor::CONECTOR) {
             self.disconnect(servidor::CONECTOR).await.ok();
         }
         self.connect(servidor::CONECTOR).await?;
@@ -609,12 +572,7 @@ impl McpManager {
     /// Derruba o servidor e esquece o segredo. O cadastro fica onde está: é o
     /// conector de sempre, desconectado, pronto para publicar de novo.
     pub async fn despublicar(&self) -> Result<bool> {
-        if self
-            .connections
-            .read()
-            .expect("connections lock poisoned")
-            .contains_key(servidor::CONECTOR)
-        {
+        if trava_leitura(&self.connections).contains_key(servidor::CONECTOR) {
             self.disconnect(servidor::CONECTOR).await.ok();
         }
         let parada = self.publicador.fechar().await?;

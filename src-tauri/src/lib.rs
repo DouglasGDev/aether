@@ -4,6 +4,7 @@ pub mod bancos;
 pub mod commands;
 pub mod config;
 pub mod connectors;
+pub mod contrato;
 pub mod conversas;
 pub mod idiomas;
 pub mod ligacoes;
@@ -31,7 +32,7 @@ pub fn run() {
         .setup(|app| {
             let config_path = Arc::new(app.path().app_config_dir()?.join("mcp.json"));
             let config = Arc::new(Mutex::new(McpConfig::load(&config_path)?));
-            let registry = config.lock().expect("config envenenada").registry()?;
+            let registry = state::trava_estado(&config).registry()?;
             let segredos = Arc::new(crate::config::Segredos::default());
             let gate = Arc::new(Mutex::new(PermissionGate::new(AgentMode::Default)));
             let pastas_path = app.path().app_config_dir()?.join("pastas.json");

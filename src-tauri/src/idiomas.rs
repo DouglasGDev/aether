@@ -3,6 +3,7 @@
 //! O build embute cada JSON daquela pasta, então o núcleo e a interface leem
 //! exatamente as mesmas chaves. Acrescentar um arquivo ali cria um idioma.
 
+use crate::state::{trava_escrita, trava_leitura};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -78,7 +79,7 @@ pub fn disponiveis() -> Vec<Idioma> {
 }
 
 pub fn atual() -> String {
-    escolhido().read().expect("idioma envenenado").clone()
+    trava_leitura(escolhido()).clone()
 }
 
 /// Devolve falso para um idioma que não existe, em vez de trocar por outro.
@@ -86,7 +87,7 @@ pub fn definir(id: &str) -> bool {
     if !catalogos().contains_key(id) {
         return false;
     }
-    *escolhido().write().expect("idioma envenenado") = id.to_string();
+    *trava_escrita(escolhido()) = id.to_string();
     true
 }
 
@@ -130,7 +131,7 @@ pub fn tem_texto(chave: &str) -> bool {
 /// visível, nunca um texto inventado.
 pub fn tr(chave: &str, args: &[(&str, &str)]) -> String {
     let todos = catalogos();
-    let idioma = escolhido().read().expect("idioma envenenado").clone();
+    let idioma = trava_leitura(escolhido()).clone();
     let texto = todos
         .get(&idioma)
         .and_then(|c| c.mensagens.get(chave))
@@ -356,5 +357,24 @@ mod tests {
         let antes = atual();
         assert!(!definir("xx-YY"));
         assert_eq!(atual(), antes);
+    }
+
+    /// Vermelho-primeiro (CONTRATO): o `expect` na trava do idioma derrubava a
+    /// thread que chamasse `tr`, e ela é chamada até por comando síncrono da
+    /// tela — um panic ali fecha o aplicativo inteiro no meio de um clique. O
+    /// escolhido só muda por atribuição inteira, então atrás da trava envenenada
+    /// está a língua de sempre, nunca um texto partido.
+    #[test]
+    fn o_idioma_envenenado_devolve_a_escolha_em_vez_de_panicar() {
+        let antes = atual();
+        let envenenador = std::thread::spawn(|| {
+            let _guard = escolhido().write().expect("idioma envenenado");
+            panic!("um panic segurando a trava do idioma");
+        });
+        let _ = envenenador.join();
+        assert!(escolhido().is_poisoned(), "o teste não envenenou a trava do idioma");
+
+        assert_eq!(atual(), antes, "a escolha se perdeu no envenenamento");
+        assert!(!tr("idioma.nome", &[]).is_empty(), "traduzir panicou na trava envenenada");
     }
 }

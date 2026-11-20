@@ -72,6 +72,12 @@ tem de vir de um log ou de uma medição desta máquina, com o comando que o pro
   intacta no disco. A trava do motor não recupera nada: sob ela os pesos são
   montados delta a delta, então o payload pode estar pela metade — descarta-se o
   motor e devolve-se o motivo real (`state::AiRuntime::trava_motor`).
+  **Esta regra é conferida no próprio fonte**: `src-tauri/src/contrato.rs` varre
+  os arquivos de produção e falha `cargo test --lib` em qualquer `.lock()` /
+  `.read()` / `.write()` seguido de `expect`/`unwrap` fora de `#[cfg(test)]`. O
+  erro imprime `arquivo:linha → fonte` para cada um, com a política a tomar. Uma
+  trava que não pode recuperar sem deixar um payload pela metade tem de mudar de
+  ordem ou de construção — não de regra; ver `docs/melhorias/CONTRATO.md`, C4.
 - Ferramenta que o modelo pediu passa pelo gate. Não existe atalho de execução
   para o conector local: ele entra no mesmo cadastro que um servidor MCP.
 - Entrada nova no catálogo de modelos entra medida, não estimada: os bytes vêm do

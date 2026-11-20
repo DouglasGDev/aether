@@ -515,3 +515,54 @@ do LLM (pesos + placa + `llama.dll`), o pino das DLLs com as três bibliotecas e
 disco, o `desligar` de 5 s contra um servidor teimoso e qualquer verificação no
 aplicativo aberto. Os 11 `ignored` são os do aperto de mão TLS, que pedem servidor
 na rede.
+
+## Passagem do maintainer sobre a sexta leva (medido 2026-11-20)
+
+Um item, `CONTRATO`, e ele não começou no código: começou na constatação de que a
+regra mais repetida do `CONTRIBUTING.md` — a das travas, `:67-74` — era a única
+sem nenhum instrumento. Dossiê completo em `CONTRATO.md`.
+
+- **A regra virou teste.** `src-tauri/src/contrato.rs` não tem uma linha de
+  produção: lê o fonte do crate, corta comentários e literais, corta os blocos
+  `#[cfg(test)]` (onde o `expect` é instrumento do teste, não defeito), emenda as
+  linhas para enxergar a cadeia que o `rustfmt` quebrou e falha o teste listando
+  cada `arquivo:linha → fonte`. Vermelho da primeira corrida: **121 travas**. O
+  guarda tem um caso que o confere (`o_guarda_ve_o_panic_na_trava_de_dado`) e o
+  teste principal exige que a varredura tenha achado os arquivos, porque verde por
+  fonte ausente é o falso verde que ninguém procura.
+- **Os 121, por três escritores em arquivos disjuntos.** `ai/memoria.rs` (43)
+  ficou comigo; o grupo MCP (40) e o grupo voz+conversas (25) e o grupo
+  comandos/idiomas/config/lib (13) foram delegados, um escritor por arquivo, cada
+  site com a pureza provada. O cache do Whisper é o caso que mais parece
+  gambiarra e não é: atrás daquela trava há um **ponteiro cru do sherpa**, e ele
+  recupera porque os dois caminhos que o tocam tiram o `Some` com `take` antes de
+  chamar `destruir_reconhecedor` — não existe instrução que deixe ponteiro morto
+  dentro do cache (`CONTRATO.md`, C2).
+- **A exceção que virou correção.** O agente do MCP parou em `manager.rs:412` em
+  vez de varrer, e estava certo: `flush_connector` mexe em duas coleções, e o
+  meio-state de um panic entre as duas era o permissivo — conector ainda confiado
+  com as aprovações apagadas, decidido `Allow` sem card depois de reconectar. A
+  correção foi a ordem (`permissions/mod.rs:164`): a confiança cai primeiro, o
+  meio que sobra passa a ser o restrito, e a trava volta a ser recuperável. O
+  guarda fecha em **zero violações sem lista de exceção**.
+- **Regras que este lote quebrou de propósito, e o que aconteceu.** A regra 7
+  ("não rodar `cargo` durante o lote, a árvore é compartilhada") não foi
+  obedecida: os três escritores rodaram o próprio `cargo check` na mesma árvore.
+  Não houve compilação de arquivo pela metade porque os conjuntos de arquivos
+  eram disjuntos e cada um conferiu depois de editar — mas é sorte, não projeto,
+  e o gate final foi re-corrido por mim sobre a árvore inteira junta, que é o
+  número que vale abaixo.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **565 passaram, 0
+falharam, 11 ignored, finished in 4.77 s** (eram 560; +2 do guarda, +3 de
+recuperação em runtime); `cargo test --lib contrato` → **2, 0,12 s**;
+`cargo test --lib conversas` → **27, 3,03 s**; `cargo test --lib voz` → **26 + 1
+ignored, 0,25 s**; `cargo test --lib permissions` → **12, 0,00 s**;
+`cargo check --all-targets` → **zero avisos, 4.38 s**; `npm run build` → **OK,
+`✓ built in 196 ms`**.
+
+Fora do alcance, e não tocado: nenhum envenenamento real foi observado no
+aplicativo aberto — o que existe é a thread de teste que panica segurando a
+trava. O `flush_connector` com processo morto de verdade, e qualquer crash real
+no meio de uma carga de pesos, continuam na rota do motor (descartar e avisar),
+que já tem teste próprio (`state.rs:792`).

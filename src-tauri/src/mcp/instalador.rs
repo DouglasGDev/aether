@@ -8,6 +8,7 @@
 
 use crate::connectors::{Connector, ConnectorCategory, ConnectorKind, McpAuth, McpEntry};
 use crate::idiomas::tr;
+use crate::state::trava_estado;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -523,7 +524,7 @@ impl Instalacoes {
 
     /// None quando já há uma tarefa para este servidor.
     pub fn iniciar(&self, id: &str) -> Option<Arc<AtomicBool>> {
-        let mut jobs = self.jobs.lock().expect("instalações envenenadas");
+        let mut jobs = trava_estado(&self.jobs);
         if jobs.contains_key(id) {
             return None;
         }
@@ -533,11 +534,11 @@ impl Instalacoes {
     }
 
     pub fn encerrar(&self, id: &str) {
-        self.jobs.lock().expect("instalações envenenadas").remove(id);
+        trava_estado(&self.jobs).remove(id);
     }
 
     pub fn cancelar(&self, id: &str) -> bool {
-        match self.jobs.lock().expect("instalações envenenadas").get(id) {
+        match trava_estado(&self.jobs).get(id) {
             Some(cancel) => {
                 cancel.store(true, Ordering::Relaxed);
                 true
@@ -547,13 +548,7 @@ impl Instalacoes {
     }
 
     pub fn em_curso(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .jobs
-            .lock()
-            .expect("instalações envenenadas")
-            .keys()
-            .cloned()
-            .collect();
+        let mut ids: Vec<String> = trava_estado(&self.jobs).keys().cloned().collect();
         ids.sort();
         ids
     }

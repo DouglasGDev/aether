@@ -151,8 +151,18 @@ impl PermissionGate {
         self.pending.remove(id)
     }
 
-    // A stopping server must not leave approvals pointing at a dead process.
+    /// Um conector que para não pode deixar aprovações apontando para um
+    /// processo morto.
+    ///
+    /// A confiança cai antes das aprovações, e a ordem é o que permite recuperar a
+    /// trava: os dois conjuntos são mutados um depois do outro, então um panic no
+    /// meio deixa um estado que não é o de antes nem o de depois. Escolhido o
+    /// meio que sobra, sobra o restrito — sem a confiança, uma aprovação órfã não
+    /// autoriza chamada nenhuma, e ela morre sozinha no `expire_pending`. Pelo
+    /// caminho contrário a aprovação apagada deixaria o conector reconectado
+    /// decidido como `Allow` sem card, e o motor nem saberia perguntar.
     pub fn flush_connector(&mut self, connector_id: &str) -> Vec<String> {
+        self.session_grants.remove(connector_id);
         let stale: Vec<String> = self
             .pending
             .iter()
@@ -162,7 +172,6 @@ impl PermissionGate {
         for id in &stale {
             self.pending.remove(id);
         }
-        self.session_grants.remove(connector_id);
         stale
     }
 

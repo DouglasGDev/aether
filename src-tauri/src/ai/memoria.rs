@@ -17,6 +17,7 @@ use super::catalog::{self, ModelSpec};
 use super::ggml::{Despacho, Embutidor};
 use crate::idiomas::tr;
 use crate::local::pastas::Pastas;
+use crate::state::{trava_estado, trava_escrita, trava_leitura};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1617,7 +1618,7 @@ impl Custodio {
     }
 
     pub fn ajustes(&self) -> Ajustes {
-        self.ajustes.lock().expect("ajustes de memória envenenados").clone()
+        trava_estado(&self.ajustes).clone()
     }
 
     /// Grava a escolha e derruba o que depender dela. Trocar de codificador
@@ -1627,11 +1628,11 @@ impl Custodio {
         let novos = novos.aprovar();
         let antes = self.ajustes();
         novos.salvar(&self.ajustes_path)?;
-        *self.ajustes.lock().expect("ajustes de memória envenenados") = novos.clone();
+        *trava_estado(&self.ajustes) = novos.clone();
         if novos.trocou_codificador(&antes) {
-            *self.carregado.lock().expect("codificador envenenado") = None;
-            *self.info_motor.write().expect("espelho do motor envenenado") = None;
-            *self.indice.write().expect("índice envenenado") = None;
+            *trava_estado(&self.carregado) = None;
+            *trava_escrita(&self.info_motor) = None;
+            *trava_escrita(&self.indice) = None;
         }
         Ok(novos)
     }
@@ -1668,9 +1669,9 @@ impl Custodio {
         if self.esta_indexando() {
             bail!(tr("erros.memoriaOcupada", &[]));
         }
-        *self.indice.write().expect("índice envenenado") = None;
-        *self.progresso.write().expect("progresso envenenado") = Progresso::default();
-        *self.concluido_em.lock().expect("data envenenada") = None;
+        *trava_escrita(&self.indice) = None;
+        *trava_escrita(&self.progresso) = Progresso::default();
+        *trava_estado(&self.concluido_em) = None;
         match std::fs::remove_file(&self.caminho_indice) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1687,7 +1688,7 @@ impl Custodio {
     /// trabalho de ler as pastas.
     pub fn soltar(&self, id: &str) -> Result<bool> {
         let era = {
-            let mut guard = self.carregado.lock().expect("codificador envenenado");
+            let mut guard = trava_estado(&self.carregado);
             let era = guard.as_ref().map(|c| c.ids == id).unwrap_or(false);
             if era {
                 if self.esta_indexando() {
@@ -1695,12 +1696,12 @@ impl Custodio {
                     bail!(tr("erros.memoriaIndexando", &[]));
                 }
                 *guard = None;
-                *self.info_motor.write().expect("espelho do motor envenenado") = None;
+                *trava_escrita(&self.info_motor) = None;
             }
             era
         };
         if era {
-            *self.indice.write().expect("índice envenenado") = None;
+            *trava_escrita(&self.indice) = None;
         }
         Ok(era)
     }
@@ -1739,7 +1740,7 @@ impl Custodio {
     fn carregado(&self) -> Result<std::sync::MutexGuard<'_, Option<Carregado>>> {
         let spec = self.spec().ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
         let alvo = self.ajustes().peca as usize;
-        let mut guard = self.carregado.lock().expect("codificador envenenado");
+        let mut guard = trava_estado(&self.carregado);
         // A peça escolhida maior que a janela que o motor aceitou mudaria o teto
         // real do lote: recarrega, em vez de embutir peça cortada.
         let servindo = guard
@@ -1753,7 +1754,7 @@ impl Custodio {
             // `carregado` antes de `info_motor`; `estado()` só lê `info_motor`, e
             // ninguém pega `info_motor` antes de `carregado`, então não há ciclo.
             if let Some(c) = guard.as_ref() {
-                *self.info_motor.write().expect("espelho do motor envenenado") = Some(InfoMotor {
+                *trava_escrita(&self.info_motor) = Some(InfoMotor {
                     dispositivo: c.embutidor.dispositivo.clone(),
                     na_placa: c.embutidor.na_placa,
                     agrupamento: c.embutidor.agrupamento.to_string(),
@@ -1784,13 +1785,13 @@ impl Custodio {
     /// busca e tela — não passam por aqui: clonar doze mil vetores de mil
     /// dimensões custa quarenta e nove megabytes por consulta.
     fn indice_na_memoria(&self) -> Option<Indice> {
-        if let Some(indice) = self.indice.read().expect("índice envenenado").as_ref() {
+        if let Some(indice) = trava_leitura(&self.indice).as_ref() {
             return Some(copiar(indice));
         }
         let spec = self.spec()?;
         let indice = self.do_disco(spec, None)?;
         let devolvido = copiar(&indice);
-        *self.indice.write().expect("índice envenenado") = Some(indice);
+        *trava_escrita(&self.indice) = Some(indice);
         Some(devolvido)
     }
 
@@ -1798,9 +1799,9 @@ impl Custodio {
     /// no momento da busca: revogar uma pasta tira o conteúdo dela da resposta
     /// antes de tirar do índice.
     fn procurar(&self, busca: &Busca) -> Result<Resposta> {
-        let raizes = self.pastas.read().expect("pastas envenenadas").raizes.clone();
+        let raizes = trava_leitura(&self.pastas).raizes.clone();
         {
-            let guard = self.indice.read().expect("índice envenenado");
+            let guard = trava_leitura(&self.indice);
             if let Some(indice) = guard.as_ref() {
                 return indice.buscar(busca, &raizes);
             }
@@ -1812,7 +1813,7 @@ impl Custodio {
             .do_disco(spec, Some(busca.vetor.len()))
             .ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemIndice", &[])))?;
         let resposta = indice.buscar(busca, &raizes)?;
-        *self.indice.write().expect("índice envenenado") = Some(indice);
+        *trava_escrita(&self.indice) = Some(indice);
         Ok(resposta)
     }
 
@@ -1826,14 +1827,14 @@ impl Custodio {
         &self,
         alterar: impl FnOnce(&mut Indice) -> usize,
     ) -> Result<usize> {
-        let _trava = self.escritores.lock().expect("trava de escritores envenenada");
+        let _trava = trava_estado(&self.escritores);
         let Some(mut indice) = self.indice_na_memoria() else {
             return Ok(0);
         };
         let feitos = alterar(&mut indice);
         if feitos > 0 {
             indice.salvar(&self.caminho_indice)?;
-            *self.indice.write().expect("índice envenenado") = Some(indice);
+            *trava_escrita(&self.indice) = Some(indice);
         }
         Ok(feitos)
     }
@@ -1846,7 +1847,7 @@ impl Custodio {
         if self.esta_indexando() {
             return Ok(0);
         }
-        let raizes = self.pastas.read().expect("pastas envenenadas").raizes.clone();
+        let raizes = trava_leitura(&self.pastas).raizes.clone();
         self.escrever_indice(|indice| indice.reter_dentro(&raizes))
     }
 
@@ -1855,7 +1856,7 @@ impl Custodio {
     /// quadro não é estado — é vazamento.
     fn ler_indice(&self) -> Leitura {
         {
-            let guard = self.indice.read().expect("índice envenenado");
+            let guard = trava_leitura(&self.indice);
             if let Some(indice) = guard.as_ref() {
                 return leitura(indice);
             }
@@ -1898,7 +1899,7 @@ impl Custodio {
             // O turno continua sem a lembrança nova, e é por isso que o erro não
             // pode sumir: ele fica onde a tela de memória já mostra os outros, e
             // diz por que o índice está atrás do histórico.
-            *self.erro.lock().expect("erro envenenado") = Some(format!("{erro:#}"));
+            *trava_estado(&self.erro) = Some(format!("{erro:#}"));
         }
         resultado
     }
@@ -1913,14 +1914,14 @@ impl Custodio {
         // `revogar`/revalidações concorrentes, segurada do ler-cópia ao publicar.
         // Ordem `escritores → carregado → indice`; a varredura não pega esta
         // trava, então não há como fechar um ciclo contra ela.
-        let _trava = self.escritores.lock().expect("trava de escritores envenenada");
+        let _trava = trava_estado(&self.escritores);
         let Some(spec) = self.spec() else {
             // Sem codificador não há vetor, e sem vetor a conversa não entra. A
             // tela já diz isto por `auto`; aqui basta não fazer nada.
             return Ok(0);
         };
         let pendente = {
-            let guard = self.indice.read().expect("índice envenenado");
+            let guard = trava_leitura(&self.indice);
             match guard.as_ref() {
                 Some(indice) => indice.conversas_pendentes(vivas),
                 None => vivas.len(),
@@ -1948,12 +1949,12 @@ impl Custodio {
             // foram cortadas na antiga também. A gravação imediata é o que faz
             // um índice esvaziado sobreviver mesmo se o turno cair no meio.
             indice.salvar(&self.caminho_indice)?;
-            *self.indice.write().expect("índice envenenado") = Some(copiar(&indice));
+            *trava_escrita(&self.indice) = Some(copiar(&indice));
         }
         let mudadas = self.escrever_conversas(&mut indice, carregado, vivas, orcamento)?;
         if mudadas > 0 {
             indice.salvar(&self.caminho_indice)?;
-            *self.indice.write().expect("índice envenenado") = Some(indice);
+            *trava_escrita(&self.indice) = Some(indice);
         }
         Ok(mudadas)
     }
@@ -2077,7 +2078,7 @@ impl Custodio {
     }
 
     pub fn progresso(&self) -> Progresso {
-        self.progresso.read().expect("progresso envenenado").clone()
+        trava_leitura(&self.progresso).clone()
     }
 
     /// Tudo que a tela de memória mostra, lido agora.
@@ -2087,7 +2088,7 @@ impl Custodio {
         // Lemos o espelho, nunca o `carregado`: a varredura segura o lock do
         // motor do primeiro ao último arquivo, e esta função é chamada no loop da
         // tela. Pedir o lock aqui congelaria a UI enquanto a varredura corre.
-        let vivo = self.info_motor.read().expect("espelho do motor envenenado").clone();
+        let vivo = trava_leitura(&self.info_motor).clone();
         let disco = self.ler_indice();
         let indexados = disco.trechos;
         Estado {
@@ -2113,8 +2114,8 @@ impl Custodio {
             bytes: std::fs::metadata(&self.caminho_indice).map(|m| m.len()).unwrap_or(0),
             indexando: self.esta_indexando(),
             progresso: self.progresso(),
-            erro: self.erro.lock().expect("erro envenenado").clone(),
-            concluido_em: *self.concluido_em.lock().expect("data envenenada"),
+            erro: trava_estado(&self.erro).clone(),
+            concluido_em: *trava_estado(&self.concluido_em),
             auto: if !fio_ligado {
                 "semFio"
             } else if ajustes.trechos == 0 {
@@ -2142,9 +2143,9 @@ impl Custodio {
             bail!(tr("erros.memoriaOcupada", &[]));
         }
         self.cancelado.store(false, Ordering::Relaxed);
-        *self.erro.lock().expect("erro envenenado") = None;
+        *trava_estado(&self.erro) = None;
         let inicio = Instant::now();
-        *self.progresso.write().expect("progresso envenenado") = Progresso {
+        *trava_escrita(&self.progresso) = Progresso {
             concluidos: 0,
             total: 0,
             arquivo: String::new(),
@@ -2155,7 +2156,7 @@ impl Custodio {
         match resultado {
             Ok(mut resumo) => {
                 resumo.ms = inicio.elapsed().as_millis() as u64;
-                *self.concluido_em.lock().expect("data envenenada") = Some(agora_ms());
+                *trava_estado(&self.concluido_em) = Some(agora_ms());
                 let cancelado = resumo.cancelado;
                 emitir(if cancelado {
                     Evento::Cancelado { resumo: resumo.clone() }
@@ -2166,7 +2167,7 @@ impl Custodio {
             }
             Err(erro) => {
                 let texto = format!("{erro:#}");
-                *self.erro.lock().expect("erro envenenado") = Some(texto.clone());
+                *trava_estado(&self.erro) = Some(texto.clone());
                 emitir(Evento::Falhou { erro: texto });
                 Err(erro)
             }
@@ -2179,7 +2180,7 @@ impl Custodio {
         emitir: &mut dyn FnMut(Evento),
     ) -> Result<Resumo> {
         let spec = self.spec().ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
-        let raizes = self.pastas.read().expect("pastas envenenadas").raizes.clone();
+        let raizes = trava_leitura(&self.pastas).raizes.clone();
         if raizes.is_empty() && conversas.is_empty() {
             // Nada para ler em lugar nenhum. Mas conversa salva já é memória:
             // sem pasta concedida o varrer ainda lembrado o histórico.
@@ -2243,7 +2244,7 @@ impl Custodio {
         let mut truncado = false;
         let mut cancelado = false;
         {
-            let mut p = self.progresso.write().expect("progresso envenenado");
+            let mut p = trava_escrita(&self.progresso);
             p.total = total;
         }
 
@@ -2254,7 +2255,7 @@ impl Custodio {
             }
             let chave = caminho.display().to_string();
             if indice.esta_visto(&chave, &assinatura) {
-                let mut p = self.progresso.write().expect("progresso envenenado");
+                let mut p = trava_escrita(&self.progresso);
                 p.concluidos = numero + 1;
                 p.arquivo = chave.clone();
                 continue;
@@ -2264,7 +2265,7 @@ impl Custodio {
                 // Arquivo que sumiu ou que não abriu: a próxima varredura tenta
                 // de novo, porque nada aqui foi provado sobre ele.
                 Err(_) => {
-                    let mut p = self.progresso.write().expect("progresso envenenado");
+                    let mut p = trava_escrita(&self.progresso);
                     p.concluidos = numero + 1;
                     continue;
                 }
@@ -2284,7 +2285,7 @@ impl Custodio {
             indice.adicionar(&chave, assinatura, &prontas);
             relidos += 1;
             {
-                let mut p = self.progresso.write().expect("progresso envenenado");
+                let mut p = trava_escrita(&self.progresso);
                 p.concluidos = numero + 1;
                 p.arquivo = chave.clone();
                 p.trechos = indice.trechos();
@@ -2297,7 +2298,7 @@ impl Custodio {
             });
             if numero > 0 && numero % SALVAR_A_CADA == 0 {
                 {
-                    let mut guard = self.indice.write().expect("índice envenenado");
+                    let mut guard = trava_escrita(&self.indice);
                     *guard = Some(copiar(&indice));
                 }
                 indice.salvar(&self.caminho_indice)?;
@@ -2310,7 +2311,7 @@ impl Custodio {
         // Uma pasta revogada no meio da varredura não pode voltar pelo arquivo
         // nem continuar em memória: a última palavra é da lista viva de
         // concessões, e ela vem depois de todo o trabalho.
-        let vivas = self.pastas.read().expect("pastas envenenadas").raizes.clone();
+        let vivas = trava_leitura(&self.pastas).raizes.clone();
         indice.reter_dentro(&vivas);
 
         // O varrer é também o ponto em que o histórico inteiro entra na memória,
@@ -2329,7 +2330,7 @@ impl Custodio {
             cancelado,
         };
         {
-            let mut guard = self.indice.write().expect("índice envenenado");
+            let mut guard = trava_escrita(&self.indice);
             *guard = Some(copiar(&indice));
         }
         indice.salvar(&self.caminho_indice)?;

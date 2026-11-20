@@ -14,6 +14,7 @@ use crate::connectors::Registry;
 use crate::idiomas::tr;
 use crate::local::{self, pastas::Pastas};
 use crate::permissions::{Decision, PendingApproval, PermissionGate, ToolEffect};
+use crate::state::{trava_estado, trava_leitura};
 use anyhow::{Result, anyhow, bail};
 use rmcp::model::{CallToolResult, ContentBlock};
 use std::path::PathBuf;
@@ -110,9 +111,7 @@ impl Execucao {
     /// `manager::permitidas`: sem cadastro não há decisão registrada, e uma
     /// permissão não se deduz do silêncio de quem decide.
     pub fn permite_local(&self, nome: &str) -> bool {
-        self.registry
-            .read()
-            .expect("registry envenenada")
+        trava_leitura(&self.registry)
             .get(local::CONECTOR)
             .is_some_and(|c| c.allows_tool(nome))
     }
@@ -121,9 +120,7 @@ impl Execucao {
     /// lista vai na linha de comando do processo filho, então mudar a concessão
     /// obriga a relançar quem depende dela.
     pub fn pastas_concedidas(&self) -> Vec<String> {
-        self.pastas
-            .read()
-            .expect("pastas envenenadas")
+        trava_leitura(&self.pastas)
             .raizes
             .iter()
             .map(|r| r.display().to_string())
@@ -145,11 +142,7 @@ impl Execucao {
         argumentos: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         let compound = argumentos_contem_composto(argumentos);
-        let decision = self
-            .gate
-            .lock()
-            .expect("permission gate poisoned")
-            .decide(connector_id, efeito, compound);
+        let decision = trava_estado(&self.gate).decide(connector_id, efeito, compound);
 
         match decision {
             Decision::Deny => {
@@ -164,19 +157,16 @@ impl Execucao {
                     arguments: serde_json::Value::Object(argumentos.clone()),
                 };
                 let receiver = self.approvals.register(&request);
-                self.gate
-                    .lock()
-                    .expect("permission gate poisoned")
-                    .insert_pending(
-                        request.id.clone(),
-                        PendingApproval {
-                            connector_id: request.connector_id.clone(),
-                            tool: request.tool.clone(),
-                            effect: efeito,
-                            compound,
-                            created_at: Instant::now(),
-                        },
-                    );
+                trava_estado(&self.gate).insert_pending(
+                    request.id.clone(),
+                    PendingApproval {
+                        connector_id: request.connector_id.clone(),
+                        tool: request.tool.clone(),
+                        effect: efeito,
+                        compound,
+                        created_at: Instant::now(),
+                    },
+                );
                 let _ = self
                     .events
                     .send(McpEvent::ApprovalRequested {
@@ -187,10 +177,7 @@ impl Execucao {
                 // voltar atrás.
                 let outcome = wait_for_decision(receiver).await;
 
-                self.gate
-                    .lock()
-                    .expect("permission gate poisoned")
-                    .resolve_pending(&request.id);
+                trava_estado(&self.gate).resolve_pending(&request.id);
                 let _ = self.events.send(McpEvent::ApprovalSettled {
                     id: request.id.clone(),
                     approved: outcome.is_approved(),
@@ -236,7 +223,7 @@ impl Execucao {
 
         // Uma cópia das pastas, nunca o lock atravessando o await: a concessão de
         // uma pasta não pode ficar presa atrás de um comando.
-        let pastas = self.pastas.read().expect("pastas envenenadas").clone();
+        let pastas = trava_leitura(&self.pastas).clone();
         let memoria = Arc::clone(&self.memoria);
         let derrame = Arc::clone(&self.derrame);
         let nome = ferramenta.to_string();

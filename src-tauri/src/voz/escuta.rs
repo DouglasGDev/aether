@@ -15,6 +15,7 @@
 use super::ffi::{ConfigReconhecimento, Opaco, Sherpa};
 use super::modelos::EspecVoz;
 use crate::idiomas::tr;
+use crate::state::trava_estado;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Host, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
@@ -67,8 +68,12 @@ struct Estado {
 }
 
 impl Estado {
+    /// Dado puro: um `Option<String>` trocado por atribuição inteira. Um panic
+    /// segurando esta trava deixa o aviso de antes ou o de depois, nunca um aviso
+    /// partido — e `erro()` e `transcrever()` leem daqui na thread da janela,
+    /// onde `expect` fecharia a aplicação em vez de mostrar o motivo.
     fn avisar(&self, texto: Option<String>) {
-        *self.aviso.lock().expect("aviso de escuta envenenado") = texto;
+        *trava_estado(&self.aviso) = texto;
     }
 }
 
@@ -87,8 +92,18 @@ pub(crate) fn nivel_de(pico: f32) -> f32 {
 pub struct Escuta {
     sherpa: Arc<Sherpa>,
     estado: Arc<Estado>,
+    /// A escuta em curso, sempre escrita inteira: um `Captura` nasce do literal
+    /// e sai por `take`. Sob um panic isto é `None` ou o par completo, e as duas
+    /// leituras são verdadeiras — por isso a trava recupera com `into_inner`.
     captura: Mutex<Option<Captura>>,
     /// (pasta do modelo, instância)
+    ///
+    /// Guarda um ponteiro cru do sherpa, e mesmo assim é dado puro: os dois
+    /// caminhos que o tocam (`na_cache`, `largar`) primeiro tiram o `Some` com
+    /// `take` e só depois chamam `destruir_reconhecedor`. Não existe instrução
+    /// entre a trava e o valor que deixe um ponteiro morto dentro do cache, então
+    /// o que um panic devolve é `None` ou uma instância viva — nunca uma
+    /// instância já destruída, que é o que uma decodificação seguiria usando.
     recon: Mutex<Option<(PathBuf, Opaco)>>,
 }
 
@@ -106,7 +121,7 @@ impl Escuta {
     /// `transcrever` pedir. `entrada` é o nome escolhido na tela; vazio é o
     /// microfone padrão do sistema.
     pub fn ouvir(&self, entrada: String) -> Result<(), String> {
-        let mut em_curso = self.captura.lock().expect("escuta envenenada");
+        let mut em_curso = trava_estado(&self.captura);
         if em_curso.is_some() {
             return Err(tr("erros.vozEscutaEmCurso", &[]));
         }
@@ -127,10 +142,7 @@ impl Escuta {
     /// Demora menos que a própria fala: medido, o fator em tempo real do
     /// Whisper base int8 é 0,117.
     pub fn transcrever(&self, dir: &Path, espec: &EspecVoz) -> Result<String, String> {
-        let captura = self
-            .captura
-            .lock()
-            .expect("escuta envenenada")
+        let captura = trava_estado(&self.captura)
             .take()
             .ok_or_else(|| tr("erros.vozNaoOuvindo", &[]))?;
         captura.parar.store(true, Ordering::Relaxed);
@@ -144,7 +156,7 @@ impl Escuta {
         if amostras.len() < (taxa as f32 * MENOS_QUE_UM_SILABO) as usize {
             // O motivo de haver pouco áudio é outro quando o microfone nem
             // abriu: devolve o aviso da thread, não uma desculpa genérica.
-            let guard = self.estado.aviso.lock().expect("aviso de escuta envenenado");
+            let guard = trava_estado(&self.estado.aviso);
             return Err(guard.clone().unwrap_or_else(|| tr("erros.vozSemFala", &[])));
         }
         if pico(&amostras) < SEM_SINAL {
@@ -169,7 +181,7 @@ impl Escuta {
         let texto = {
             // A decodificação acontece com o lock da instância tomado: é a mesma
             // que um `largar` destrói, e as duas nunca podem se cruzar.
-            let mut cache = self.recon.lock().expect("reconhecedor envenenado");
+            let mut cache = trava_estado(&self.recon);
             let opaco = self.na_cache(&mut cache, dir, espec)?;
             // A instância só é destruída sob este mesmo lock, então não há
             // decodificação com ponteiro solto.
@@ -184,7 +196,7 @@ impl Escuta {
     /// houver uma decodificação em curso, ela segura o mesmo lock: esperada.
     pub fn largar(&self, dir: &Path) {
         self.descartar();
-        let mut cache = self.recon.lock().expect("reconhecedor envenenado");
+        let mut cache = trava_estado(&self.recon);
         if cache.as_ref().is_some_and(|(aberta, _)| aberta == dir) {
             if let Some((_, velho)) = cache.take() {
                 self.sherpa.destruir_reconhecedor(velho);
@@ -196,7 +208,7 @@ impl Escuta {
     /// áudio vai fora, mas a thread é esperada, para o próximo clique abrir com
     /// o buffer vazio e o estado coerente.
     pub fn descartar(&self) {
-        let Some(captura) = self.captura.lock().expect("escuta envenenada").take() else {
+        let Some(captura) = trava_estado(&self.captura).take() else {
             return;
         };
         captura.parar.store(true, Ordering::Relaxed);
@@ -238,11 +250,7 @@ impl Escuta {
     }
 
     pub fn erro(&self) -> Option<String> {
-        self.estado
-            .aviso
-            .lock()
-            .expect("aviso de escuta envenenado")
-            .clone()
+        trava_estado(&self.estado.aviso).clone()
     }
 }
 

@@ -13,6 +13,7 @@
 
 use super::ffi::{ConfigGeracao, ConfigTts, Opaco, Sherpa};
 use crate::idiomas::tr;
+use crate::state::trava_estado;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Host, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
@@ -137,8 +138,10 @@ impl Estado {
         self.corte.store(self.prox.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
+    /// `Option<String>` trocado por atribuição inteira: não há meia frase de
+    /// aviso para ficar atrás de um panic, e `erro()` é lido na thread da janela.
     fn avisar(&self, texto: Option<String>) {
-        *self.aviso.lock().expect("aviso de fala envenenado") = texto;
+        *trava_estado(&self.aviso) = texto;
     }
 }
 
@@ -153,6 +156,11 @@ struct Contexto {
 
 /// A boca do Aether: uma thread só, dona do modelo e do alto-falante.
 pub struct Parlante {
+    /// A ponta escritora do canal, presa numa trava só para `send` ser chamado
+    /// por uma thread de cada vez. Ela nunca é reescrita depois de `novo`, e é
+    /// por isso que a trava recupera do envenenamento: o `Sender` atrás da trava
+    /// envenenada é exatamente o mesmo `Sender` de antes — não há valor partido
+    /// para descartar, e `send` ou põe o pedido na fila inteiro ou devolve erro.
     pedidos: Mutex<Sender<Pedido>>,
     estado: Arc<Estado>,
     _thread: JoinHandle<()>,
@@ -247,9 +255,7 @@ impl Parlante {
     }
 
     fn mandar(&self, pedido: Pedido) -> Result<(), String> {
-        self.pedidos
-            .lock()
-            .expect("fila de fala envenenada")
+        trava_estado(&self.pedidos)
             .send(pedido)
             .map_err(|_| tr("erros.vozFilaFechada", &[]))
     }
@@ -265,7 +271,7 @@ impl Parlante {
     /// O erro da última tentativa, ou None depois de uma que deu certo. Falar é
     /// assíncrono: um alto-falante ausente só se revela aqui.
     pub fn erro(&self) -> Option<String> {
-        self.estado.aviso.lock().expect("aviso de fala envenenado").clone()
+        trava_estado(&self.estado.aviso).clone()
     }
 }
 
