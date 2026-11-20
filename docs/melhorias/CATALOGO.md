@@ -78,15 +78,17 @@ arquiteturas, e é o próprio teste do catálogo que confere —
 - **Qwen3.5** é o parente direto do Ornith 1.5 que já estava dentro: mesma
   arquitetura, mesma janela, e o mesmo tokenizador — os 12.807.982 bytes de
   `tokenizer.json` de `Qwen/Qwen3.5-4B` têm o `lfs.oid`
-  `5f9e4d49…` idêntico ao do `ornith-ai/Ornith-1.5-9B`. Isso foi lido dos dois
-  lados, não copiado de um para o outro, e é a melhor evidência disponível de
-  que a família é a mesma. O template declara o bloco `<tools>` e o marcador de
-  chamada de ferramenta: a gramática de ferramenta que a sessão já sabe ler.
+  `5f9e4d49…` idêntico aos 12.807.982 bytes de `ornith-ai/Ornith-1.5-9B`, e as
+  duas somas foram lidas cada uma do próprio repositório. É a melhor evidência
+  disponível de que a família é a mesma. Os 7.816 caracteres do template dele
+  carregam o bloco de ferramentas em XML — mesmas palavras que a gramática do
+  laço, lidas como nomes de tag, sem byte comum entre os dois textos.
 - **Gemma 4 12B** entra pela arquitetura registrada e pelo `general.license`
   lido do arquivo (`apache-2.0`), mas **não** entra como modelo de ferramentas
-  verificado: o template dele usa marcadores próprios (`<tool_call`, `name`),
-  não o XML que o laço do Aether escreve e parseia. O que ele faz no laço de
-  ferramentas não foi medido — vê abaixo.
+  verificado: os 18.922 caracteres do template declaram a chamada de ferramenta
+  com os marcadores próprios do modelo, e o laço do Aether escreve e lê o XML da
+  família do Qwen. O que ele faz numa rodada de ferramentas não foi medido —
+  vê abaixo.
 - **GLM-5.3-Flash ficou de fora por um motivo concreto**: os quants do
   repositório vêm em partes (`GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf`), e
   o downloader do Aether baixa um arquivo por entrada. Um modelo dividido em
@@ -113,10 +115,13 @@ não abrir o app mantém fechado:
    Conferir é `engine_probe alojar:` com o peso em disco.
 2. **A qualidade do texto e o custo por rodada** (tokens de entrada e saída,
    t/s) — medição de turno, placa, aplicativo aberto.
-3. **Chamada de ferramenta no Gemma 4.** O catálogo declara o modelo como de
-   conversa, e o roteador pode escolhê-lo; se o laço pedir ferramentas a um
-   modelo cujo template não usa a gramática que o parser lê, a rodada devolve
-   texto em vez de chamada. Isso é verificação de produto, com a placa.
+3. **Chamada de ferramenta no Gemma 4.** O laço do Aether não lê a gramática do
+   template: ele define a sua, em `chat.rs:241-246` (abertura de chamada, nome
+   de função e parâmetros em XML), e `inicio_de_chamada` (mesmo arquivo, `:254`)
+   escreve essa gramática como continuação forçada — `session.rs:513` é o ponto
+   que a injeta. O que o modelo viu no treino é a gramática do próprio template,
+   e no Gemma 4 ela é diferente. Se a continuação forçada chega para governar o
+   resto do bloco, é medição com a placa, não leitura de cabeçalho.
 
 ## Gates desta frente
 

@@ -235,9 +235,10 @@ fn escape_non_ascii(text: &str) -> String {
 }
 
 /// Marcador que abre uma chamada de ferramenta. Público porque quem filtra o
-/// O marcador que abre uma chamada de ferramenta, lido do template do
-/// fabricante. É também o ponto onde o stream para de mostrar prosa — e por
-/// isso o stream precisa segurar a cauda que pode ser um marcador partido.
+/// stream precisa dele para saber a hora de parar de mostrar prosa — e é por
+/// isso que o stream segura a cauda que pode ser um marcador partido. É a
+/// gramática que o próprio app define e força como continuação em
+/// `inicio_de_chamada`, não uma que se leia do template do modelo.
 pub const CALL_OPEN: &str = concat!("<", "tool_call>");
 const CALL_CLOSE: &str = concat!("</", "tool_call>");
 const FN_OPEN: &str = concat!("<", "function=");
