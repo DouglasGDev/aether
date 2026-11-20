@@ -4,6 +4,7 @@ import { numero } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
 import type { AjustesGeracao, AiStatus, ModelStatus } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
+import { Regua } from "./BarraDeTrabalho";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -200,31 +201,20 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
   const inteiraDoModelo =
     inteira !== null && inteira.modelo === ajustes.modelo ? inteira.tokens : null;
 
-  const campo = (escala: Escala) => {
-    const valor = ajustes[escala.chave];
-    return (
-      <label className="field" key={escala.chave}>
-        <span className="field-label">
-          {t(`geracao.${escala.chave}`)}
-          <span className="geracao-valor">{numero(valor, idioma, escala.casas)}</span>
-        </span>
-        <input
-          type="range"
-          min={escala.minimo}
-          max={escala.maximo}
-          step={escala.passo}
-          value={valor}
-          disabled={ocupada}
-          aria-label={t(`geracao.${escala.chave}`)}
-          onChange={(event) =>
-            setAjustes({ ...ajustes, [escala.chave]: Number(event.target.value) })
-          }
-          onPointerUp={() => void gravar(ajustes)}
-          onBlur={() => void gravar(ajustes)}
-        />
-      </label>
-    );
-  };
+  const campo = (escala: Escala) => (
+    <Regua
+      key={escala.chave}
+      titulo={t(`geracao.${escala.chave}`)}
+      valor={ajustes[escala.chave]}
+      minimo={escala.minimo}
+      maximo={escala.maximo}
+      passo={escala.passo}
+      casas={escala.casas}
+      ocupada={ocupada}
+      aoMudar={(novo) => setAjustes({ ...ajustes, [escala.chave]: novo })}
+      aoGravar={() => void gravar(ajustes)}
+    />
+  );
 
   return (
     <div className="modal" role="dialog" aria-modal="true" aria-label={t("geracao.titulo")}>
@@ -268,46 +258,46 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
 
         {ANTES_DA_JANELA.map(campo)}
 
-        <div className="field">
-          <span className="field-label">
-            {t("geracao.contexto")}
-            <span className="geracao-valor">{numero(ajustes.contexto, idioma, 0)}</span>
-            {inteiraDoModelo !== null && (
-              <>
-                <span className="geracao-chip">
-                  {t("geracao.janelaInteira", { n: numero(inteiraDoModelo, idioma, 0) })}
-                </span>
-                <button
-                  type="button"
-                  className="icon-only"
-                  disabled={ocupada || inteiraDoModelo === ajustes.contexto}
-                  onClick={() => void gravar({ ...ajustes, contexto: inteiraDoModelo })}
-                  aria-label={t("geracao.janelaInteiraUsar")}
-                  title={t("geracao.janelaInteiraUsar")}
-                >
-                  <Icon name="arrow" />
-                </button>
-              </>
-            )}
-          </span>
-          <input
-            type="range"
-            min={0}
-            max={degrausDeJanela.length - 1}
-            step={1}
-            value={degrauAtual}
-            disabled={ocupada}
-            aria-label={t("geracao.contexto")}
-            onChange={(event) =>
-              setAjustes({
-                ...ajustes,
-                contexto: degrausDeJanela[Number(event.target.value)] ?? ajustes.contexto,
-              })
-            }
-            onPointerUp={() => void gravar(ajustes)}
-            onBlur={() => void gravar(ajustes)}
-          />
-        </div>
+        <Regua
+          titulo={t("geracao.contexto")}
+          valor={degrauAtual}
+          mostrar={ajustes.contexto}
+          minimo={0}
+          maximo={degrausDeJanela.length - 1}
+          passo={1}
+          casas={0}
+          ocupada={ocupada}
+          extra={
+            <>
+              {inteiraDoModelo !== null && (
+                <>
+                  <span className="geracao-chip">
+                    {t("geracao.janelaInteira", {
+                      n: numero(inteiraDoModelo, idioma, 0),
+                    })}
+                  </span>
+                  <button
+                    type="button"
+                    className="icon-only"
+                    disabled={ocupada || inteiraDoModelo === ajustes.contexto}
+                    onClick={() => void gravar({ ...ajustes, contexto: inteiraDoModelo })}
+                    aria-label={t("geracao.janelaInteiraUsar")}
+                    title={t("geracao.janelaInteiraUsar")}
+                  >
+                    <Icon name="arrow" />
+                  </button>
+                </>
+              )}
+            </>
+          }
+          aoMudar={(degrau) =>
+            setAjustes({
+              ...ajustes,
+              contexto: degrausDeJanela[degrau] ?? ajustes.contexto,
+            })
+          }
+          aoGravar={() => void gravar(ajustes)}
+        />
 
         {DEPOIS_DA_JANELA.map(campo)}
 

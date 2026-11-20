@@ -8,6 +8,7 @@ import type {
   ItemAdaptador,
 } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
+import { Regua } from "./BarraDeTrabalho";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -252,32 +253,21 @@ export function AdaptadoresDialog({ onClose, onChange }: Props) {
                   </span>
                 </span>
 
-                <label className="adaptador-forca">
-                  <span className="field-label">
-                    {t("adaptadores.forca")}
-                    <span className="geracao-valor">
-                      {numero(item.forca, idioma, 2)}
-                    </span>
-                  </span>
-                  <input
-                    type="range"
-                    min={MINIMO}
-                    max={MAXIMO}
-                    step={PASSO}
-                    value={item.forca}
-                    disabled={ocupada || !item.ativo}
-                    aria-label={`${t("adaptadores.forca")} ${item.ficha.nome}`}
-                    onChange={(event) =>
-                      setEstado(
-                        marcar(estado, item.ficha.caminho, {
-                          forca: Number(event.target.value),
-                        }),
-                      )
-                    }
-                    onPointerUp={() => void gravar(estado)}
-                    onBlur={() => void gravar(estado)}
-                  />
-                </label>
+                <Regua
+                  titulo={t("adaptadores.forca")}
+                  rotulo={`${t("adaptadores.forca")} ${item.ficha.nome}`}
+                  classe="adaptador-forca"
+                  casas={2}
+                  valor={item.forca}
+                  minimo={MINIMO}
+                  maximo={MAXIMO}
+                  passo={PASSO}
+                  ocupada={ocupada || !item.ativo}
+                  aoMudar={(novo) =>
+                    setEstado(marcar(estado, item.ficha.caminho, { forca: novo }))
+                  }
+                  aoGravar={() => void gravar(estado)}
+                />
 
                 <span
                   className={item.aplicada ? "adaptador-estado ligada" : "adaptador-estado"}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, message, onModelEvent } from "../lib/api";
 import { bytes, inteiro, numero } from "../lib/display";
 import { useIdioma, useT, type Traduzir } from "../lib/i18n";
+import { useJobs, type Job } from "../lib/jobs";
 import type { Acelerador, Alojado, ModelEvent, ModelStatus } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
@@ -12,15 +13,9 @@ interface Props {
   onLoaded: () => void;
 }
 
-interface Job {
-  /// `null` é "há um trabalho registrado no núcleo, mas esta janela não viu o
-  /// evento que dizia em que fase ele estava". A barra não chuta fase.
-  fase: "preparando" | "pesos" | "apoio" | null;
-  arquivo?: string;
-  done: number;
-  total: number;
-  speed: number;
-}
+/// As fases que o downloader deste gerenciador anuncia. `preparando` é a pedida
+/// antes do primeiro byte; `apoio` conta arquivos, não bytes.
+type Fase = "preparando" | "pesos" | "apoio";
 
 /// Onde os bytes ficaram, nas palavras do dono da máquina. O texto é a previsão
 /// feita com o cabeçalho do GGUF antes da carga; o título é a VRAM que a carga
@@ -60,10 +55,9 @@ export function ModelManager({ onClose, onLoaded }: Props) {
   const [loaded, setLoaded] = useState<string | null>(null);
   const [fixado, setFixado] = useState("");
   const [acelerador, setAcelerador] = useState<Acelerador | null>(null);
-  const [jobs, setJobs] = useState<Record<string, Job>>({});
+  const { jobs, faltas: faults, aplicar, limparFalta } = useJobs<Fase>();
   /// Os downloads que o núcleo tem registrados agora (`ai_status.downloading`).
   const [emCurso, setEmCurso] = useState<string[]>([]);
-  const [faults, setFaults] = useState<Record<string, string>>({});
   const [tab, setTab] = useState<"descobrir" | "meus">("descobrir");
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -97,49 +91,28 @@ export function ModelManager({ onClose, onLoaded }: Props) {
     const handle = (event: ModelEvent) => {
       switch (event.type) {
         case "started":
-          setFaults((current) => ({ ...current, [event.id]: "" }));
-          setJobs((current) => ({
-            ...current,
-            [event.id]: { fase: "preparando", done: 0, total: event.totalBytes, speed: 0 },
-          }));
+          aplicar({ tipo: "iniciou", id: event.id, total: event.totalBytes, fase: "preparando" });
           break;
         case "support":
-          setJobs((current) => ({
-            ...current,
-            [event.id]: {
-              ...(current[event.id] ?? { done: 0, total: 0, speed: 0 }),
-              fase: "apoio",
-              arquivo: event.file,
-            },
-          }));
+          aplicar({ tipo: "fase", id: event.id, fase: "apoio", arquivo: event.file });
           break;
         case "progress":
-          setJobs((current) => ({
-            ...current,
-            [event.id]: {
-              fase: "pesos",
-              done: event.doneBytes,
-              total: event.totalBytes,
-              speed: event.bytesPerSecond,
-            },
-          }));
+          aplicar({
+            tipo: "bytes",
+            id: event.id,
+            feito: event.doneBytes,
+            total: event.totalBytes,
+            velocidade: event.bytesPerSecond,
+            fase: "pesos",
+          });
           break;
         case "done":
         case "cancelled":
-          setJobs((current) => {
-            const next = { ...current };
-            delete next[event.id];
-            return next;
-          });
+          aplicar({ tipo: "terminou", id: event.id });
           void refresh();
           break;
         case "failed":
-          setJobs((current) => {
-            const next = { ...current };
-            delete next[event.id];
-            return next;
-          });
-          setFaults((current) => ({ ...current, [event.id]: event.error }));
+          aplicar({ tipo: "terminou", id: event.id, erro: event.error });
           void refresh();
           break;
       }
@@ -152,7 +125,7 @@ export function ModelManager({ onClose, onLoaded }: Props) {
       cancelled = true;
       unlisten?.();
     };
-  }, [refresh]);
+  }, [refresh, aplicar]);
 
   const families = useMemo(() => {
     const terms = query.trim().toLowerCase().split(/\s+/).filter((t) => t !== "");
@@ -178,7 +151,7 @@ export function ModelManager({ onClose, onLoaded }: Props) {
 
   async function download(id: string) {
     setError(null);
-    setFaults((current) => ({ ...current, [id]: "" }));
+    limparFalta(id);
     try {
       await api.modelDownload(id);
     } catch (cause) {
@@ -242,9 +215,9 @@ export function ModelManager({ onClose, onLoaded }: Props) {
   /// com "este modelo já está baixando" (`commands.rs`). Sem os bytes lidos
   /// ainda — eles só chegam por evento — a barra fica vazia e a ponta mostra o
   /// traço; a fase desconhecida não é inventada.
-  const trabalho = (id: string): Job | undefined =>
+  const trabalho = (id: string): Job<Fase> | undefined =>
     jobs[id] ??
-    (emCurso.includes(id) ? { fase: null, done: 0, total: 0, speed: 0 } : undefined);
+    (emCurso.includes(id) ? { fase: null, feito: 0, total: 0, velocidade: 0 } : undefined);
 
   const row = (model: ModelStatus) => (
     <VariantRow
@@ -438,7 +411,7 @@ export function ModelManager({ onClose, onLoaded }: Props) {
 
 interface RowProps {
   model: ModelStatus;
-  job: Job | undefined;
+  job: Job<Fase> | undefined;
   fault: string;
   loaded: boolean;
   acting: boolean;
@@ -495,9 +468,9 @@ function VariantRow({
                 ? job.arquivo ?? ""
                 : t(`modelos.${job.fase}`)
           }
-          feito={job.done}
+          feito={job.feito}
           total={job.total}
-          velocidade={job.speed}
+          velocidade={job.velocidade}
           // Os arquivos de apoio são cópias locais: não há byte de rede a
           // contar, então o percentual do peso fica para trás em vez de virar
           // andamento da fase.

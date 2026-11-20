@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, message, onRuntimeEvent } from "../lib/api";
 import { bytes, inteiro } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
+import { useJobs } from "../lib/jobs";
 import type {
   RuntimeEvento,
   RuntimePacote,
@@ -16,12 +17,7 @@ interface Props {
   onChange: () => void;
 }
 
-interface Job {
-  fase: "baixando" | "extraindo" | "conferindo";
-  done: number;
-  total: number;
-  speed: number;
-}
+type Fase = "baixando" | "extraindo" | "conferindo";
 
 /// As DLLs não estão no repositório: num PC novo o download dos pesos termina e
 /// a inferência não abre. Esta tela é o passo que faltava — baixar o pacote
@@ -32,8 +28,7 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
   const { id: idioma } = useIdioma();
   const [pacotes, setPacotes] = useState<RuntimePacote[]>([]);
   const [vereditos, setVereditos] = useState<Record<string, RuntimeVeredito>>({});
-  const [jobs, setJobs] = useState<Record<string, Job>>({});
-  const [faults, setFaults] = useState<Record<string, string>>({});
+  const { jobs, faltas: faults, aplicar } = useJobs<Fase>();
   const [conferindo, setConferindo] = useState(false);
   const [erro, setErro] = useState<string | null>(null);
   /// A primeira leitura terminou. Sem isto, a lista vazia de um
@@ -58,48 +53,26 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     const handle = (event: RuntimeEvento) => {
-      const soltar = () =>
-        setJobs((current) => {
-          const next = { ...current };
-          delete next[event.id];
-          return next;
-        });
       switch (event.type) {
         case "iniciou":
-          setFaults((current) => ({ ...current, [event.id]: "" }));
-          setJobs((current) => ({
-            ...current,
-            [event.id]: {
-              fase: "baixando",
-              done: 0,
-              total: event.totalBytes,
-              speed: 0,
-            },
-          }));
+          aplicar({ tipo: "iniciou", id: event.id, total: event.totalBytes, fase: "baixando" });
           break;
         case "progresso":
-          setJobs((current) => ({
-            ...current,
-            [event.id]: {
-              fase: "baixando",
-              done: event.doneBytes,
-              total: event.totalBytes,
-              speed: event.bytesPorSegundo,
-            },
-          }));
+          aplicar({
+            tipo: "bytes",
+            id: event.id,
+            feito: event.doneBytes,
+            total: event.totalBytes,
+            velocidade: event.bytesPorSegundo,
+            fase: "baixando",
+          });
           break;
         case "extraindo":
         case "conferindo":
-          setJobs((current) => ({
-            ...current,
-            [event.id]: {
-              ...(current[event.id] ?? { done: 0, total: 0, speed: 0 }),
-              fase: event.type,
-            },
-          }));
+          aplicar({ tipo: "fase", id: event.id, fase: event.type });
           break;
         case "concluiu":
-          soltar();
+          aplicar({ tipo: "terminou", id: event.id });
           // O veredito antigo descreve o que estava no disco antes: instalar
           // substituiu os arquivos, então a conferência velha não vale mais.
           setVereditos((current) => {
@@ -111,12 +84,11 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
           onChange();
           break;
         case "cancelou":
-          soltar();
+          aplicar({ tipo: "terminou", id: event.id });
           void refresh();
           break;
         case "falhou":
-          soltar();
-          setFaults((current) => ({ ...current, [event.id]: event.erro }));
+          aplicar({ tipo: "terminou", id: event.id, erro: event.erro });
           void refresh();
           break;
       }
@@ -290,10 +262,10 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
 
                 {job !== undefined && (
                   <BarraDeTrabalho
-                    fase={t(`runtime.${job.fase}`)}
-                    feito={job.done}
+                    fase={job.fase === null ? "" : t(`runtime.${job.fase}`)}
+                    feito={job.feito}
                     total={job.total}
-                    velocidade={job.speed}
+                    velocidade={job.velocidade}
                     // Só o download conta bytes. Na extração e na conferência a
                     // ponta já dizia "—"; a barra cheia ali era o percentual de
                     // outra fase, relido como se fosse desta.

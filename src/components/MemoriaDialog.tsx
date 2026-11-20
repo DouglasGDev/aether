@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, message, onMemoriaEvent, onModelEvent } from "../lib/api";
 import { MODO_KEY, ORIGEM_KEY, bytes, data, dataCurta, numero } from "../lib/display";
 import { useIdioma, useT, type Traduzir } from "../lib/i18n";
+import { useJobs, type Job } from "../lib/jobs";
 import type {
   AjustesMemoria,
   AutoMemoria,
@@ -19,12 +20,6 @@ import { BarraDeTrabalho, Regua } from "./BarraDeTrabalho";
 interface Props {
   onClose: () => void;
   onChange: () => void;
-}
-
-interface Job {
-  done: number;
-  total: number;
-  speed: number;
 }
 
 /// As quatro escalas que o núcleo aprova em `memoria.rs`. Como no painel de
@@ -70,7 +65,7 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
   const { id: idioma } = useIdioma();
   const [estado, setEstado] = useState<EstadoMemoria | null>(null);
   const [ajustes, setAjustes] = useState<AjustesMemoria | null>(null);
-  const [jobs, setJobs] = useState<Record<string, Job>>({});
+  const { jobs, aplicar } = useJobs<"pesos">();
   const [erro, setErro] = useState<string | null>(null);
   const [ocupada, setOcupada] = useState(false);
   const [consulta, setConsulta] = useState("");
@@ -162,30 +157,27 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
       if (!vivo) return;
       switch (event.type) {
         case "started":
-          setJobs((atual) => ({
-            ...atual,
-            [event.id]: { done: 0, total: event.totalBytes, speed: 0 },
-          }));
+          aplicar({ tipo: "iniciou", id: event.id, total: event.totalBytes, fase: "pesos" });
           break;
         case "progress":
-          setJobs((atual) => ({
-            ...atual,
-            [event.id]: {
-              done: event.doneBytes,
-              total: event.totalBytes,
-              speed: event.bytesPerSecond,
-            },
-          }));
+          aplicar({
+            tipo: "bytes",
+            id: event.id,
+            feito: event.doneBytes,
+            total: event.totalBytes,
+            velocidade: event.bytesPerSecond,
+            fase: "pesos",
+          });
           break;
         case "done":
         case "cancelled":
+          aplicar({ tipo: "terminou", id: event.id });
+          void ler();
+          onChange();
+          break;
         case "failed":
-          setJobs((atual) => {
-            const proximo = { ...atual };
-            delete proximo[event.id];
-            return proximo;
-          });
-          if (event.type === "failed") setErro(event.error);
+          aplicar({ tipo: "terminou", id: event.id });
+          setErro(event.error);
           void ler();
           onChange();
           break;
@@ -556,7 +548,7 @@ function Cabecalho({ onClose, t }: { onClose: () => void; t: Traduzir }) {
 
 interface LinhaProps {
   modelo: ModelStatus;
-  job: Job | undefined;
+  job: Job<"pesos"> | undefined;
   emUso: boolean;
   ocupada: boolean;
   idioma: string;
@@ -601,10 +593,10 @@ function Linha({
 
       {job !== undefined ? (
         <BarraDeTrabalho
-          fase={t("modelos.pesos")}
-          feito={job.done}
+          fase={job.fase === null ? "" : t(`modelos.${job.fase}`)}
+          feito={job.feito}
           total={job.total}
-          velocidade={job.speed}
+          velocidade={job.velocidade}
           aoCancelar={onCancelar}
           rotuloCancelar={t("modelos.cancelar", { nome: modelo.display })}
         />

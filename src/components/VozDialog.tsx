@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { api, message, onVozEvent } from "../lib/api";
 import { GENERO_KEY, SERVICO_KEY, bytes } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
+import type { Job } from "../lib/jobs";
+import { useJobs } from "../lib/jobs";
 import type { AjustesVoz, EstadoVoz, MedidorVoz, StatusVoz, VozEvento } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
@@ -14,12 +16,7 @@ interface Props {
   onRefresh: () => void;
 }
 
-interface Job {
-  fase: "baixando" | "extraindo";
-  done: number;
-  total: number;
-  speed: number;
-}
+type Fase = "baixando" | "extraindo";
 
 type Aba = "fala" | "escuta" | "modelos";
 
@@ -27,8 +24,7 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
   useFecharComEscape(onClose);
   const t = useT();
   const [aba, setAba] = useState<Aba>("fala");
-  const [jobs, setJobs] = useState<Record<string, Job>>({});
-  const [faults, setFaults] = useState<Record<string, string>>({});
+  const { jobs, faltas: faults, aplicar, limparFalta } = useJobs<Fase>();
   const [velocidade, setVelocidade] = useState<number | null>(null);
   const [erro, setErro] = useState<string | null>(null);
 
@@ -47,47 +43,31 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
     const handle = (event: VozEvento) => {
       switch (event.type) {
         case "iniciou":
-          setFaults((current) => ({ ...current, [event.id]: "" }));
-          setJobs((current) => ({
-            ...current,
-            [event.id]: { fase: "baixando", done: 0, total: event.totalBytes, speed: 0 },
-          }));
+          aplicar({ tipo: "iniciou", id: event.id, total: event.totalBytes, fase: "baixando" });
           break;
         case "progresso":
-          setJobs((current) => ({
-            ...current,
-            [event.id]: {
-              fase: "baixando",
-              done: event.doneBytes,
-              total: event.totalBytes,
-              speed: event.bytesPorSegundo,
-            },
-          }));
+          aplicar({
+            tipo: "bytes",
+            id: event.id,
+            feito: event.doneBytes,
+            total: event.totalBytes,
+            velocidade: event.bytesPorSegundo,
+            fase: "baixando",
+          });
           break;
         // O pacote do Kokoro são trezentos e setenta e oito arquivos: aqui não
-        // há byte de rede a contar, só o `tar` do Windows trabalhando.
+        // há byte de rede a contar, só o `tar` do Windows trabalhando. A medição
+        // do download fica onde estava e a barra diz que não é dela.
         case "extraindo":
-          setJobs((current) => ({
-            ...current,
-            [event.id]: { fase: "extraindo", done: 0, total: 0, speed: 0 },
-          }));
+          aplicar({ tipo: "fase", id: event.id, fase: "extraindo" });
           break;
         case "concluiu":
         case "cancelou":
-          setJobs((current) => {
-            const next = { ...current };
-            delete next[event.id];
-            return next;
-          });
+          aplicar({ tipo: "terminou", id: event.id });
           onRefresh();
           break;
         case "falhou":
-          setJobs((current) => {
-            const next = { ...current };
-            delete next[event.id];
-            return next;
-          });
-          setFaults((current) => ({ ...current, [event.id]: event.erro }));
+          aplicar({ tipo: "terminou", id: event.id, erro: event.erro });
           onRefresh();
           break;
       }
@@ -139,7 +119,7 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
 
   async function baixar(modelo: StatusVoz) {
     setErro(null);
-    setFaults((current) => ({ ...current, [modelo.id]: "" }));
+    limparFalta(modelo.id);
     try {
       await api.vozBaixar(modelo.id);
     } catch (cause) {
@@ -174,10 +154,10 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
   /// linha oferecendo "Baixar" de novo, e o núcleo recusaria o segundo pedido
   /// com "já está baixando". Sem bytes lidos ainda, a barra fica vazia e a
   /// ponta mostra o traço — o que se sabe é a fase, não o andamento.
-  const emCurso = (id: string): Job | undefined =>
+  const emCurso = (id: string): Job<Fase> | undefined =>
     jobs[id] ??
     (estado?.baixando.includes(id) === true
-      ? { fase: "baixando", done: 0, total: 0, speed: 0 }
+      ? { fase: "baixando", feito: 0, total: 0, velocidade: 0 }
       : undefined);
 
   const falha = erro ?? estado?.erro ?? null;
@@ -450,10 +430,10 @@ function ModeloRow({ modelo, job, fault, escolhido, onBaixar, onCancelar, onApag
 
       {job !== undefined ? (
         <BarraDeTrabalho
-          fase={t(`voz.${job.fase}`)}
-          feito={job.done}
+          fase={job.fase === null ? "" : t(`voz.${job.fase}`)}
+          feito={job.feito}
           total={job.total}
-          velocidade={job.speed}
+          velocidade={job.velocidade}
           // Na extração do pacote não há byte de rede a contar: a barra fica
           // vazia e a ponta mostra o traço, em vez do último percentual.
           contavel={job.fase === "baixando"}

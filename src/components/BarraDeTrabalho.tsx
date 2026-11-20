@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { bytes, numero } from "../lib/display";
 import { useIdioma } from "../lib/i18n";
 import { Icon } from "./Icon";
@@ -19,11 +20,12 @@ interface PropsBarra {
   /// total é nenhuma leitura, não trabalho concluído.
   feito: number;
   total: number;
-  /// Bytes por segundo medidos pelo downloader; zero é nenhuma medição.
+  /// Bytes por segundo medidos pelo downloader; zero é nenhuma medição. Só
+  /// aparece na ponta quando a fase atual é contável.
   velocidade?: number;
   /// A fase atual conta bytes? A extração do pacote e os arquivos de apoio não
   /// contam: repetir ali o último percentual do download seria um número lido
-  /// de outra coisa. Sem contagem não há barra nem percentual.
+  /// de outra coisa. Sem contagem não há barra, percentual nem taxa.
   contavel?: boolean;
   /// O texto da ponta quando a fase não é percentual — a varredura da memória
   /// conta arquivos e trechos, não bytes.
@@ -51,10 +53,13 @@ export function BarraDeTrabalho({
   const { id: idioma } = useIdioma();
   const medido = contavel && total > 0;
   const percent = medido ? Math.min(100, (feito / total) * 100) : 0;
+  // A velocidade é bytes por segundo: se a fase não conta bytes, a taxa que
+  // chegou junto é a da fase anterior. O traço é a resposta honesta, e é a
+  // mesma resposta que a ponta dava antes de a medição morar num só lugar.
   const ponta =
     leitura ??
     `${medido ? `${numero(percent, idioma, 1)}%` : "—"}${
-      velocidade > 0 ? ` · ${bytes(velocidade, idioma)}/s` : ""
+      medido && velocidade > 0 ? ` · ${bytes(velocidade, idioma)}/s` : ""
     }`;
 
   return (
@@ -99,8 +104,24 @@ interface PropsRegua {
   /// A classe do valor na linha do rótulo. Voz e geração têm corpos diferentes
   /// hoje; a extração não redraw a tela para caber numa classe só.
   classeValor?: string;
+  /// A classe do invólucro. Os dialogs desenhavam a régua em `field` e em
+  /// `adaptador-forca`: a regra é uma, o desenho tem dois corpos, e nenhum dos
+  /// dois sai aqui por fora.
+  classe?: string;
+  /// Nome ouvido pelo leitor de tela quando precisa ser mais específico que o
+  /// rótulo — a força de um adaptador entre dez na lista é o nome dele junto.
+  rotulo?: string;
   /// Unidade colada ao número, para quem precisa dela ("×").
   sufixo?: string;
+  /// O que aparece na linha do rótulo quando o cursor não anda sobre o número
+  /// mostrado: a janela de contexto sobe de degrau em degrau sobre as janelas
+  /// publicadas, e o que a pessoa lê é o tamanho que o degrau representa, não
+  /// o índice dele.
+  mostrar?: number;
+  /// O que entra depois do número na linha do rótulo: o chip da janela inteira
+  /// e o botão que a usa. Com isto a régua deixa de ser um `<label>`: um botão
+  /// dentro de um rótulo ativaria o cursor ao lado, e ninguém pediu isso.
+  extra?: ReactNode;
   /// Com a escrita em curso o cursor para de mexer no valor.
   ocupada?: boolean;
   /// O arrastado: guarda o número na tela, sem escrever nada.
@@ -123,33 +144,53 @@ export function Regua({
   passo,
   casas,
   classeValor = "geracao-valor",
+  classe = "field",
+  rotulo,
   sufixo = "",
+  mostrar,
+  extra,
   ocupada = false,
   aoMudar,
   aoGravar,
 }: PropsRegua) {
   const { id: idioma } = useIdioma();
-  return (
-    <label className="field">
-      <span className="field-label">
-        {titulo}
-        <span className={classeValor}>
-          {numero(valor, idioma, casas)}
-          {sufixo}
-        </span>
+  const nome = rotulo ?? titulo;
+  const linha = (
+    <span className="field-label">
+      {titulo}
+      <span className={classeValor}>
+        {numero(mostrar ?? valor, idioma, casas)}
+        {sufixo}
       </span>
-      <input
-        type="range"
-        min={minimo}
-        max={maximo}
-        step={passo}
-        value={valor}
-        disabled={ocupada}
-        aria-label={titulo}
-        onChange={(event) => aoMudar(Number(event.target.value))}
-        onPointerUp={aoGravar}
-        onBlur={aoGravar}
-      />
-    </label>
+      {extra}
+    </span>
+  );
+  const cursor = (
+    <input
+      type="range"
+      min={minimo}
+      max={maximo}
+      step={passo}
+      value={valor}
+      disabled={ocupada}
+      aria-label={nome}
+      onChange={(event) => aoMudar(Number(event.target.value))}
+      onPointerUp={aoGravar}
+      onBlur={aoGravar}
+    />
+  );
+  if (extra === undefined) {
+    return (
+      <label className={classe}>
+        {linha}
+        {cursor}
+      </label>
+    );
+  }
+  return (
+    <div className={classe}>
+      {linha}
+      {cursor}
+    </div>
   );
 }

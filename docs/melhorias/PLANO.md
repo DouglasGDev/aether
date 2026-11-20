@@ -249,8 +249,12 @@ o derrotam:
 - ~~**Chunk JS >500 kB**~~ — **fechado na segunda leva** (`FRONT2.md`, FU7): onze
   dialogs e o grafo entram por `lazy()` (`App.tsx:36-75`) e o build não imprime
   mais aviso nenhum; o maior bloco é `react` a 210,53 kB.
-- **F16**: maquinaria de Job/progresso e slider duplicada em 4 dialogs; extrair
-  componente compartilhado DEPOIS das correções individuais (sequenciado).
+- ~~**F16**: maquinaria de Job/progresso e slider duplicada em 4 dialogs~~ —
+  **fechado** (`FRONT3.md`): `useJobs<F>()` em `src/lib/jobs.ts:40` é a única
+  máquina de trabalho (`interface Job` restou 1 em `src`, `setJobs`/`setFaults`
+  restaram 0 fora de `jobs.ts`) e `Regua` é o único cursor — `type="range"` há
+  um só na frente toda (`BarraDeTrabalho.tsx:170`). A extração foi depois das
+  correções individuais, como o sequenciamento pedia.
 
 ## Finalização
 
@@ -328,7 +332,7 @@ sem abrir o aplicativo:
 Registros dos agentes, como ficaram: `FFI.md` (#39, A9, A8 — com a ressalva
 deles mesmos de que a carga real do codificador não rodou, porque abrir o
 aplicativo estava proibido), `CONC2.md` (#94, posse do motor), `M8.md` (#92,
-integridade do download), `FRONT2.md` e `FRONT3` (casca e dialogs). O gate acima
+integridade do download), `FRONT2.md` e `FRONT3.md` (casca e dialogs). O gate acima
 é a evidência de que os arquivos deles estão na árvore e verdes; o que cada um
 alega além disso está nos próprios docs, com MEDIDO e ALEGADO separados.
 
