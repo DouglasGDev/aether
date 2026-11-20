@@ -489,6 +489,20 @@ fn cabeca_de_chamada(resposta: &str, tools: &[ToolSpec]) -> Option<String> {
     Some(inicio_de_chamada(&escolhida.name))
 }
 
+/// O teto de tokens cortou o turno dentro de um pensamento que nunca fechou? É
+/// o caso em que não existe resposta a mostrar: o `answer` fica vazio, e um
+/// `Done` com ele seria o app jurando sucesso de uma resposta que a placa nunca
+/// terminou de escrever. Uma chamada de ferramenta cortada tem continuação (o
+/// `chamada_pendente` retoma o corpo); um bloco de pensamento aberto não tem —
+/// a retoma dele é suprimida em `em_chamada` e não devolveria o texto à tela —,
+/// então a saída honesta é dizer o motivo, não calar em vez de responder.
+fn corte_em_pensamento_aberto(raw: &str, thinking_ligado: bool, stop: StopReason) -> bool {
+    thinking_ligado
+        && stop == StopReason::MaxTokens
+        && raw.contains(THINK_OPEN)
+        && !raw.contains(THINK_CLOSE)
+}
+
 /// Um turno completo: gera, executa as ferramentas que o modelo pediu e volta a
 /// gerar com os resultados, até responder em prosa ou atingir o teto de rodadas.
 pub fn run_turn(
@@ -693,6 +707,12 @@ pub fn run_turn(
             raw.clone()
         };
 
+        // O pensamento foi cortado antes de fechar: `answer` está vazio, mas o
+        // modelo não terminou — é falha, não uma resposta em branco de sucesso.
+        if corte_em_pensamento_aberto(&raw, config.enable_thinking, generation.stop) {
+            bail!(tr("erros.pensamentoTruncado", &[]));
+        }
+
         let calls = parse_tool_calls(&answer, &nomes);
         if calls.is_empty() {
             // O modelo pôs o arquivo na tela e disse que criou. Enquanto a
@@ -824,6 +844,21 @@ mod tests {
     fn unfinished_thinking_shows_no_answer_yet() {
         let raw = format!("{THINK_OPEN}\npreciso checar");
         assert_eq!(answer_start(&raw, true), raw.len());
+    }
+
+    #[test]
+    fn corte_em_pensamento_aberto_e_falha_e_nao_sucesso_vazio() {
+        let aberto = format!("{THINK_OPEN}\npreciso checar");
+        // Pensamento ligado, teto atingido, bloco aberto: é aqui que o turno
+        // calava como se tivesse respondido. A recusa é o motivo honesto.
+        assert!(corte_em_pensamento_aberto(&aberto, true, StopReason::MaxTokens));
+        // O bloco fechou: a resposta existe, o turno termina normal.
+        let fechado = format!("{THINK_OPEN}\npensei{THINK_CLOSE}Paris.");
+        assert!(!corte_em_pensamento_aberto(&fechado, true, StopReason::MaxTokens));
+        // Sem teto (o modelo terminou sozinho) não é corte: é resposta.
+        assert!(!corte_em_pensamento_aberto(&aberto, true, StopReason::Eos));
+        // Pensamento desligado: prosa truncada é resposta parcial legítima.
+        assert!(!corte_em_pensamento_aberto(&aberto, false, StopReason::MaxTokens));
     }
 
     /// O que a injeção produz, visto de fora: a sequência de papéis e textos,

@@ -194,9 +194,55 @@ fn titulo_de(mensagens: &[ChatMessage]) -> String {
     titulo
 }
 
+/// Reconstrói o índice dos arquivos de conversa em disco. É o plano B honesto
+/// quando o `indice.json` está ilegível: as conversas têm arquivo próprio, o que
+/// se perdeu foi só o sumário — reler a pasta as traz de volta em vez de deixar
+/// órfãs. Uma conversa que também não abre fica de fora, em silêncio: não se
+/// recupera o que não se lê, do mesmo jeito que `para_memoria` faz.
+///
+/// O `ativa` não volta: nada no arquivo diz qual estava no buffer, e escolher
+/// uma por conta seria inventar estado. A lista é o que importa, e a próxima
+/// conversa ativa nasce do primeiro pedido de quem voltou.
+fn reconstruir_indice(raiz: &Path) -> Indice {
+    let mut indice = Indice::default();
+    let Ok(entradas) = std::fs::read_dir(raiz) else {
+        return indice;
+    };
+    for entrada in entradas.flatten() {
+        let caminho = entrada.path();
+        if caminho.file_name().map(|n| n == "indice.json").unwrap_or(false) {
+            continue;
+        }
+        if caminho.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // O arquivo é `<id>.json`; um nome que não é id deste módulo (um `.tmp`
+        // de gravação interrompida, por exemplo) não entra.
+        let Some(id) = caminho.file_stem().and_then(|s| s.to_str()) else { continue };
+        if !id_valido(id) {
+            continue;
+        }
+        let Ok(conversa) = ler_json::<Conversa>(&caminho) else { continue };
+        let mut ficha = conversa.ficha();
+        // O identificador canônico é o nome do arquivo, que é como `arquivo()`
+        // resolve uma abertura depois — o `id` de dentro é redundante.
+        ficha.id = id.to_string();
+        indice.conversas.push(ficha);
+    }
+    indice
+        .conversas
+        .sort_by(|a, b| b.atualizada.cmp(&a.atualizada).then(b.id.cmp(&a.id)));
+    indice
+}
+
 impl Conversas {
     pub fn novo(raiz: PathBuf) -> Self {
-        let indice = ler_json::<Indice>(&raiz.join("indice.json")).unwrap_or_default();
+        // Um `indice.json` corrompido não apaga as conversas: elas existem em
+        // arquivos próprios. Se o sumário não abre, a lista é refeita do disco.
+        let indice = match ler_json::<Indice>(&raiz.join("indice.json")) {
+            Ok(indice) => indice,
+            Err(_) => reconstruir_indice(&raiz),
+        };
         Self { raiz, indice: Mutex::new(indice) }
     }
 
@@ -271,16 +317,21 @@ impl Conversas {
             bail!(tr("erros.conversaTituloVazio", &[]));
         }
         let caminho = arquivo(&self.raiz, id);
+        // O lock cobre o ler→mudar→gravar do arquivo E o update do índice. Sem
+        // isso, um renomear e um gravar de turno no mesmo id leem o mesmo estado
+        // e cada um escreve o arquivo inteiro: o último apagou o efeito do
+        // outro — o título, ou as mensagens do turno. Gravar é atômico no disco,
+        // mas não contra uma segunda escrita que começou antes desta.
+        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let Some(pos) = indice.conversas.iter().position(|f| f.id == id) else {
+            bail!(tr("erros.conversaDesconhecida", &[("id", id)]));
+        };
         let mut conversa: Conversa = ler_json(&caminho)?;
         conversa.titulo = titulo.to_string();
         conversa.nomeada = true;
         gravar_json(&caminho, &conversa)?;
         let ficha = conversa.ficha();
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
-        match indice.conversas.iter_mut().find(|f| f.id == id) {
-            Some(entrada) => *entrada = ficha.clone(),
-            None => bail!(tr("erros.conversaDesconhecida", &[("id", id)])),
-        }
+        indice.conversas[pos] = ficha.clone();
         self.salvar_indice(&indice)?;
         Ok(ficha)
     }
@@ -302,6 +353,17 @@ impl Conversas {
             bail!(tr("erros.conversaIdInvalido", &[("id", id)]));
         }
         let caminho = arquivo(&self.raiz, id);
+        // O lock cobre o ler→mudar→gravar do arquivo E o update do índice, pelo
+        // mesmo motivo de renomear: sem ele, um gravar de turno e um renomear no
+        // mesmo id leem o mesmo estado e cada um escreve o arquivo inteiro por
+        // cima — o último apaga o título (ou as mensagens) que o outro acabou de
+        // pôr, e as duas escritas ainda se atropelam no mesmo arquivo .tmp.
+        // Gravar é atômico no disco contra um leitor, não contra uma segunda
+        // escrita que começou lendo um estado anterior.
+        let mut indice = self.indice.lock().expect("conversas envenenadas");
+        let Some(pos) = indice.conversas.iter().position(|f| f.id == id) else {
+            bail!(tr("erros.conversaDesconhecida", &[("id", id)]));
+        };
         let mut conversa: Conversa = ler_json(&caminho)?;
         if !conversa.nomeada {
             conversa.titulo = titulo_de(mensagens);
@@ -311,11 +373,7 @@ impl Conversas {
         conversa.atualizada = agora();
         gravar_json(&caminho, &conversa)?;
         let ficha = conversa.ficha();
-        let mut indice = self.indice.lock().expect("conversas envenenadas");
-        match indice.conversas.iter_mut().find(|f| f.id == id) {
-            Some(entrada) => *entrada = ficha.clone(),
-            None => bail!(tr("erros.conversaDesconhecida", &[("id", id)])),
-        }
+        indice.conversas[pos] = ficha.clone();
         self.salvar_indice(&indice)?;
         Ok(ficha)
     }
@@ -850,6 +908,89 @@ mod testes {
         assert_eq!(segunda.mensagens, 4);
         assert_eq!(segunda.texto.split('\n').count(), 3);
         assert!(segunda.texto.ends_with(&format!("{}: e o filtro também", tr("memoria.falaAssistente", &[]))));
+        let _ = std::fs::remove_dir_all(&conversas.raiz);
+    }
+
+    #[test]
+    fn um_sumario_corrompido_nao_apaga_as_conversas() {
+        let conversas = temporaria("sumario-corrompido");
+        let ficha = conversas.criar().unwrap();
+        conversas.gravar(&ficha.id, &pedido("crie uma página animada"), None).unwrap();
+        let raiz = conversas.raiz.clone();
+        drop(conversas);
+        // Só o sumário é destruído; o arquivo da conversa continua inteiro.
+        std::fs::write(raiz.join("indice.json"), b"{").unwrap();
+        let reaberto = Conversas::novo(raiz.clone());
+        let estado = reaberto.estado();
+        assert_eq!(estado.conversas.len(), 1, "a conversa sobrevive ao sumário perdido");
+        assert_eq!(estado.conversas[0].id, ficha.id);
+        assert_eq!(estado.conversas[0].titulo, "crie uma página animada");
+        // Recuperada de verdade: dá para abrir e o histórico vem do arquivo.
+        let aberta = reaberto.abrir(&ficha.id).unwrap();
+        assert_eq!(aberta.mensagens.len(), 3);
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    #[test]
+    fn renomear_e_gravar_concorrentes_nao_se_atropelam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let conversas = temporaria("renomeia-grava-race");
+        let ficha = conversas.criar().unwrap();
+        let id = ficha.id.clone();
+        let caminho = arquivo(&conversas.raiz, &id);
+        let titular = "nome escrito a mao";
+        let mensagens = pedido("assunto razoavelmente longo para o turno de hoje");
+        let perdido = AtomicUsize::new(0);
+
+        for _ in 0..150 {
+            // Cada rodada recomeça do mesmo estado: sem nome e sem mensagens.
+            let base = Conversa {
+                id: id.clone(),
+                titulo: String::new(),
+                nomeada: false,
+                criada: agora(),
+                atualizada: agora(),
+                mensagens: Vec::new(),
+                resumo: None,
+            };
+            gravar_json(&caminho, &base).unwrap();
+
+            let conv = &conversas;
+            let id_ref = &id;
+            let msgs_ref = &mensagens;
+            let barreira = Barrier::new(3);
+            std::thread::scope(|cena| {
+                let r1 = &barreira;
+                cena.spawn(move || {
+                    r1.wait();
+                    let _ = conv.renomear(id_ref, titular);
+                });
+                let r2 = &barreira;
+                cena.spawn(move || {
+                    r2.wait();
+                    let _ = conv.gravar(id_ref, msgs_ref, None);
+                });
+                barreira.wait();
+            });
+
+            // Dos dois efeitos nenhum pode sumir: o nome dado à mão e o histórico
+            // do turno. Um ler→escrever sem lock faz o último apagar o outro.
+            let final_: Conversa = ler_json(&caminho).unwrap();
+            if !(final_.nomeada
+                && final_.titulo == titular
+                && final_.mensagens.len() == mensagens.len())
+            {
+                perdido.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        assert_eq!(
+            perdido.load(Ordering::Relaxed),
+            0,
+            "renomear e gravar no mesmo id se atropelaram: um efeito sumiu do arquivo"
+        );
         let _ = std::fs::remove_dir_all(&conversas.raiz);
     }
 }

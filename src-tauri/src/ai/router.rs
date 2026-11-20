@@ -190,9 +190,13 @@ fn janela_efetiva(c: &Candidato, pedida: usize) -> usize {
 fn posto(c: &Candidato, hardware: &Hardware, pedida: usize) -> (u8, bool) {
     use super::alojamento::Alojamento;
     let Some(ficha) = &c.ficha else {
-        // Sem ficha não há colocação a prometer: entra por último, mas entra,
-        // porque é o que há em disco e o usuário pode ter acabado de baixar.
-        return (3, true);
+        // Sem ficha não há o que prometer: entra por último na colocação e,
+        // principalmente, não afirma que cabe. O `false` é o invariante deste
+        // módulo — `None` é "não medimos", nunca "cabe" — e é ele que impede um
+        // arquivo pela metade de passar no freio `cabem` como se tivesse sido
+        // medido. Ainda entra, porque é o que há em disco e a escolha final
+        // recorre ao último candidato quando ninguém foi medido.
+        return (3, false);
     };
     let janela = janela_efetiva(c, pedida);
     match super::alojamento::alojar(ficha, hardware.placa.as_ref(), janela) {
@@ -589,6 +593,21 @@ mod tests {
         assert_eq!(choice.model_id, "granite-4.2-3b-Q4_K_M");
         assert!(choice.reason.contains("não medido"), "{}", choice.reason);
         assert!(choice.signals.iter().any(|s| s.contains("sem cabeçalho")), "{:?}", choice.signals);
+    }
+
+    /// O invariante escrito na struct: `None` é "não medimos" e nunca deve ser
+    /// lido como "cabe". Antes o `posto` de um candidato sem ficha devolvia
+    /// `(3, true)` — último na colocação, mas afirmando caber sem nunca ter
+    /// medido. Aqui é o `false` que se cobra.
+    #[test]
+    fn candidato_sem_ficha_nao_afirma_que_cabe() {
+        let hardware = hardware_na_placa(16, 15 * 1024);
+        let sem_ficha = candidato("granite-4.2-3b-Q4_K_M", None);
+        assert_eq!(
+            posto(&sem_ficha, &hardware, 4096),
+            (3, false),
+            "sem ficha: entra por último e não jura que cabe"
+        );
     }
 
     #[test]

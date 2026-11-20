@@ -213,5 +213,9 @@ export function onBancadaEvent(
 }
 
 export function message(error: unknown): string {
-  return typeof error === "string" ? error : JSON.stringify(error);
+  if (typeof error === "string") return error;
+  // Um `Error` serializa para "{}": a faixa de falha mostraria um objeto vazio
+  // em vez do motivo real. A mensagem dele é o que a pessoa precisa ler.
+  if (error instanceof Error) return error.message;
+  return JSON.stringify(error);
 }

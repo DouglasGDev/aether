@@ -322,7 +322,16 @@ fn extrair(text: &str, nomes: &[&str]) -> (Vec<ToolCall>, Vec<(usize, usize)>) {
         }
         de = fim;
     }
+    // Os intervalos já tomados pela leitura XML acima. Um bloco JSON contido
+    // dentro de um deles não é uma chamada nova: é o valor de um parâmetro que o
+    // modelo escreveu como JSON. Lê-lo outra vez seria a mesma ferramenta
+    // executada duas vezes pelo gate — por isso a varredura de JSON só corre nos
+    // trechos que a leitura XML não reclamou.
+    let tomadas = marcas.clone();
     for (inicio, fim) in blocos_json(text) {
+        if tomadas.iter().any(|&(m_ini, m_fim)| m_ini <= inicio && fim <= m_fim) {
+            continue;
+        }
         let Ok(valor) = serde_json::from_str::<serde_json::Value>(&text[inicio..fim]) else {
             continue;
         };
@@ -827,6 +836,21 @@ mod tests {
         );
         assert_eq!(parse_tool_calls(&text, NOMES).len(), 2);
         assert_eq!(strip_tool_calls(&text, NOMES), "Vou verificar.\ne depois");
+    }
+
+    #[test]
+    fn json_dentro_da_chamada_xml_nao_e_segunda_chamada() {
+        // A chamada é XML, e o valor de um parâmetro é ele mesmo um JSON que cita
+        // outra ferramenta conectada. Esse objeto é DADO da primeira chamada, não
+        // uma segunda: contá-lo de novo é a mesma ferramenta batida duas vezes.
+        let text = format!(
+            "{c}\n{f}everything__echo{gt}\n{p}payload{gt}\n{{\"name\": \"srv__n\", \"arguments\": {{}}}}\n{pc}\n{fc}\n{cc}",
+            c = CALL_OPEN, f = FN_OPEN, gt = ">", p = PARAM_OPEN,
+            pc = PARAM_CLOSE, fc = FN_CLOSE, cc = CALL_CLOSE,
+        );
+        let calls = parse_tool_calls(&text, NOMES);
+        assert_eq!(calls.len(), 1, "o JSON embutido não vira segunda chamada: {calls:?}");
+        assert_eq!(calls[0].name, "everything__echo");
     }
 
     #[test]

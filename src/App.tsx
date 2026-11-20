@@ -106,7 +106,13 @@ export default function App() {
   // catálogo: ele resolve a ferramenta por aqui, não por um valor capturado.
   const ferramentas = useRef<Map<string, ToolInfo>>(new Map());
 
+  /// Cada evento MCP e cada fim de turno dispara um refresh concorrente: sem
+  /// ordem, um snapshot mais antigo e mais lento atropela `pending`/`connected`/
+  /// `chats` mais novos. Só o último pedido iniciado tem o direito de escrever.
+  const refreshPedido = useRef(0);
+
   const refresh = useCallback(async () => {
+    const token = ++refreshPedido.current;
     try {
       const [
         nextConnectors,
@@ -131,6 +137,8 @@ export default function App() {
           api.sessionGrants(),
           api.conversasListar(),
         ]);
+      // Um pedido mais novo já começou: este snapshot é velho e não escreve.
+      if (token !== refreshPedido.current) return;
       setConnectors(nextConnectors);
       setConnected(nextConnected);
       setMode(nextMode);
@@ -145,6 +153,9 @@ export default function App() {
       setChats(nextChats);
       ferramentas.current = new Map(nextTools.map((tool) => [tool.qualifiedName, tool]));
     } catch (cause) {
+      // A falha de um pedido já superado não é a falha do estado atual: um
+      // refresh mais novo pode ter sucedido depois deste ter falhado.
+      if (token !== refreshPedido.current) return;
       setError(message(cause));
     }
   }, []);
@@ -475,6 +486,11 @@ export default function App() {
   }
 
   async function abrirConversa(id: string) {
+    // Um turno em curso anexa cada delta ao último turno assistant do buffer
+    // vivo: trocar a conversa agora faria o handler escrever na história de
+    // outra. O núcleo recusa a troca e a tela já esconde o botão (Chats
+    // desabilita com `ocupado`); esta guarda cobre quem chamar direto.
+    if (talking) return;
     setError(null);
     try {
       setTurns(turnsDe(await api.conversaAbrir(id)));

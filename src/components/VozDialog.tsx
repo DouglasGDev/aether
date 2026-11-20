@@ -124,6 +124,17 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
     }
   }
 
+  /// Parar a fala pode falhar como qualquer invoke: o motivo real vai para a
+  /// faixa de erro, não para uma rejeição sem dono no console.
+  async function parar() {
+    setErro(null);
+    try {
+      await api.vozParar();
+    } catch (cause) {
+      setErro(message(cause));
+    }
+  }
+
   async function baixar(modelo: StatusVoz) {
     setErro(null);
     setFaults((current) => ({ ...current, [modelo.id]: "" }));
@@ -170,7 +181,7 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
           <span className="sheet-title">{t("voz.titulo")}</span>
           <span className="voz-pulso">
             {medidor.falando && (
-              <button type="button" className="danger" onClick={() => void api.vozParar()}>
+              <button type="button" className="danger" onClick={() => void parar()}>
                 <Icon name="stop" />
                 {t("voz.pararFala")}
               </button>

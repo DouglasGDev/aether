@@ -144,8 +144,15 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
 
   const cancelar = async (servidor: ServidorCatalogo) => {
     setErro(null);
-    const obtido = await api.mcpInstallCancel(servidor.id).catch(() => false);
-    if (!obtido) setErro(t("servidores.nadaParaCancelar", { nome: servidor.nome }));
+    try {
+      const obtido = await api.mcpInstallCancel(servidor.id);
+      // `false` é a resposta real do núcleo: não havia obra em curso. Uma
+      // rejeição é outra coisa — o motivo real vai para a faixa de erro, em
+      // vez de virar um "nada para cancelar" que não aconteceu.
+      if (!obtido) setErro(t("servidores.nadaParaCancelar", { nome: servidor.nome }));
+    } catch (cause) {
+      setErro(message(cause));
+    }
   };
 
   const alternar = async () => {

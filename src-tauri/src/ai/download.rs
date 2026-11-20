@@ -67,9 +67,22 @@ fn part_path(target: &Path) -> PathBuf {
 }
 
 pub(crate) fn client() -> anyhow::Result<reqwest::Client> {
+    client_com_leitura(Duration::from_secs(30))
+}
+
+/// O cliente real, com o prazo de leitura trocável apenas para que um teste
+/// possa encurtá-lo sem encurtar o `read_timeout` que está em produção.
+fn client_com_leitura(leitura: Duration) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("Aether/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
+        // O `connect_timeout` só cobre abrir a conexão. Um servidor que aceita,
+        // manda os cabeçalhos e então silencia no meio do corpo penduraria a
+        // leitura para sempre, e sem prazo o `.part` fica congelado no ar. O
+        // `read_timeout` é por leitura, não pelo corpo inteiro: um servidor lento
+        // mas vivo continua mandando peças e não é cortado — o que cai é o
+        // silêncio, e ele vira falha retentável na fila de tentativas.
+        .read_timeout(leitura)
         .build()
         .context(tr("erros.falhaCriarCliente", &[]))
 }
@@ -128,6 +141,18 @@ async fn esperar(espera: Duration, cancel: &AtomicBool) -> anyhow::Result<()> {
         return Err(Cancelled.into());
     }
     Ok(())
+}
+
+/// Acaba quando *Parar* é apertado, sozinho. Vive para ser a outra perna de um
+/// `select!` contra a espera pelo próximo chunk: se o servidor abriu a conexão e
+/// silenciou no corpo, `stream.next()` não devolve nada até o `read_timeout`, e
+/// o botão não pode esperar o timeout para fazer efeito. Este vigia dá o
+/// cancelamento antes.
+async fn vigiar_cancelamento(cancel: &AtomicBool) {
+    const PASSO: Duration = Duration::from_millis(50);
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(PASSO).await;
+    }
 }
 
 /// Escreve `url` em `target`, retomando de um `.part` quando o servidor aceita
@@ -320,7 +345,18 @@ async fn tentativa_de_escrever(
     let mut last_report = Instant::now();
     let mut received = 0u64;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // `stream.next()` fica pendurado se o servidor silenciar no corpo, e
+        // aí o *Parar* só seria visto depois do `read_timeout`. O select dá o
+        // cancelamento assim que ele chega, no meio da espera por bytes.
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk,
+            () = vigiar_cancelamento(cancel) => {
+                file.flush().ok();
+                return Err(Cancelled.into());
+            }
+        };
+        let Some(chunk) = chunk else { break };
         if cancel.load(Ordering::Relaxed) {
             file.flush().ok();
             return Err(Cancelled.into());
@@ -698,6 +734,11 @@ mod tests {
             /// Anuncia o corpo inteiro e entrega só `bytes` antes de fechar. É
             /// o que uma conexão cortada deixa escrito no `.part`.
             Cortar { bytes: usize },
+            /// Anuncia o corpo inteiro, entrega `bytes` e então silencia: a
+            /// conexão fica aberta, sem mandar o resto e sem fechar. É o corpo
+            /// que para no meio depois que o `connect_timeout` já passou — só o
+            /// `read_timeout` ou o *Parar* devolvem o controle.
+            Silenciar { bytes: usize },
             /// Entrega tudo, honrando o Range quando ele vem.
             Inteira,
             /// Status sem corpo: 404 para a falha definitiva, 416 para o
@@ -736,9 +777,21 @@ mod tests {
                 let Ok((mut socket, _)) = listener.accept() else { return };
                 conexoes.fetch_add(1, Ordering::Relaxed);
                 let inicio = ler_inicio(&mut socket);
-                let _ = socket.write_all(&resposta(pedida, &corpo, inicio));
+                let (resposta, silencia) = resposta(pedida, &corpo, inicio);
+                let _ = socket.write_all(&resposta);
                 let _ = socket.flush();
-                let _ = socket.shutdown(std::net::Shutdown::Write);
+                if silencia {
+                    // Segura a conexão aberta e muda, sem corpo: o cliente fica
+                    // esperando bytes que não vêm. Solta depois de um tempo para
+                    // não deixar um socket pendurado, mas o suficiente para o
+                    // read_timeout e o *Parar* terem o que fazer primeiro.
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                        drop(socket);
+                    });
+                } else {
+                    let _ = socket.shutdown(std::net::Shutdown::Write);
+                }
             }
             // Acabou o script: o que chegar depois é derrubado na hora. Um
             // downloader que resolvesse pedir mais vezes que o combinado falha o
@@ -774,18 +827,22 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        fn resposta(pedida: Pedida, corpo: &[u8], inicio: u64) -> Vec<u8> {
+        /// A resposta crua e se a conexão deve ficar aberta e muda depois dela.
+        fn resposta(pedida: Pedida, corpo: &[u8], inicio: u64) -> (Vec<u8>, bool) {
             let inicio = (inicio as usize).min(corpo.len());
             let restante = corpo.len() - inicio;
             if let Pedida::Status(codigo) = pedida {
-                return format!(
-                    "HTTP/1.1 {codigo} indefinido\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-                .into_bytes();
+                return (
+                    format!(
+                        "HTTP/1.1 {codigo} indefinido\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes(),
+                    false,
+                );
             }
             let entregue = match pedida {
                 Pedida::Inteira => restante,
-                Pedida::Cortar { bytes } => bytes.min(restante),
+                Pedida::Cortar { bytes } | Pedida::Silenciar { bytes } => bytes.min(restante),
                 Pedida::Status(_) => unreachable!(),
             };
             let (codigo, faixa) = if inicio > 0 {
@@ -806,7 +863,7 @@ mod tests {
             )
             .into_bytes();
             bytes.extend_from_slice(&corpo[inicio..inicio + entregue]);
-            bytes
+            (bytes, matches!(pedida, Pedida::Silenciar { .. }))
         }
     }
 
@@ -961,6 +1018,83 @@ mod tests {
         assert_eq!(recebidos, TOTAL as u64, "recomeçar do zero é pedir o arquivo inteiro");
         assert_eq!(std::fs::read(&alvo).unwrap(), corpo());
         assert_eq!(servidor.atendidas(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O *Parar* tem de valer durante um corpo que silenciou — conexão aberta,
+    /// sem bytes, sem fechar — e não só durante a espera do backoff. Sem o
+    /// `select!` contra o stream, `stream.next()` fica pendurado esperando bytes
+    /// que não vêm (e este cliente de teste não tem `read_timeout` nenhum): o
+    /// botão não faz nada até o teste estourar. Com o vigia de cancelamento, o
+    /// *Parar* vence a espera por bytes e devolve `Cancelled` na hora.
+    #[tokio::test]
+    async fn parar_responde_durante_um_corpo_que_silenciou() {
+        let servidor = Servidor::novo(vec![Pedida::Silenciar { bytes: 10_000 }]);
+        let dir = pasta_de_teste("parar-silencio");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+
+        let control = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            control.store(true, Ordering::Relaxed);
+        });
+
+        // O timeout de 5s é o veredito do próprio defeito: pendurado no stream,
+        // o download nunca devolve e o tempo esgota. Verde é `Cancelled` antes.
+        let resposta =
+            tokio::time::timeout(Duration::from_secs(5), baixar(&servidor, &dir, Some(TOTAL as u64), &cancel))
+                .await;
+        match resposta {
+            Err(_) => panic!("o *Parar* não respondeu durante o silêncio: o stream ficou pendurado"),
+            Ok(Ok(_)) => panic!("um download cancelado no meio não é sucesso"),
+            Ok(Err(erro)) => {
+                assert!(erro.downcast_ref::<Cancelled>().is_some(), "{erro:#}")
+            }
+        }
+        assert_eq!(servidor.atendidas(), 1, "cancelado não pode pedir de novo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ninguém apertou *Parar* e mesmo assim um corpo que silenciou não pode
+    /// pendurar o download para sempre: o `read_timeout` corta o silêncio, cada
+    /// corte é retentável, e no fim a fila devolve as tentativas gastadas em vez
+    /// de esperar por bytes que não vêm. O servidor silencioso tem o dobro de
+    /// pedidas de que a retentativa dispõe — sobrar conexão na lista é a prova
+    /// de que ela parou no número, não que ficou presa.
+    #[tokio::test]
+    async fn um_corpo_que_silencia_vira_falha_retentavel_pelo_read_timeout() {
+        let servidor =
+            Servidor::novo(vec![Pedida::Silenciar { bytes: 10_000 }; TENTATIVAS as usize * 2]);
+        let dir = pasta_de_teste("read-timeout");
+        let cancel = AtomicBool::new(false);
+        // A cadeia de cliente real da produção, só com o prazo de leitura
+        // encurtado: o que se mede é o corte do silêncio, não o relógio de 30s.
+        let http =
+            client_com_leitura(Duration::from_millis(200)).expect("cliente com read_timeout");
+
+        let resposta = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream_desde_o_ponto(
+                &http,
+                &servidor.url,
+                &dir.join("arquivo.gguf"),
+                Some(TOTAL as u64),
+                &cancel,
+                |_, _, _| {},
+                Duration::from_millis(5),
+            ),
+        )
+        .await;
+        let erro = match resposta {
+            Err(_) => panic!("o read_timeout não cortou o silêncio: o download ficou pendurado"),
+            Ok(Ok(_)) => panic!("um corpo que silenciou não é download completo"),
+            Ok(Err(erro)) => erro,
+        };
+
+        let texto = format!("{erro:#}");
+        assert!(texto.contains(&TENTATIVAS.to_string()), "{texto}");
+        assert_eq!(servidor.atendidas(), TENTATIVAS as usize, "cada silêncio tinha de virar uma pedida");
+        assert!(!dir.join("arquivo.gguf").exists(), "nada é publicado pela metade");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

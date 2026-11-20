@@ -54,6 +54,11 @@ pub fn evaluate(
             // so a compound command always earns a fresh prompt.
             if compound {
                 Decision::Ask
+            } else if effect == ToolEffect::Destructive {
+                // Apagar exige um prompt novo mesmo com a confiança da sessão: o
+                // Default é mais cauteloso que o AutoAccept, que já pergunta para
+                // destrutivo. Um grant não pode tornar o modo padrão menos seguro.
+                Decision::Ask
             } else if session_granted {
                 Decision::Allow
             } else {
@@ -238,6 +243,17 @@ mod tests {
         );
         assert_eq!(
             evaluate(AgentMode::Default, ToolEffect::Mutating, true, true),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn session_grant_does_not_skip_destructive_prompt() {
+        // O Default é mais cauteloso que o AutoAccept, que já pergunta para
+        // destrutivo. Um grant de sessão não pode tornar o modo padrão menos
+        // seguro: apagar exige um prompt novo mesmo com a confiança da sessão.
+        assert_eq!(
+            evaluate(AgentMode::Default, ToolEffect::Destructive, false, true),
             Decision::Ask
         );
     }

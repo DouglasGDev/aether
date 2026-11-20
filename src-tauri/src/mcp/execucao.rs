@@ -237,8 +237,11 @@ pub fn resultado_local(saida: local::Saida) -> CallToolResult {
     resultado
 }
 
-// Qualquer argumento textual pode chegar a um shell, então um pipe ou uma
-// substituição revoga o benefício de uma concessão de sessão.
+// Qualquer argumento textual pode chegar a um shell, então um separador ou uma
+// substituição revoga o benefício de uma concessão de sessão. O `&` simples
+// (que cobre o `&&`), a quebra de linha e o `<` também separam/redirecionam no
+// cmd.exe, e `^`/`%` são escape e expansão dele: ficar só nos separadores do
+// sh deixaria `cmd /C "echo ok & payload"` passar como comando único.
 pub(crate) fn argumentos_contem_composto(
     argumentos: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
@@ -247,10 +250,15 @@ pub(crate) fn argumentos_contem_composto(
             serde_json::Value::String(texto) => {
                 texto.contains('|')
                     || texto.contains(';')
-                    || texto.contains("&&")
+                    || texto.contains('&')
                     || texto.contains("$(")
                     || texto.contains('`')
                     || texto.contains('>')
+                    || texto.contains('<')
+                    || texto.contains('\n')
+                    || texto.contains('\r')
+                    || texto.contains('^')
+                    || texto.contains('%')
             }
             serde_json::Value::Array(itens) => itens.iter().any(scan),
             serde_json::Value::Object(map) => map.values().any(scan),
@@ -309,6 +317,34 @@ mod tests {
     #[test]
     fn argumentos_vazios_nao_sao_compostos() {
         assert!(!argumentos_contem_composto(&mapa(json!({}))));
+    }
+
+    /// O cmd.exe separa comandos com `&` simples e quebra de linha, redireciona
+    /// entrada com `<`, escapa com `^` e expande `%VAR%`: nenhum deles pode
+    /// passar como comando único, ou o grant de sessão deixa de reperguntar
+    /// diante de `cmd /C "echo ok & payload"`.
+    #[test]
+    fn separadores_do_cmd_tambem_tornam_composto() {
+        for comando in [
+            "echo ok & payload",
+            "echo ok\npayload",
+            "echo ok\rpayload",
+            "type saida < entrada.txt",
+            "echo ^escapado",
+            "echo %PATH%",
+        ] {
+            assert!(
+                argumentos_contem_composto(&mapa(json!({ "comando": comando }))),
+                "deveria ser composto: {comando:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comando_unico_sem_separadores_continua_simples() {
+        assert!(!argumentos_contem_composto(&mapa(
+            json!({ "comando": "git status --short" })
+        )));
     }
 
     /// A recusa do modo não depende do que a ferramenta escreve no disco: um

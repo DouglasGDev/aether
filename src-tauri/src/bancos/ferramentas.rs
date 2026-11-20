@@ -298,7 +298,10 @@ fn tabelas(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
 
 fn colunas(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
     let conexao = conexao_pedida(config, args)?;
-    let fonte = fonte_exposta(&conexao, args)?;
+    // Descrever o esquema é leitura: sem o `ler` do dono, a tabela não exposta
+    // para consulta também não tem as colunas divulgadas — estar no cadastro
+    // não basta, a política por operação é que manda.
+    let fonte = fonte_pedida(&conexao, args, Operacao::Ler)?;
     let mut motor = motor::abrir(&conexao)?;
     let lista = motor.colunas(&fonte)?;
     let cartoes: Vec<ColunaCartao> = lista
@@ -788,6 +791,26 @@ mod tests {
         let json = saida.vista.para_json();
         assert_eq!(json["colunas"][0]["nome"], "id");
         assert_eq!(json["colunas"][1]["nome"], "nome");
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    /// Descrever o esquema também é leitura: a tabela que o dono não autorizou
+    /// ler não tem as colunas divulgadas pelo `bancos_colunas`, do mesmo jeito
+    /// que `bancos_consultar` já recusava.
+    #[test]
+    fn colunas_de_fonte_nao_legivel_sao_recusadas() {
+        let b = bancada();
+        let mut config = Config::load(&b.config_path).expect("carrega");
+        config.conexoes[0].fontes.get_mut("clientes").expect("fonte").ler = false;
+        config.save(&b.config_path).expect("salva");
+        let erro = executar(
+            "bancos_colunas",
+            json!({ "conexao": "Estoque", "fonte": "clientes" }),
+            &b.config_path,
+        )
+        .expect_err("sem ler não descreve o esquema");
+        assert!(erro.to_string().contains("ler"), "{erro}");
+        assert!(erro.to_string().contains("clientes"), "{erro}");
         std::fs::remove_dir_all(&b.raiz).ok();
     }
 

@@ -236,6 +236,14 @@ fn arvore(raiz: &Path, profundidade_maxima: usize) -> Vec<PathBuf> {
         itens.sort_by_key(|e| e.file_name());
         for item in itens {
             let caminho = item.path();
+            // No Windows `DirEntry::metadata` não segue o link: um symlink para
+            // arquivo entraria como arquivo e a leitura depois seguiria o link
+            // para fora da concessão. O tipo da entrada vê o link em si, então
+            // a recusa acontece aqui, antes de qualquer leitura.
+            let Ok(tipo) = item.file_type() else { continue };
+            if tipo.is_symlink() {
+                continue;
+            }
             let Ok(meta) = item.metadata() else { continue };
             if meta.is_dir() {
                 if profundidade + 1 < profundidade_maxima {
@@ -276,7 +284,9 @@ pub fn buscar(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
                 leitura
                     .filter_map(|e| e.ok())
                     .map(|e| e.path())
-                    .filter(|p| p.is_file())
+                    // `is_file` segue o link e aprovaria um symlink para fora;
+                    // `symlink_metadata` vê o link em si, que não é arquivo.
+                    .filter(|p| p.symlink_metadata().map(|m| m.is_file()).unwrap_or(false))
                     .collect()
             })
             .unwrap_or_default()
@@ -286,6 +296,10 @@ pub fn buscar(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
     let mut total = 0usize;
     let mut truncado = false;
     'arquivos: for arquivo in arquivos {
+        // Re-resolver cada candidato fecha a janela entre listar e ler: um link
+        // que apareceu nesse meio tempo é canonicalizado pelo resolver e, se
+        // aponta para fora da concessão, recusado antes de qualquer leitura.
+        let Ok(arquivo) = pastas.resolver(&arquivo.to_string_lossy()) else { continue };
         let Ok(meta) = fs::metadata(&arquivo) else { continue };
         if meta.len() > LIMITE_LEITURA {
             continue;
@@ -491,6 +505,16 @@ pub fn criar_pasta(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> 
 
 pub fn mover(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
     let origem = pastas.resolver(&obrigatorio(args, "origem")?)?;
+    // Renomear a raiz concedida revogaria por dentro a permissão que o usuário
+    // deu — o mesmo motivo de `apagar` recusar: o gate autorizou o conteúdo da
+    // pasta, não a concessão em si. A recusa vem antes do destino, senão um
+    // destino fora da concessão mascararia o verdadeiro motivo.
+    if pastas.raizes.contains(&origem) {
+        bail!(tr(
+            "erros.raizProtegida",
+            &[("caminho", &origem.display().to_string())]
+        ));
+    }
     let destino = pastas.resolver(&obrigatorio(args, "destino")?)?;
     if !origem.exists() {
         bail!(tr("erros.caminhoNaoExiste", &[("caminho", &origem.display().to_string())]));
@@ -918,6 +942,121 @@ mod tests {
         }
         assert!(!fora.exists());
         limpar(&raiz);
+    }
+
+    /// Link simbólico de teste. Sem privilégio (comum no Windows fora do modo
+    /// desenvolvedor) devolve false: o teste então prova a contenção pelo
+    /// resolver, que é a mesma regra que barra o alvo do link.
+    fn criar_link(alvo: &Path, link: &Path, pasta: bool) -> bool {
+        #[cfg(windows)]
+        {
+            if pasta {
+                std::os::windows::fs::symlink_dir(alvo, link).is_ok()
+            } else {
+                std::os::windows::fs::symlink_file(alvo, link).is_ok()
+            }
+        }
+        #[cfg(unix)]
+        {
+            let _ = pasta;
+            std::os::unix::fs::symlink(alvo, link).is_ok()
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (alvo, link, pasta);
+            false
+        }
+    }
+
+    /// `buscar` é ReadOnly e roda sem aprovação no Plan: um link dentro da
+    /// pasta concedida apontando para fora não pode virar leitura do alvo,
+    /// ou a concessão de uma pasta vira acesso a qualquer arquivo do disco.
+    #[test]
+    fn buscar_nao_le_link_simbolico_que_aponta_para_fora() {
+        let (_, pastas) = cenario("buscar-link");
+        // O link é encenado sobre a raiz concedida, que é o caminho real sem o
+        // prefixo verbatim do Windows: criar symlink com `\\?\` no alvo é
+        // terreno incerto, e a concessão é exatamente esta pasta.
+        let raiz = pastas.raizes[0].clone();
+        let fora = raiz
+            .parent()
+            .unwrap()
+            .join(format!("aether-arq-link-fora-{}", std::process::id()));
+        fs::create_dir_all(&fora).unwrap();
+        let segredo = fora.join("segredo.txt");
+        fs::write(&segredo, "SEGREDOFORA na primeira linha\n").unwrap();
+        fs::write(raiz.join("visivel.txt"), "nada demais\n").unwrap();
+        let link = raiz.join("atalho.txt");
+        if !criar_link(&segredo, &link, false) {
+            // Sem privilégio de link o escape não é encenado; a contenção do
+            // resolver sobre o alvo do link continua provada.
+            assert!(pastas.resolver(&segredo.to_string_lossy()).is_err());
+            limpar(&raiz);
+            limpar(&fora);
+            return;
+        }
+        for recursivo in [true, false] {
+            let saida =
+                buscar(&args(json!({"termo": "segredofora", "recursivo": recursivo})), &pastas)
+                    .unwrap();
+            assert!(!saida.texto.contains("SEGREDOFORA"), "recursivo={recursivo}");
+            let Vista::Busca { total, achados, .. } = saida.vista else {
+                panic!("vista errada");
+            };
+            assert_eq!(total, 0, "recursivo={recursivo}: o link não pode ser lido");
+            assert!(achados.is_empty());
+        }
+        limpar(&raiz);
+        limpar(&fora);
+    }
+
+    /// O mesmo vale para link de pasta: a travessia não pode descer por ele
+    /// e ler a árvore de fora da concessão.
+    #[test]
+    fn buscar_nao_desce_em_link_de_pasta_que_aponta_para_fora() {
+        let (_, pastas) = cenario("buscar-link-pasta");
+        let raiz = pastas.raizes[0].clone();
+        let fora = raiz
+            .parent()
+            .unwrap()
+            .join(format!("aether-arq-linkpasta-fora-{}", std::process::id()));
+        fs::create_dir_all(fora.join("sub")).unwrap();
+        fs::write(fora.join("sub").join("segredo.txt"), "SEGREDOFORA fundo\n").unwrap();
+        let link = raiz.join("atalho");
+        if !criar_link(&fora, &link, true) {
+            assert!(
+                pastas
+                    .resolver(&fora.join("sub").join("segredo.txt").to_string_lossy())
+                    .is_err()
+            );
+            limpar(&raiz);
+            limpar(&fora);
+            return;
+        }
+        let saida = buscar(&args(json!({"termo": "segredofora"})), &pastas).unwrap();
+        assert!(!saida.texto.contains("SEGREDOFORA"));
+        let Vista::Busca { total, .. } = saida.vista else { panic!("vista errada") };
+        assert_eq!(total, 0);
+        limpar(&raiz);
+        limpar(&fora);
+    }
+
+    /// A raiz concedida é a permissão do usuário, não conteúdo: renomeá-la
+    /// revogaria a concessão por dentro, o mesmo motivo de `apagar` recusar.
+    #[test]
+    fn mover_a_propria_raiz_concedida_e_recusado() {
+        let (raiz, pastas) = cenario("mover-raiz");
+        let destino = raiz
+            .parent()
+            .unwrap()
+            .join(format!("aether-arq-raiz-renomeada-{}", std::process::id()));
+        let erro = mover(&args(json!({"origem": raiz, "destino": destino})), &pastas)
+            .expect_err("a raiz concedida não se renomeia");
+        assert!(erro.to_string().contains("pasta concedida"), "{erro}");
+        assert!(raiz.exists());
+        assert!(!destino.exists());
+        limpar(&raiz);
+        limpar(&destino);
     }
 
     #[test]

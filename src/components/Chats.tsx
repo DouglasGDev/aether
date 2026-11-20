@@ -135,6 +135,7 @@ export function Chats({
                       onClick={() => {
                         if (!atual) onAbrir(ficha.id);
                       }}
+                      disabled={ocupado}
                       aria-current={atual ? "true" : undefined}
                       title={t("conversas.abrir", { nome: nome(ficha) })}
                     >

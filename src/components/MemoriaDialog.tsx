@@ -338,7 +338,7 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
                 ocupada={ocupada}
                 idioma={idioma}
                 onBaixar={() => void agir(() => api.modelDownload(modelo.id))}
-                onCancelar={() => void api.modelDownloadCancel(modelo.id)}
+                onCancelar={() => void agir(() => api.modelDownloadCancel(modelo.id))}
                 onUsar={() => void agir(() => api.modelLoad(modelo.id))}
                 onExcluir={() => void agir(() => api.modelDelete(modelo.id))}
               />
@@ -426,7 +426,7 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
               <button
                 type="button"
                 className="icon-only"
-                onClick={() => void api.ragIndexarCancelar()}
+                onClick={() => void agir(() => api.ragIndexarCancelar())}
                 aria-label={t("memoria.parar")}
               >
                 <Icon name="cross" />

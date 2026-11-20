@@ -82,14 +82,14 @@ fn filtro_bson(filtro: &Filtro) -> Result<DocBson> {
                 if condicao.valor.is_null() {
                     Bson::Null
                 } else {
-                    json_para_bson(&condicao.valor)
+                    json_para_bson(&condicao.valor)?
                 }
             }
             Comparacao::Diferente => {
                 if condicao.valor.is_null() {
                     Bson::Document(doc! { "$ne": Bson::Null })
                 } else {
-                    Bson::Document(doc! { "$ne": json_para_bson(&condicao.valor) })
+                    Bson::Document(doc! { "$ne": json_para_bson(&condicao.valor)? })
                 }
             }
             Comparacao::Contendo => {
@@ -108,7 +108,7 @@ fn filtro_bson(filtro: &Filtro) -> Result<DocBson> {
                     _ => unreachable!("conferido acima"),
                 };
                 let mut pedaco = DocBson::new();
-                pedaco.insert(rotulo, json_para_bson(&condicao.valor));
+                pedaco.insert(rotulo, json_para_bson(&condicao.valor)?);
                 Bson::Document(pedaco)
             }
         };
@@ -117,26 +117,35 @@ fn filtro_bson(filtro: &Filtro) -> Result<DocBson> {
     Ok(consulta)
 }
 
-fn json_para_bson(valor: &Value) -> Bson {
+fn json_para_bson(valor: &Value) -> Result<Bson> {
     match valor {
-        Value::Null => Bson::Null,
-        Value::Bool(b) => Bson::Boolean(*b),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Bson::Int64(i)
-            } else {
-                n.as_f64().map(Bson::Double).unwrap_or(Bson::Null)
+        Value::Null => Ok(Bson::Null),
+        Value::Bool(b) => Ok(Bson::Boolean(*b)),
+        Value::Number(n) => Ok(if let Some(i) = n.as_i64() {
+            Bson::Int64(i)
+        } else {
+            n.as_f64().map(Bson::Double).unwrap_or(Bson::Null)
+        }),
+        Value::String(texto) => Ok(Bson::String(texto.clone())),
+        Value::Array(lista) => Ok(Bson::Array(
+            lista.iter().map(json_para_bson).collect::<Result<Vec<_>>>()?,
+        )),
+        // Um objeto que o modelo manda como valor entra como subdocumento —
+        // mas chave com `$` inicial é operador da gramática do Mongo, não
+        // identificador: deixá-la passar transformaria um valor de filtro em
+        // consulta sempre-verdadeira (`$ne: null`) e o atualizar/apagar em
+        // escrita em massa. A recusa vale em qualquer profundidade, e o erro
+        // nomeia a chave, como `conferir_campo` já faz para o nível de cima.
+        Value::Object(objeto) => {
+            let mut documento = DocBson::new();
+            for (chave, valor) in objeto {
+                if chave.starts_with('$') {
+                    bail!(tr("erros.bancoColunaInexistente", &[("coluna", chave)]));
+                }
+                documento.insert(chave.clone(), json_para_bson(valor)?);
             }
+            Ok(Bson::Document(documento))
         }
-        Value::String(texto) => Bson::String(texto.clone()),
-        Value::Array(lista) => Bson::Array(lista.iter().map(json_para_bson).collect()),
-        // Um objeto que o modelo manda como valor entra como subdocumento.
-        Value::Object(objeto) => Bson::Document(
-            objeto
-                .iter()
-                .map(|(chave, valor)| (chave.clone(), json_para_bson(valor)))
-                .collect(),
-        ),
     }
 }
 
@@ -159,7 +168,7 @@ fn documento_de(valores: &Map<String, Value>) -> Result<DocBson> {
                 }
             }
         }
-        documento.insert(chave, json_para_bson(valor));
+        documento.insert(chave, json_para_bson(valor)?);
     }
     Ok(documento)
 }
@@ -428,7 +437,7 @@ impl Motor for Mongo {
         }
         let mut definicoes = DocBson::new();
         for (chave, valor) in valores {
-            definicoes.insert(conferir_campo(chave)?, json_para_bson(valor));
+            definicoes.insert(conferir_campo(chave)?, json_para_bson(valor)?);
         }
         let consulta = filtro_bson(filtro)?;
         let cliente = self.cliente.clone();
@@ -466,5 +475,48 @@ impl Motor for Mongo {
 
     fn sql(&mut self, _declaracao: &str, _limite: usize) -> Result<ResultadoSql> {
         bail!(tr("erros.bancoSemSql", &[("tipo", "MongoDB")]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bancos::motor::filtro_de;
+    use serde_json::json;
+
+    /// Uma chave `$` no valor é operador da gramática do Mongo, não dado:
+    /// aceita-la transformaria o filtro em consulta sempre-verdadeira e o
+    /// atualizar/apagar em escrita em massa dentro da tabela autorizada.
+    #[test]
+    fn chave_de_operador_no_valor_e_recusada_em_qualquer_profundidade() {
+        let erro = json_para_bson(&json!({"$ne": null})).unwrap_err().to_string();
+        assert!(erro.contains("$ne"), "{erro}");
+        assert!(json_para_bson(&json!({"a": {"b": {"$gt": 1}}})).is_err());
+        assert!(json_para_bson(&json!([{"$exists": true}])).is_err());
+        let valores = json!({"campo": {"$ne": null, "x": 1}});
+        assert!(documento_de(valores.as_object().unwrap()).is_err());
+    }
+
+    /// O caminho real da injeção: `filtro_de` entrega um objeto com várias
+    /// chaves como igualdade, e o valor chegava ao driver como documento de
+    /// operadores. A recusa tem de acontecer antes de a consulta existir.
+    #[test]
+    fn filtro_com_operador_embutido_nao_vira_consulta() {
+        let filtro = filtro_de(Some(&json!({"campo": {"$ne": null, "x": 1}}))).unwrap();
+        assert!(filtro_bson(&filtro).is_err());
+        let filtro = filtro_de(Some(&json!({"campo": {"op": "igual", "valor": {"$ne": null}}}))).unwrap();
+        assert!(filtro_bson(&filtro).is_err());
+    }
+
+    /// Objeto sem operador continua sendo subdocumento legítimo: a recusa é
+    /// do `$`, não de valores compostos.
+    #[test]
+    fn objeto_sem_operador_continua_entrando_como_subdocumento() {
+        let bson = json_para_bson(&json!({"a": 1, "b": {"c": "x"}})).unwrap();
+        let Bson::Document(documento) = bson else { panic!("esperava documento") };
+        assert_eq!(documento.get_i64("a").unwrap(), 1);
+        let filtro =
+            filtro_de(Some(&json!({"campo": {"op": "igual", "valor": {"a": 1}}}))).unwrap();
+        assert!(filtro_bson(&filtro).is_ok());
     }
 }

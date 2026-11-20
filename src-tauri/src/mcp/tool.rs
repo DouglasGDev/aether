@@ -18,16 +18,17 @@ pub struct ToolInfo {
     pub input_schema: serde_json::Value,
 }
 
-// An unannotated tool is treated as mutating: a server that says nothing about
-// its effects has not earned read-only trust.
+// O efeito de uma ferramenta de terceiros é uma alegação do servidor, não uma
+// medida. Honrar `read_only_hint` deixaria o servidor se auto-conceder execução
+// sem prompt em Plan/AutoAccept, então o teto aqui é Mutating: só o conector
+// embutido declara efeito confiável (ToolInfo::local). O `destructive_hint` é
+// honrado porque aumenta a cautela, nunca porque a diminui.
 pub fn classify_effect(annotations: Option<&ToolAnnotations>) -> ToolEffect {
     let Some(annotations) = annotations else {
         return ToolEffect::Mutating;
     };
     if annotations.destructive_hint == Some(true) {
         ToolEffect::Destructive
-    } else if annotations.read_only_hint == Some(true) {
-        ToolEffect::ReadOnly
     } else {
         ToolEffect::Mutating
     }
@@ -88,10 +89,13 @@ mod tests {
     }
 
     #[test]
-    fn read_only_hint_is_honoured() {
+    fn a_third_party_read_only_claim_does_not_grant_trust() {
+        // O hint read-only de um servidor de terceiros não é verificável:
+        // honrá-lo deixaria o servidor se auto-conceder execução sem prompt em
+        // Plan/AutoAccept. O teto de efeito de terceiros é Mutating.
         assert_eq!(
             classify_effect(Some(&annotations(Some(true), None))),
-            ToolEffect::ReadOnly
+            ToolEffect::Mutating
         );
     }
 

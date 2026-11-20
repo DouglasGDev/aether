@@ -412,15 +412,24 @@ export function GrafoNeural({
   const quadro = useRef<HTMLDivElement | null>(null);
   const layoutAtual = useRef<Record<string, Posicao>>({});
 
+  /// Escritas otimistas e releituras da política competem: a resposta de um
+  /// `ligacoesAplicar` mais antigo pode chegar depois de um gesto mais novo e
+  /// sobrescrever o estado otimista, divergindo do que o núcleo cobra. Cada
+  /// pedido recebe um token crescente e só o mais recente escreve `base`.
+  const pedido = useRef(0);
+
   const carregar = useCallback(async () => {
+    const token = ++pedido.current;
     try {
       const estado = await api.ligacoesObter();
+      if (token !== pedido.current) return;
       setBase(estado);
       const posicoes = Object.fromEntries(estado.posicoes.map((p) => [p.id, p] as const));
       layoutAtual.current = posicoes;
       setLayout(posicoes);
       setErro(null);
     } catch (cause) {
+      if (token !== pedido.current) return;
       setErro(message(cause));
     }
   }, []);
@@ -453,12 +462,17 @@ export function GrafoNeural({
    *  desenho é relido do estado real. */
   const gravar = useCallback(
     async (novo: EstadoLigacoes, pastas: string[]) => {
+      const token = ++pedido.current;
       try {
         const estado = await api.ligacoesAplicar(planoDe(novo, pastas));
+        // Resposta fora de ordem: um gesto mais novo já assumiu o desenho, e
+        // este estado velho não pode sobrescrevê-lo.
+        if (token !== pedido.current) return;
         setBase(estado);
         setErro(null);
         onChange();
       } catch (cause) {
+        if (token !== pedido.current) return;
         setErro(message(cause));
         void carregar();
       }

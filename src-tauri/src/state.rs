@@ -352,14 +352,55 @@ impl AiRuntime {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Executa uma troca de conversa com o lugar do turno reservado. O `begin`
+    /// é o mesmo CAS que `chat_send` usa para começar um turno: ou a troca
+    /// acontece inteira antes de qualquer turno poder começar, ou o turno já
+    /// começou e a troca recusa na hora com o motivo real. Não há janela TOCTOU
+    /// entre olhar `is_busy` e agir — que era o congelamento da UI: o comando
+    /// síncrono via o flag livre, um turno começava no gap, e o `esquecer`
+    /// seguinte esperava o lock do motor a geração inteira na thread da janela.
+    /// O `end` no Drop garante que um panic na troca não deixe o flag preso:
+    /// sem isso, um único panic travaria todos os turnos seguintes até reiniciar.
+    pub fn troca_exclusiva<T>(
+        &self,
+        troca: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if !self.begin() {
+            anyhow::bail!(crate::idiomas::tr("erros.turnoEmAndamento", &[]));
+        }
+        struct Reserva<'a>(&'a AiRuntime);
+        impl Drop for Reserva<'_> {
+            fn drop(&mut self) {
+                self.0.end();
+            }
+        }
+        let _reserva = Reserva(self);
+        troca()
+    }
+
     /// Manda o motor em memória esquecer o KV. Quem troca de conversa carrega
     /// outro histórico: o cache da conversa anterior não é prefixo desta, e
     /// deixá-lo ali seria o modelo continuando a conversa errada. Sem modelo
     /// carregado não há o que esquecer.
-    pub fn esquecer(&self) {
-        if let Some(carregado) = self.loaded.lock().expect("motor envenenado").as_mut() {
+    ///
+    /// O lock é tentado, nunca esperado: o turno segura o motor a geração
+    /// inteira (e o `preload` o segura durante a carga), então bloquear aqui
+    /// prenderia a thread da janela — o card de aprovação nunca chegaria. Motor
+    /// ocupado devolve o motivo real em vez de congelar a UI. Chamado dentro de
+    /// `troca_exclusiva`, o único ocupante possível é uma carga/aplicação, não um
+    /// turno: o turno já teria derrotado a reserva.
+    pub fn esquecer(&self) -> anyhow::Result<()> {
+        let mut guard = match self.loaded.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                anyhow::bail!(crate::idiomas::tr("erros.motorOcupado", &[]))
+            }
+            Err(std::sync::TryLockError::Poisoned(erro)) => panic!("motor envenenado: {erro}"),
+        };
+        if let Some(carregado) = guard.as_mut() {
             carregado.engine.reset();
         }
+        Ok(())
     }
 
     /// Os candidatos do roteador, cada um com o cabeçalho do próprio arquivo
@@ -503,5 +544,102 @@ mod tests {
             .expect("a leitura do estado esperou o motor: comando síncrono prendeu a UI");
         drop(guard);
         drop(lido);
+    }
+
+    fn runtime_de_teste(nome: &str) -> Arc<AiRuntime> {
+        let raiz = std::env::temp_dir().join(format!("aether-{nome}-{}", std::process::id()));
+        Arc::new(AiRuntime::new(
+            raiz.clone(),
+            Vec::new(),
+            raiz.join("geracao.json"),
+            raiz.join("adaptadores.json"),
+        ))
+    }
+
+    /// Vermelho-primeiro: o `esquecer` antigo fazia `loaded.lock()` e devolvia
+    /// `()`. Com o motor preso (o turno o segura a geração inteira), ele esperava
+    /// o turno todo — o `recv_timeout` abaixo expirava, e a thread da janela ficava
+    /// congelada. Agora o lock é tentado: motor ocupado devolve o motivo real na
+    /// hora, sem esperar. O guard fica preso de propósito para simular a geração.
+    #[test]
+    fn o_esquecer_nao_espera_o_motor_no_meio_do_turno() {
+        let ai = runtime_de_teste("esquecer");
+        let guard = ai.loaded.lock().expect("motor envenenado");
+
+        let outro = Arc::clone(&ai);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(outro.esquecer());
+        });
+
+        let resultado = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("esquecer esperou o motor: a troca de conversa prenderia a UI o turno inteiro");
+        assert!(
+            resultado.is_err(),
+            "com o motor ocupado o esquecer devia recusar com o motivo real, não bloquear"
+        );
+        drop(guard);
+    }
+
+    /// A atomicidade que fecha o TOCTOU: enquanto a troca de conversa está dentro
+    /// da reserva, um turno NÃO pode começar — o `begin` do `chat_send` é o mesmo
+    /// CAS e a reserva o derrota. Antes, o comando olhava `is_busy` e só depois
+    /// agia; um turno que começasse nesse gap disputava o KV e o histórico.
+    #[test]
+    fn a_troca_de_conversa_reserva_o_lugar_do_turno() {
+        let ai = runtime_de_teste("reserva");
+        let (entrou_tx, entrou_rx) = mpsc::channel();
+        let (pode_sair_tx, pode_sair_rx) = mpsc::channel();
+
+        let outro = Arc::clone(&ai);
+        let troca = std::thread::spawn(move || {
+            outro.troca_exclusiva(|| {
+                entrou_tx.send(()).expect("canal da troca fechado");
+                // Segura a reserva aberta para o teste tentar começar um turno.
+                pode_sair_rx.recv().expect("canal da troca fechado");
+                Ok(())
+            })
+        });
+
+        entrou_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a troca não começou");
+        assert!(
+            !ai.begin(),
+            "um turno começou no meio da troca de conversa: a reserva não é atômica"
+        );
+        pode_sair_tx.send(()).expect("canal da troca fechado");
+        troca.join().expect("a thread da troca panicou").expect("a troca falhou");
+        // Liberada a reserva, o turno volta a poder começar.
+        assert!(ai.begin(), "a reserva não foi liberada no fim da troca");
+        ai.end();
+    }
+
+    /// Nada simulado: com um turno já em curso, a troca recusa com o motivo real
+    /// e o corpo da troca nem roda — não há sucesso falso nem efeito pela metade.
+    #[test]
+    fn a_troca_recusa_com_o_motivo_real_quando_ha_turno() {
+        let ai = runtime_de_teste("recusa");
+        assert!(ai.begin(), "o turno de teste não começou");
+
+        let executou = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&executou);
+        let resultado = ai.troca_exclusiva(|| {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let erro = resultado.expect_err("a troca devia recusar com turno em curso");
+        assert!(
+            !executou.load(Ordering::SeqCst),
+            "a troca rodou mesmo com um turno em curso"
+        );
+        let motivo = erro.to_string();
+        assert!(
+            motivo.contains("turno"),
+            "esperava o motivo real de turno em curso, veio: {motivo}"
+        );
+        ai.end();
     }
 }

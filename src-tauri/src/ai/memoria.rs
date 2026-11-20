@@ -400,6 +400,14 @@ struct FichaConversa {
     /// Momento da última mensagem, para o cartão dizer quando foi a conversa.
     atualizada: u64,
     prova: Assinatura,
+    /// A conversa foi cortada pelo teto de trechos no meio do fatiamento: o
+    /// índice lembra só o começo dela. Marcada, a ficha não prova o texto
+    /// inteiro — `conversa_vista` a trata como pendente para o turno seguinte
+    /// tentar de novo quando houver espaço, em vez de prometer para sempre um
+    /// trecho que não existe. Índice gravado antes disto existir não tem a
+    /// chave: vale `false`, que é a verdade sobre uma conversa que entrou inteira.
+    #[serde(default)]
+    truncada: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -632,9 +640,14 @@ impl Indice {
 
     /// Se a conversa já está no índice exatamente como está na lista de conversas.
     /// É esta resposta, e não uma reescrita, que faz o turno sem conversa nova não
-    /// pagar um vetor nenhum.
+    /// pagar um vetor nenhum. Uma ficha truncada nunca está "vista": falta texto
+    /// dela no índice, e dizê-lo é o que devolve os trechos que faltam quando o
+    /// teto de trechos abrir espaço.
     fn conversa_vista(&self, id: &str, prova: &Assinatura) -> bool {
-        self.meta.conversas.get(id).is_some_and(|ficha| ficha.prova == *prova)
+        self.meta
+            .conversas
+            .get(id)
+            .is_some_and(|ficha| !ficha.truncada && ficha.prova == *prova)
     }
 
     /// Quantas conversas pedem trabalho: as novas, as que ganharam mensagem e as
@@ -749,11 +762,16 @@ impl Indice {
     ///
     /// A linha de cada peça é contada no texto que foi fatiado; somar
     /// `a_partir_de` devolve o número da mensagem como a conversa o vê.
+    ///
+    /// `truncada` diz se o teto de trechos cortou a conversa no meio do
+    /// fatiamento: a ficha guarda a prova completa mesmo assim (é o estado da
+    /// conversa na lista), mas marcada não conta como vista — ver `conversa_vista`.
     fn substituir_conversa(
         &mut self,
         viva: &ConversaViva,
         prova: Assinatura,
         pecas: &[(Peca, Vec<f32>)],
+        truncada: bool,
     ) {
         self.remover(Fonte::Conversa, &viva.id);
         for (peca, vetor) in pecas {
@@ -767,7 +785,12 @@ impl Indice {
         }
         self.meta.conversas.insert(
             viva.id.clone(),
-            FichaConversa { titulo: viva.titulo.clone(), atualizada: viva.atualizada, prova },
+            FichaConversa {
+                titulo: viva.titulo.clone(),
+                atualizada: viva.atualizada,
+                prova,
+                truncada,
+            },
         );
     }
 
@@ -1038,9 +1061,17 @@ impl Indice {
         }
         let meta: Meta = serde_json::from_slice(&bruto[8..fim]).ok()?;
         let blob = &bruto[fim..];
-        if meta.dimensao == 0
-            || blob.len() != meta.trechos.len() * meta.dimensao * 4
-        {
+        // A conta do tamanho esperado é checada: um `dimensao` danificado no
+        // cabeçalho multiplicaria e embrulhari em release até casar com um blob
+        // curto, o índice carregaria torto e a fatia `vetores[..inicio+dimensao]`
+        // estouraria mais tarde. Overflow aqui é "não sei", e o caminho é indexar
+        // de novo — igual a um arquivo que não bate consigo mesmo.
+        let esperado = meta
+            .trechos
+            .len()
+            .checked_mul(meta.dimensao)
+            .and_then(|n| n.checked_mul(4));
+        if meta.dimensao == 0 || esperado != Some(blob.len()) {
             return None;
         }
         let vetores = blob
@@ -1496,6 +1527,21 @@ struct Carregado {
     tokenizador: Tokenizer,
 }
 
+/// O resumo do codificador carregado, para a tela ler sem encostar no `carregado`.
+/// É uma cópia pequena e estável: só muda quando o motor entra ou sai da memória,
+/// nunca durante a varredura. A varredura segura `carregado` do primeiro ao último
+/// arquivo, então quem pergunta o estado pelo lock dele esperaria a varredura
+/// inteira — a mesma UI congelada do task #40, agora pelo lado da memória. A tela
+/// lê este espelho, que a varredura não toca.
+#[derive(Debug, Clone)]
+struct InfoMotor {
+    dispositivo: String,
+    na_placa: bool,
+    agrupamento: String,
+    dimensao: usize,
+    lote: usize,
+}
+
 /// O dono da memória. Vive atrás de um `Arc`, porque a varredura corre numa
 /// tarefa bloqueante enquanto os comandos leem estado e a conversa busca.
 pub struct Custodio {
@@ -1506,7 +1552,20 @@ pub struct Custodio {
     pastas: Arc<RwLock<Pastas>>,
     ajustes: Mutex<Ajustes>,
     carregado: Mutex<Option<Carregado>>,
+    /// O espelho de `carregado` para leitura sem o lock do motor. `Some` é
+    /// exatamente quando `carregado` tem um codificador; as duas pontas se movem
+    /// juntas em `carregado()` (carga) e nos dois `= None` (descarga).
+    info_motor: RwLock<Option<InfoMotor>>,
     indice: RwLock<Option<Indice>>,
+    /// Trava dos escritores do índice. O `RwLock` acima só protege a publicação
+    /// final; quem mexe no índice faz ler-cópia → mudar → gravar-disco → publicar,
+    /// e sem esta trava dois escritores concorrentes (um `revogar` e a revalidação
+    /// de conversas de um turno) leem a mesma cópia e o último publicar ressuscita
+    /// o conteúdo que o primeiro acabou de apagar, no disco e na memória. Ordem:
+    /// `escritores` antes de `carregado` e de `indice`. A varredura não pega esta
+    /// trava — ela já é exclusiva por `ocupado`, e pegá-la sob o `carregado` que
+    /// segura o tempo todo fecharia um ciclo com quem escreve.
+    escritores: Mutex<()>,
     ocupado: AtomicBool,
     cancelado: AtomicBool,
     progresso: RwLock<Progresso>,
@@ -1536,7 +1595,9 @@ impl Custodio {
             pastas,
             ajustes: Mutex::new(ajustes),
             carregado: Mutex::new(None),
+            info_motor: RwLock::new(None),
             indice: RwLock::new(None),
+            escritores: Mutex::new(()),
             ocupado: AtomicBool::new(false),
             cancelado: AtomicBool::new(false),
             progresso: RwLock::new(Progresso::default()),
@@ -1559,6 +1620,7 @@ impl Custodio {
         *self.ajustes.lock().expect("ajustes de memória envenenados") = novos.clone();
         if novos.trocou_codificador(&antes) {
             *self.carregado.lock().expect("codificador envenenado") = None;
+            *self.info_motor.write().expect("espelho do motor envenenado") = None;
             *self.indice.write().expect("índice envenenado") = None;
         }
         Ok(novos)
@@ -1623,6 +1685,7 @@ impl Custodio {
                     bail!(tr("erros.memoriaIndexando", &[]));
                 }
                 *guard = None;
+                *self.info_motor.write().expect("espelho do motor envenenado") = None;
             }
             era
         };
@@ -1675,6 +1738,19 @@ impl Custodio {
             .unwrap_or(false);
         if !servindo {
             *guard = Some(self.modelo_de(spec)?);
+            // O espelho acompanha a carga: só aqui um codificador entra no motor,
+            // então registrar o fato uma vez, sob o mesmo guard, basta. A ordem é
+            // `carregado` antes de `info_motor`; `estado()` só lê `info_motor`, e
+            // ninguém pega `info_motor` antes de `carregado`, então não há ciclo.
+            if let Some(c) = guard.as_ref() {
+                *self.info_motor.write().expect("espelho do motor envenenado") = Some(InfoMotor {
+                    dispositivo: c.embutidor.dispositivo.clone(),
+                    na_placa: c.embutidor.na_placa,
+                    agrupamento: c.embutidor.agrupamento.to_string(),
+                    dimensao: c.embutidor.dimensao(),
+                    lote: c.embutidor.limite(),
+                });
+            }
         }
         Ok(guard)
     }
@@ -1729,6 +1805,28 @@ impl Custodio {
         Ok(resposta)
     }
 
+    /// Um trecho é `Some` quando `indice` já tem alguma coisa na memória; sem
+    /// escritor concorrente é o que vale. Esta função é a única porta de escrita
+    /// no índice para quem não é a varredura: pega a trava dos escritores, lê a
+    /// cópia, aplica a mudança, grava no disco e publica — tudo sob a mesma trava.
+    /// O `alterar` devolve quantas peças mudou; zero significa "nada a gravar",
+    /// e o índice nem sai da função.
+    fn escrever_indice(
+        &self,
+        alterar: impl FnOnce(&mut Indice) -> usize,
+    ) -> Result<usize> {
+        let _trava = self.escritores.lock().expect("trava de escritores envenenada");
+        let Some(mut indice) = self.indice_na_memoria() else {
+            return Ok(0);
+        };
+        let feitos = alterar(&mut indice);
+        if feitos > 0 {
+            indice.salvar(&self.caminho_indice)?;
+            *self.indice.write().expect("índice envenenado") = Some(indice);
+        }
+        Ok(feitos)
+    }
+
     /// Revogar uma pasta apaga o que ela continha do índice. Não é isto que
     /// protege o conteúdo — a busca já recusa o que está fora das pastas
     /// concedidas — é o espaço que volta. Com a varredura em curso ela mesma
@@ -1738,15 +1836,7 @@ impl Custodio {
             return Ok(0);
         }
         let raizes = self.pastas.read().expect("pastas envenenadas").raizes.clone();
-        let Some(mut indice) = self.indice_na_memoria() else {
-            return Ok(0);
-        };
-        let tirados = indice.reter_dentro(&raizes);
-        if tirados > 0 {
-            indice.salvar(&self.caminho_indice)?;
-            *self.indice.write().expect("índice envenenado") = Some(indice);
-        }
-        Ok(tirados)
+        self.escrever_indice(|indice| indice.reter_dentro(&raizes))
     }
 
     /// O que o índice diz sobre si, sem copiar um vetor sequer: a tela de
@@ -1808,6 +1898,11 @@ impl Custodio {
             // agora seria perder o trabalho dela.
             return Ok(0);
         }
+        // Daqui para baixo há escrita no índice: a mesma trava que separa dois
+        // `revogar`/revalidações concorrentes, segurada do ler-cópia ao publicar.
+        // Ordem `escritores → carregado → indice`; a varredura não pega esta
+        // trava, então não há como fechar um ciclo contra ela.
+        let _trava = self.escritores.lock().expect("trava de escritores envenenada");
         let Some(spec) = self.spec() else {
             // Sem codificador não há vetor, e sem vetor a conversa não entra. A
             // tela já diz isto por `auto`; aqui basta não fazer nada.
@@ -1891,6 +1986,9 @@ impl Custodio {
                 // entrou: nenhuma fica pela metade.
                 break;
             }
+            // Quantas peças o fatiamento produziu: se entrarem menos que isso, o
+            // teto cortou a conversa no meio e a ficha precisa dizer a verdade.
+            let total_lidas = lidas.len();
             let mut prontas: Vec<(Peca, Vec<f32>)> = Vec::with_capacity(lidas.len());
             for peca in lidas {
                 if indice.trechos() + prontas.len() >= LIMITE_TRECHOS {
@@ -1900,11 +1998,12 @@ impl Custodio {
                 Indice::normalizar(&mut vetor)?;
                 prontas.push((peca, vetor));
             }
-            // O que entra é o que a ficha prova. Uma conversa cortada pelo teto
-            // fica lembrada até onde coube, e a ficha diz isso em vez de prometer
-            // o texto inteiro: assim ela não volta a ser vetorada turno após
-            // turno atrás de um começo que não cabe.
-            indice.substituir_conversa(viva, prova, &prontas);
+            // A prova cobre só o que de fato foi vetorado. Se o teto de trechos
+            // cortou a conversa no meio do fatiamento, a ficha fica marcada como
+            // truncada: assim ela não é dada por inteira (o que a esconderia da
+            // fila para sempre) e volta a ser tentada quando abrir espaço, em vez
+            // de prometer um texto que não cabe.
+            indice.substituir_conversa(viva, prova, &prontas, prontas.len() < total_lidas);
             gastos += tokens;
             mudadas += 1;
         }
@@ -1974,8 +2073,10 @@ impl Custodio {
     pub fn estado(&self, fio_ligado: bool) -> Estado {
         let ajustes = self.ajustes();
         let spec = self.spec();
-        let carregado = self.carregado.lock().expect("codificador envenenado");
-        let vivo = carregado.as_ref();
+        // Lemos o espelho, nunca o `carregado`: a varredura segura o lock do
+        // motor do primeiro ao último arquivo, e esta função é chamada no loop da
+        // tela. Pedir o lock aqui congelaria a UI enquanto a varredura corre.
+        let vivo = self.info_motor.read().expect("espelho do motor envenenado").clone();
         let disco = self.ler_indice();
         let indexados = disco.trechos;
         Estado {
@@ -1983,13 +2084,11 @@ impl Custodio {
             modelo: spec.map(|s| s.id.to_string()).unwrap_or_default(),
             instalado: spec.is_some(),
             carregado: vivo.is_some(),
-            dispositivo: vivo.map(|c| c.embutidor.dispositivo.clone()).unwrap_or_default(),
-            na_placa: vivo.map(|c| c.embutidor.na_placa).unwrap_or(false),
-            agrupamento: vivo
-                .map(|c| c.embutidor.agrupamento.to_string())
-                .unwrap_or(disco.agrupamento),
-            dimensao: vivo.map(|c| c.embutidor.dimensao()).unwrap_or(disco.dimensao),
-            lote: vivo.map(|c| c.embutidor.limite()).unwrap_or(0),
+            dispositivo: vivo.as_ref().map(|c| c.dispositivo.clone()).unwrap_or_default(),
+            na_placa: vivo.as_ref().map(|c| c.na_placa).unwrap_or(false),
+            agrupamento: vivo.as_ref().map(|c| c.agrupamento.clone()).unwrap_or(disco.agrupamento),
+            dimensao: vivo.as_ref().map(|c| c.dimensao).unwrap_or(disco.dimensao),
+            lote: vivo.as_ref().map(|c| c.lote).unwrap_or(0),
             peca: ajustes.peca,
             sobreposicao: ajustes.sobreposicao,
             trechos: ajustes.trechos,
@@ -2406,6 +2505,133 @@ mod testes {
         std::fs::remove_dir_all(&pasta).ok();
     }
 
+    /// O M2 em forma de teste: um `dimensao` danificado no cabeçalho multiplicava
+    /// `trechos * dimensao * 4` sem checagem. Em release o produto embrulha até
+    /// casar com um blob curto e o índice carregava torto; em debug o próprio
+    /// multiply entrava em pânico. Com aritmética checada é só "não sei": um
+    /// cabeçalho que não cabe no blob volta a `None`, igual a um arquivo torto.
+    #[test]
+    fn uma_dimensao_que_estoura_a_conta_nao_carrega() {
+        let pasta =
+            std::env::temp_dir().join(format!("aether-memoria-estouro-{}", std::process::id()));
+        std::fs::create_dir_all(&pasta).unwrap();
+        let arquivo = pasta.join("indice.aether");
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        for nome in ["a", "b", "c"] {
+            indice.adicionar(
+                &format!("C:/x/{nome}.txt"),
+                Assinatura { bytes: 1, modificado: 1 },
+                &[(Peca { linha: 1, texto: nome.into(), ids: vec![] }, vec![1.0, 0.0])],
+            );
+        }
+        // Três peças caberiam numa dimensão 2 (blob de 24 bytes); o cabeçalho
+        // mente uma dimensão gigante e o blob fica vazio. O produto embrulharia
+        // para zero, igual ao tamanho do blob — é a colisão que a conta checada
+        // agora recusa.
+        indice.meta.dimensao = 1usize << 62;
+        indice.vetores.clear();
+        indice.salvar(&arquivo).unwrap();
+        assert!(Indice::carregar(&arquivo).is_none(), "cabeçalho que estoura a conta não entra");
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// O M1 em forma de teste: a varredura segura o lock do motor do primeiro ao
+    /// último arquivo, e a tela chama `estado()` no loop dela. Se `estado()` pedir
+    /// o lock do motor, a janela congela a varredura inteira (a classe do task
+    /// #40). Com o espelho `info_motor`, `estado()` devolve mesmo com o motor
+    /// ocupado. Sem o espelho, o `recv_timeout` abaixo estoura — vermelho antes
+    /// da correção, verde depois.
+    #[test]
+    fn o_estado_nao_espera_o_motor_da_varredura() {
+        let base = std::env::temp_dir().join(format!("aether-memoria-estado-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let pastas = Arc::new(RwLock::new(Pastas::default()));
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            pastas,
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            // A varredura em andamento: o guard do motor fica tomado o tempo todo.
+            let _guard = custodio.carregado.lock().expect("motor envenenado");
+            s.spawn(|| {
+                let _estado = custodio.estado(false);
+                let _ = tx.send(());
+            });
+            let chegou = rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok();
+            assert!(chegou, "estado() deve ler o espelho, não o lock do motor");
+        });
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// O M5 em forma de teste: um `revogar` e a revalidação de conversas de um
+    /// turno são os dois escritores do índice fora da varredura. Cada um lê uma
+    /// cópia, muda, grava no disco e publica — e sem a trava de escritores o
+    /// último publicar escreve por cima do primeiro e ressuscita o arquivo que o
+    /// outro acabou de apagar. Com a trava o par é atômico: dos dois cortes nenhum
+    /// some. Aqui um writer corta `a`, o outro corta `b`, e só `c` pode sobrar.
+    #[test]
+    fn dois_escritores_do_indice_nao_se_atropelam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-escritores-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let pastas = Arc::new(RwLock::new(Pastas::default()));
+        let custodio = Custodio::novo(&[], &base, &base, base.join("rag.json"), pastas);
+
+        let semear = |custodio: &Custodio| {
+            let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+            for nome in ["a", "b", "c"] {
+                indice.adicionar(
+                    &format!("C:/x/{nome}.rs"),
+                    Assinatura { bytes: 1, modificado: 1 },
+                    &[(Peca { linha: 1, texto: nome.into(), ids: vec![] }, vec![1.0])],
+                );
+            }
+            *custodio.indice.write().expect("índice envenenado") = Some(indice);
+        };
+
+        let perdido = AtomicUsize::new(0);
+        for _ in 0..150 {
+            semear(&custodio);
+            let conv = &custodio;
+            let barreira = Barrier::new(3);
+            std::thread::scope(|cena| {
+                let b1 = &barreira;
+                cena.spawn(move || {
+                    b1.wait();
+                    let _ = conv.escrever_indice(|i| i.remover_arquivo("C:/x/a.rs"));
+                });
+                let b2 = &barreira;
+                cena.spawn(move || {
+                    b2.wait();
+                    let _ = conv.escrever_indice(|i| i.remover_arquivo("C:/x/b.rs"));
+                });
+                barreira.wait();
+            });
+            let guard = custodio.indice.read().expect("índice envenenado");
+            let indice = guard.as_ref().expect("índice publicado");
+            if indice.trechos() != 1 || indice.meta.trechos[0].arquivo != "C:/x/c.rs" {
+                perdido.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        assert_eq!(
+            perdido.load(Ordering::Relaxed),
+            0,
+            "dois escritores do índice se atropelaram: um arquivo apagado voltou"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn a_busca_ordena_por_proximidade_e_aplica_o_piso() {
         let mut indice = Indice::vazio("m", 2, "último", 64, 0);
@@ -2670,6 +2896,7 @@ mod testes {
                 Peca { linha: 1, texto: "fala 1 sobre a troca da bomba".into(), ids: vec![] },
                 vec![1.0, 0.0],
             )],
+            false,
         );
         indice
     }
@@ -2708,6 +2935,7 @@ mod testes {
             &viva,
             viva.prova(),
             &[(Peca { linha: 1, texto: "a fala da conversa".into(), ids: vec![] }, vec![1.0])],
+            false,
         );
         assert_eq!(indice.trechos(), 2);
         assert_eq!(indice.esquecer_conversa("c1"), 1);
@@ -2743,6 +2971,7 @@ mod testes {
             &viva,
             viva.prova(),
             &[(Peca { linha: 1, texto: "fala 1".into(), ids: vec![] }, vec![1.0])],
+            false,
         );
         assert_eq!(indice.conversas_pendentes(&[viva.clone()]), 0);
         // Ganhou falas: voltou a ser trabalho.
@@ -2844,6 +3073,7 @@ mod testes {
                 (Peca { linha: 1, texto: "fala 49".into(), ids: vec![] }, vec![1.0]),
                 (Peca { linha: 2, texto: "fala 50".into(), ids: vec![] }, vec![1.0]),
             ],
+            false,
         );
         assert_eq!(
             indice.meta.trechos.iter().map(|t| t.linha).collect::<Vec<_>>(),
@@ -2854,6 +3084,7 @@ mod testes {
             &viva,
             viva.prova(),
             &[(Peca { linha: 1, texto: "fala 49 de novo".into(), ids: vec![] }, vec![1.0])],
+            false,
         );
         assert_eq!(indice.trechos_de(Fonte::Conversa), 1);
         assert_eq!(indice.meta.trechos[0].linha, 49);

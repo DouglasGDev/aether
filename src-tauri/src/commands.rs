@@ -800,41 +800,52 @@ pub fn conversas_listar(state: State<'_, AppState>) -> conversas::Estado {
 }
 
 /// Uma conversa nova. Se a ativa ainda não tem mensagem, ela já é nova: criar
-/// outra deixaria uma vazia na lista a cada clique.
+/// outra deixaria uma vazia na lista a cada clique. A troca inteira corre com o
+/// lugar do turno reservado (`troca_exclusiva`): um turno que começasse no meio
+/// dela disputaria o mesmo KV e o mesmo histórico, e o comando síncrono não pode
+/// esperar o lock do motor — ele corre na thread da janela.
 #[tauri::command]
 pub fn conversa_nova(state: State<'_, AppState>) -> Result<conversas::Estado, String> {
-    if state.ai.is_busy() {
-        return Err(tr("erros.turnoEmAndamento", &[]));
-    }
-    let estado = state.conversas.estado();
-    let vazia = estado
-        .ativa
-        .as_ref()
-        .and_then(|id| estado.conversas.iter().find(|f| &f.id == id))
-        .map(|f| f.mensagens == 0)
-        .unwrap_or(false);
-    if !vazia {
-        state.conversas.criar().map_err(report)?;
-    }
-    state.ai.history.lock().expect("histórico envenenado").clear();
-    *state.ai.resumo.lock().expect("resumo envenenado") = None;
-    state.ai.esquecer();
-    Ok(state.conversas.estado())
+    state
+        .ai
+        .troca_exclusiva(|| {
+            // O KV é esquecido primeiro: se o motor estiver ocupado, a recusa
+            // sai sem ter criado conversa nem tocado no buffer vivo.
+            state.ai.esquecer()?;
+            let estado = state.conversas.estado();
+            let vazia = estado
+                .ativa
+                .as_ref()
+                .and_then(|id| estado.conversas.iter().find(|f| &f.id == id))
+                .map(|f| f.mensagens == 0)
+                .unwrap_or(false);
+            if !vazia {
+                state.conversas.criar()?;
+            }
+            state.ai.history.lock().expect("histórico envenenado").clear();
+            *state.ai.resumo.lock().expect("resumo envenenado") = None;
+            Ok(state.conversas.estado())
+        })
+        .map_err(report)
 }
 
 /// Troca a conversa ativa: o histórico do arquivo entra no buffer vivo, com o
 /// resumo que pertence a ele, e o motor esquece o KV — porque o cache da
-/// conversa anterior não é prefixo desta.
+/// conversa anterior não é prefixo desta. Tudo sob a reserva do turno: abrir no
+/// meio de uma geração substituiria o histórico que o turno está escrevendo, e
+/// esperar o lock do motor prenderia a thread da janela o turno inteiro.
 #[tauri::command]
 pub fn conversa_abrir(state: State<'_, AppState>, id: String) -> Result<Vec<ChatMessage>, String> {
-    if state.ai.is_busy() {
-        return Err(tr("erros.turnoEmAndamento", &[]));
-    }
-    let aberta = state.conversas.abrir(&id).map_err(report)?;
-    *state.ai.history.lock().expect("histórico envenenado") = aberta.mensagens.clone();
-    *state.ai.resumo.lock().expect("resumo envenenado") = aberta.resumo.clone();
-    state.ai.esquecer();
-    Ok(aberta.mensagens)
+    state
+        .ai
+        .troca_exclusiva(|| {
+            state.ai.esquecer()?;
+            let aberta = state.conversas.abrir(&id)?;
+            *state.ai.history.lock().expect("histórico envenenado") = aberta.mensagens.clone();
+            *state.ai.resumo.lock().expect("resumo envenenado") = aberta.resumo.clone();
+            Ok(aberta.mensagens)
+        })
+        .map_err(report)
 }
 
 #[tauri::command]
@@ -848,16 +859,22 @@ pub fn conversa_renomear(
 
 #[tauri::command]
 pub fn conversa_apagar(state: State<'_, AppState>, id: String) -> Result<conversas::Estado, String> {
-    if state.ai.is_busy() {
-        return Err(tr("erros.turnoEmAndamento", &[]));
-    }
-    let era_ativa = state.conversas.estado().ativa.as_deref() == Some(id.as_str());
-    state.conversas.apagar(&id).map_err(report)?;
-    if era_ativa {
-        state.ai.history.lock().expect("histórico envenenado").clear();
-        state.ai.esquecer();
-    }
-    Ok(state.conversas.estado())
+    state
+        .ai
+        .troca_exclusiva(|| {
+            let era_ativa = state.conversas.estado().ativa.as_deref() == Some(id.as_str());
+            if era_ativa {
+                // Esquece antes de apagar: se o motor estiver ocupado, a recusa
+                // sai limpa — nada foi apagado nem o buffer vivo tocado.
+                state.ai.esquecer()?;
+            }
+            state.conversas.apagar(&id)?;
+            if era_ativa {
+                state.ai.history.lock().expect("histórico envenenado").clear();
+            }
+            Ok(state.conversas.estado())
+        })
+        .map_err(report)
 }
 
 /// Texto que o modelo recebe de uma ferramenta. Só o conteúdo textual: imagem e

@@ -164,14 +164,22 @@ fn texto(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> String {
 /// forma diz quantos elementos há. `elementos / bloco * tamanho_do_bloco` é a
 /// conta do próprio ggml, e vale para f32/f16 também, cujo bloco é 1.
 fn bytes_do_tensor(info: &gguf_file::TensorInfo) -> u64 {
-    let elementos: u64 = info.shape.dims().iter().map(|d| *d as u64).product();
+    // As dimensões vêm do cabeçalho, que é dado de entrada não-confiável: uma
+    // forma fabricada embrulharia o produto em `u64` e o tensor pareceria
+    // minúsculo. Saturar é a direção segura — o peso deixa de existir como
+    // número falso e passa a gritar "não cabe", em vez de sorrir "cabe".
+    let elementos: u64 = info
+        .shape
+        .dims()
+        .iter()
+        .fold(1u64, |acum, d| acum.saturating_mul(*d as u64));
     let bloco = info.ggml_dtype.block_size() as u64;
     if bloco == 0 {
         return 0;
     }
     // O ggml arredonda para cima: um tensor cujo número de elementos não é
     // múltiplo do bloco ainda paga o bloco inteiro.
-    elementos.div_ceil(bloco) * info.ggml_dtype.type_size() as u64
+    elementos.div_ceil(bloco).saturating_mul(info.ggml_dtype.type_size() as u64)
 }
 
 /// Os bytes de `blk.N.*` somados por camada. A camada de um tensor se lê do
@@ -182,8 +190,8 @@ fn por_camada(tensor_infos: &HashMap<String, gguf_file::TensorInfo>, camadas: us
     for (nome, info) in tensor_infos {
         let bytes = bytes_do_tensor(info);
         match camada_do_nome(nome, camadas) {
-            Some(indice) => soma[indice] += bytes,
-            None => fixo += bytes,
+            Some(indice) => soma[indice] = soma[indice].saturating_add(bytes),
+            None => fixo = fixo.saturating_add(bytes),
         }
     }
     (soma, fixo)
@@ -236,8 +244,29 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         .filter(|v| *v > 0)
         .unwrap_or_else(|| comprimento.checked_div(cabecas).unwrap_or(comprimento));
     let (camada, fixo) = por_camada(&cabecalho.tensor_infos, camadas);
-    let pesos_total = camada.iter().sum::<u64>() + fixo;
+    // Somar com `sum` embrulharia num arquivo fabricado; o teto em `u64::MAX` é
+    // o valor honesto para "estes bytes não cabem em lugar nenhum".
+    let pesos_total = camada
+        .iter()
+        .fold(0u64, |acum, bytes| acum.saturating_add(*bytes))
+        .saturating_add(fixo);
     let (template, eos, paradas) = vocabulario(md);
+    // 2 = K e V; 2 bytes = o f16 do flash attention. Numa arquitetura híbrida
+    // (parte das camadas com estado de espaço de estados em vez de atenção, como
+    // `qwen35` declara com `full_attention_interval`), isto é teto, não conta
+    // exata: as camadas lineares também ocupam cache, só que com outra forma. O
+    // que confere o número é o delta real de VRAM que a carga produz —
+    // `engine-probe alojar:` — e não esta fórmula.
+    //
+    // Os fatores vêm do cabeçalho, então a conta é feita com `checked_mul` e o
+    // arquivo é recusado no estouro: um `kv_por_token` que embrulha viraria um
+    // KV barato de mentira e a placa juraria caber o modelo inteiro.
+    let kv_por_token = 2u64
+        .checked_mul(camadas as u64)
+        .and_then(|n| n.checked_mul(cabecas_kv))
+        .and_then(|n| n.checked_mul(dimensao))
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| anyhow::anyhow!(tr("erros.alojamentoEstouro", &[])))?;
     Ok(Ficha {
         arquivo: caminho.display().to_string(),
         arquitetura,
@@ -245,15 +274,7 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         pesos_total,
         camada,
         fixo,
-        // 2 = K e V; 2 bytes = o f16 do flash attention.
-        //
-        // Numa arquitetura híbrida (parte das camadas com estado de espaço de
-        // estados em vez de atenção, como `qwen35` declara com
-        // `full_attention_interval`), isto é teto, não conta exata: as camadas
-        // lineares também ocupam cache, só que com outra forma. O que confere o
-        // número é o delta real de VRAM que a carga produz — `engine-probe
-        // alojar:` — e não esta fórmula.
-        kv_por_token: 2 * camadas as u64 * cabecas_kv * dimensao * 2,
+        kv_por_token,
         janela_maxima: numero(md, &chave("context_length")).unwrap_or(0) as usize,
         template,
         eos,
@@ -294,24 +315,28 @@ pub enum Alojamento {
 /// não o máximo do modelo: o KV é proporcional a ela, e é por isso que a mesma
 /// placa pode caber um modelo em 4096 e não caber em 32768.
 pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> Alojamento {
+    // Toda a conta abaixo é saturante: a `fichar` acima recusa um cabeçalho que
+    // estoura, mas o veredito é uma função pública sobre uma `Ficha` que pode
+    // vir de outra construção. Um produto que embrulhasse aqui diria "cabe" para
+    // um modelo que nunca caberia — o pior engano que esta tela pode cometer.
     let Some(cap) = capacidade else {
         return Alojamento::SoSistema {
             pesos: ficha.pesos_total,
-            kv: ficha.kv_por_token * janela as u64,
+            kv: ficha.kv_por_token.saturating_mul(janela as u64),
         };
     };
-    let kv = ficha.kv_por_token * janela as u64;
-    if ficha.pesos_total + kv + FOLGA_DE_COMPUTACAO <= cap.livre {
+    let kv = ficha.kv_por_token.saturating_mul(janela as u64);
+    if ficha.pesos_total.saturating_add(kv).saturating_add(FOLGA_DE_COMPUTACAO) <= cap.livre {
         return Alojamento::Inteira { pesos: ficha.pesos_total, kv, livre: cap.livre };
     }
     // O orçamento da placa, tirado o que ela é obrigada a guardar para si: o KV
     // da janela e a folga do grafo. As camadas entram de cima para baixo, que é
     // a ordem em que a biblioteca empilha quando falta memória.
-    let orcamento = cap.livre.saturating_sub(kv + FOLGA_DE_COMPUTACAO);
+    let orcamento = cap.livre.saturating_sub(kv.saturating_add(FOLGA_DE_COMPUTACAO));
     let mut usados = 0u64;
     let mut postas = 0usize;
     for bytes in ficha.camada.iter().rev() {
-        if usados + bytes > orcamento {
+        if usados.saturating_add(*bytes) > orcamento {
             break;
         }
         usados += bytes;
@@ -321,7 +346,7 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
         camadas: postas,
         total: ficha.camadas,
         na_placa: usados,
-        em_ram: ficha.pesos_total - usados,
+        em_ram: ficha.pesos_total.saturating_sub(usados),
         livre: cap.livre,
     }
 }
@@ -739,6 +764,89 @@ mod testes {
         std::fs::write(&vazio, b"GGUF").unwrap();
         assert!(fichar(&vazio).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira() {
+        // O defeito: `kv_por_token * janela` embrulha em u64 num release, o KV
+        // parece zero e a placa juraria caber um modelo que nunca caberia. A
+        // conta é a linha 304 do `alojar`, exercida direto, com uma ficha armada
+        // à mão para o estouro (a `fichar` real já recusaria este cabeçalho).
+        let impossivel = Ficha {
+            arquivo: "impossivel.gguf".to_string(),
+            arquitetura: "granite".to_string(),
+            camadas: 40,
+            pesos_total: 2136 * 1024 * 1024,
+            camada: vec![20 * 1024 * 1024; 40],
+            fixo: 2136 * 1024 * 1024 - 40 * 20 * 1024 * 1024,
+            // 1 << 63 vezes uma janela de 2 = 1 << 64: embrulha em zero.
+            kv_por_token: 1u64 << 63,
+            janela_maxima: 131072,
+            template: None,
+            eos: vec![100257],
+            paradas: vec![],
+        };
+        let veredito = alojar(&impossivel, placa(15 * 1024).as_ref(), 2);
+        assert!(
+            !matches!(veredito, Alojamento::Inteira { .. }),
+            "um KV que estoura a conta não pode virar veredito inteira: {veredito:?}"
+        );
+    }
+
+    /// Um GGUF só de geometria, sem tensores nem vocabulário, com o número de
+    /// cabeças de KV fabricado para estourar a conta do KV cache. É o mesmo
+    /// esqueleto de `gguf_de_vocabulario`, com os valores trocados.
+    fn gguf_de_geometria_estourada(caminho: &Path) {
+        const STR: u32 = 8;
+        const U32: u32 = 4;
+        fn texto(s: &str) -> Vec<u8> {
+            let mut v = (s.len() as u64).to_le_bytes().to_vec();
+            v.extend_from_slice(s.as_bytes());
+            v
+        }
+        fn par(chave: &str, tipo: u32, valor: Vec<u8>) -> Vec<u8> {
+            let mut v = texto(chave);
+            v.extend_from_slice(&tipo.to_le_bytes());
+            v.extend_from_slice(&valor);
+            v
+        }
+        let u32_bytes = |v: u32| v.to_le_bytes().to_vec();
+        let corpo: Vec<u8> = [
+            par("general.architecture", STR, texto("granite")),
+            // block_count pequeno: o vetor de camadas não aloca memória a mais.
+            par("granite.block_count", U32, u32_bytes(2)),
+            par("granite.embedding_length", U32, u32_bytes(u32::MAX)),
+            par("granite.attention.head_count", U32, u32_bytes(1)),
+            // head_count_kv no teto: 2*2*MAX*MAX*2 estoura um u64 com folga.
+            par("granite.attention.head_count_kv", U32, u32_bytes(u32::MAX)),
+            par("granite.attention.key_length", U32, u32_bytes(u32::MAX)),
+            par("granite.context_length", U32, u32_bytes(4096)),
+        ]
+        .concat();
+        let mut arquivo: Vec<u8> = b"GGUF".to_vec();
+        arquivo.extend_from_slice(&3u32.to_le_bytes());
+        arquivo.extend_from_slice(&0u64.to_le_bytes());
+        arquivo.extend_from_slice(&(7u64).to_le_bytes());
+        arquivo.extend_from_slice(&corpo);
+        std::fs::write(caminho, arquivo).unwrap();
+    }
+
+    #[test]
+    fn a_ficha_recusa_geometria_que_estoura_a_conta() {
+        // A fronteira de entrada: um cabeçalho fabricado não pode virar uma
+        // Ficha com um `kv_por_token` embrulhado (que a tela leria como um KV
+        // barato). A recusa é o motivo real, não um zero silencioso.
+        let dir = std::env::temp_dir().join(format!("aether-aloj-estouro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caminho = dir.join("estouro.gguf");
+        gguf_de_geometria_estourada(&caminho);
+        let erro = fichar(&caminho).expect_err("geometria que estoura o u64 deve ser recusada");
+        assert!(
+            erro.to_string().contains("estoura"),
+            "a recusa deve nomear o estouro, veio: {erro}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

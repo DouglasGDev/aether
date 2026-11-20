@@ -112,16 +112,29 @@ struct TextStream {
     tokenizer: Tokenizer,
     tokens: Vec<u32>,
     committed: usize,
+    /// `true` no fluxo que a pessoa lê: token especial não aparece na resposta.
+    /// `false` na vigia de parada — ver `TextStream::bruto`.
+    pular_especiais: bool,
 }
 
 impl TextStream {
     fn new(tokenizer: Tokenizer) -> Self {
-        Self { tokenizer, tokens: Vec::new(), committed: 0 }
+        Self { tokenizer, tokens: Vec::new(), committed: 0, pular_especiais: true }
+    }
+
+    /// O mesmo fluxo incremental, mas com os tokens especiais à vista. Existe
+    /// porque a rede de parada de ChatML procurava o marcador no texto do
+    /// usuário: Granite/Qwen marcam `<|im_start|>` como especial, o decode com
+    /// `skip_special_tokens` o apaga, e `text.contains` nunca casava — o modelo
+    /// repetindo turnos ia até max_tokens. A vigia decodifica com `false` só
+    /// para detectar a parada; o que a pessoa lê continua saindo de `new`.
+    fn bruto(tokenizer: Tokenizer) -> Self {
+        Self { tokenizer, tokens: Vec::new(), committed: 0, pular_especiais: false }
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String> {
         self.tokenizer
-            .decode(tokens, true)
+            .decode(tokens, self.pular_especiais)
             .map_err(|e| anyhow::anyhow!(tr("erros.falhaDecodificar", &[("detalhe", &e.to_string())])))
     }
 
@@ -143,6 +156,26 @@ impl TextStream {
         self.committed = self.tokens.len();
         Ok(Some(before))
     }
+}
+
+/// Quantos tokens gerados precedem o corte de uma parada no texto bruto.
+/// O marcador começa em `corte` (byte do bruto, que inclui os especiais); o
+/// texto da pessoa não os inclui. Recua-se token a token até o prefixo bruto
+/// terminar antes do marcador: esse prefixo, decodificado sem especiais, é o
+/// que se mostra. Recuar pelo comprimento do marcador não bastaria — um token
+/// pode decodificar em vários caracteres.
+fn tokens_antes_do_corte(tokenizer: &Tokenizer, tokens: &[u32], corte: usize) -> Result<usize> {
+    let mut k = tokens.len();
+    while k > 0 {
+        let bruto = tokenizer.decode(&tokens[..k], false).map_err(|e| {
+            anyhow::anyhow!(tr("erros.falhaDecodificar", &[("detalhe", &e.to_string())]))
+        })?;
+        if bruto.len() <= corte {
+            break;
+        }
+        k -= 1;
+    }
+    Ok(k)
 }
 
 /// Onde a conta acontece.
@@ -229,7 +262,10 @@ pub struct Acelerador {
     pub tipo: &'static str,
     /// Nome que a placa se deu no registro Vulkan; vazio na CPU.
     pub dispositivo: String,
-    /// Por que a placa não serviu, quando ela não serviu.
+    /// Por que a placa não serviu, quando ela não serviu — e, quando serviu
+    /// sem medida completa, o motivo real de cada sonda que falhou. `None` na
+    /// placa só quando nada falhou: offload não-medido nunca se apresenta como
+    /// normal.
     pub motivo: Option<String>,
     /// Onde os bytes ficaram, na placa que serviu. `None` só na CPU, onde não há
     /// placa para alojar nada.
@@ -255,6 +291,16 @@ pub struct Alojado {
     pub previsto: crate::ai::alojamento::Alojamento,
     /// Bytes de VRAM que sumiram do livre entre antes e depois da carga.
     pub cedido: u64,
+}
+
+/// O motivo que acompanha a carga: cada sonda que falhou deixa o motivo real
+/// aqui, na ordem em que falhou. `None` só quando nada falhou. A tela lê
+/// `motivo` para decidir se há explicação a mostrar — um offload total sem
+/// medida com `motivo: null` seria a tela apresentando o não-medido como
+/// normal, que é exatamente o que este campo existe para impedir.
+fn motivo_de_carga(avisos: [Option<String>; 3]) -> Option<String> {
+    let juntos: Vec<String> = avisos.into_iter().flatten().collect();
+    (!juntos.is_empty()).then(|| juntos.join("\n"))
 }
 
 pub struct Engine {
@@ -299,7 +345,12 @@ impl Engine {
         let weights = dir.join(weights_file);
         // A ficha é lida uma vez e serve a três decisões: onde os pesos vão
         // morar, qual template renderizar e quais tokens encerram a resposta.
-        let ficha = super::alojamento::fichar(&weights).ok();
+        // A falha não vai para o chão: sem ficha o alojamento não foi medido,
+        // e o motivo real acompanha a carga até a tela (`motivo_de_carga`).
+        let (ficha, erro_ficha) = match super::alojamento::fichar(&weights) {
+            Ok(f) => (Some(f), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
         let eos_tokens = match eos_from_generation_config(&dir.join("generation_config.json")) {
             Ok(ids) if !ids.is_empty() => ids,
             // Um GGUF que traz o vocabulário inteiro dentro de si pode não ter
@@ -313,7 +364,14 @@ impl Engine {
         }
         // A VRAM é lida antes da carga. Depois dela o livre já descontaria o
         // próprio modelo, e a conta deixaria de ser previsão para ser retrospecto.
-        let capacidade = super::alojamento::capacidade(dlls).ok().flatten();
+        // `Err` é sonda que falhou — diferente de `Ok(None)`, que é máquina sem
+        // placa — e o motivo é retido, não descartado por `.ok()`. O erro da
+        // sonda já vem traduzido pelas chaves existentes do motor: é ele mesmo
+        // que vai à tela, sem embrulho que o apagasse.
+        let (capacidade, erro_sonda) = match super::alojamento::capacidade(dlls) {
+            Ok(c) => (c, None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
         let livre_antes = capacidade.as_ref().map(|c| c.livre).unwrap_or(0);
         // O veredito antes da carga é o que manda a placa e é o que a tela mostra:
         // o mesmo número decide quantas camadas sobem e conta a história no chip.
@@ -325,6 +383,11 @@ impl Engine {
             .map(|(ficha, capacidade)| {
                 super::alojamento::alojar(ficha, Some(capacidade), context)
             });
+        // Sem medida o despacho continua sendo o sentinela de "todas as camadas":
+        // a regra do produto é placa primeiro, e recusar a carga porque a sonda
+        // falhou deixaria a máquina sem resposta. O que não pode é calar — o
+        // `motivo` abaixo leva o motivo real de cada sonda que falhou, e a tela
+        // mostra que este offload total é uma tentativa, não uma medida.
         let despacho = previsto
             .as_ref()
             .map(super::alojamento::despacho)
@@ -345,18 +408,30 @@ impl Engine {
             });
         match ggml::Motor::novo(dlls, &weights, context, despacho) {
             Ok(motor) => {
-                let alojado = previsto.map(|previsto| {
-                    let livre_depois = super::alojamento::capacidade(dlls)
-                        .ok()
-                        .flatten()
-                        .map(|c| c.livre)
-                        .unwrap_or(livre_antes);
-                    Alojado { previsto, cedido: livre_antes.saturating_sub(livre_depois) }
-                });
+                // O cedido só existe quando a placa respondeu depois da carga:
+                // zero sem medição seria dizer "nada foi levado" sem ter lido.
+                // Sonda que falha aqui também deixa o motivo, e o `alojado`
+                // não publicado é a resposta honesta de que não há medida.
+                let (alojado, erro_pos) = match previsto {
+                    Some(previsto) => match super::alojamento::capacidade(dlls) {
+                        Ok(Some(depois)) => (
+                            Some(Alojado {
+                                previsto,
+                                cedido: livre_antes.saturating_sub(depois.livre),
+                            }),
+                            None,
+                        ),
+                        // A placa que carregou não respondeu à medição de depois:
+                        // o motivo é o que o motor já sabe dizer, sem chave nova.
+                        Ok(None) => (None, Some(tr("erros.motorSemPlaca", &[]))),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
+                    None => (None, None),
+                };
                 let acelerador = Acelerador {
                     tipo: "gpu",
                     dispositivo: motor.dispositivo.clone(),
-                    motivo: None,
+                    motivo: motivo_de_carga([erro_ficha, erro_sonda, erro_pos]),
                     alojado,
                     janela_inteira: inteira,
                 };
@@ -377,6 +452,12 @@ impl Engine {
                     .map_err(|falha_cpu| {
                         anyhow::anyhow!("{falha_gpu}\n{falha_cpu}")
                     })?;
+                // As sondas que falharam antes da tentativa entram junto no
+                // motivo: explicam por que a carga chegou à CPU sem medida.
+                let motivo = match motivo_de_carga([erro_ficha, erro_sonda, None]) {
+                    Some(avisos) => format!("{falha_gpu}\n{avisos}"),
+                    None => falha_gpu.to_string(),
+                };
                 Ok(Self {
                     model_id: model_id.to_string(),
                     tokenizer,
@@ -387,7 +468,7 @@ impl Engine {
                     acelerador: Acelerador {
                         tipo: "cpu",
                         dispositivo: String::new(),
-                        motivo: Some(falha_gpu.to_string()),
+                        motivo: Some(motivo),
                         alojado: None,
                         janela_inteira: None,
                     },
@@ -521,6 +602,11 @@ impl Engine {
 
         let mut all_tokens = prompt_tokens.to_vec();
         let mut stream = TextStream::new(self.tokenizer.clone());
+        // A vigia vê os tokens especiais que o stream da pessoa esconde: é neles
+        // que mora o marcador de turno do ChatML. A parada é procurada aqui, não
+        // no texto do usuário — ver `TextStream::bruto`.
+        let mut vigia = TextStream::bruto(self.tokenizer.clone());
+        let mut bruto = String::new();
         let mut text = String::new();
 
         let prefill_start = Instant::now();
@@ -553,12 +639,18 @@ impl Engine {
                 text.push_str(&piece);
                 emit(Emission::Delta(piece));
             }
+            if let Some(piece) = vigia.push(next)? {
+                bruto.push_str(&piece);
+            }
             if let Some(hit) = stop_sequences
                 .iter()
-                .find(|s| !s.is_empty() && text.contains(s.as_str()))
+                .find(|s| !s.is_empty() && bruto.contains(s.as_str()))
             {
-                let cut = text.find(hit.as_str()).expect("parada recém-encontrada");
-                text.truncate(cut);
+                let cut = bruto.find(hit.as_str()).expect("parada recém-encontrada");
+                // O que a pessoa vê é o prefixo sem especiais que antecede o
+                // marcador — não o bruto truncado, que vazaria o token especial.
+                let k = tokens_antes_do_corte(&self.tokenizer, &vigia.tokens, cut)?;
+                text = stream.decode(&vigia.tokens[..k])?;
                 emit(Emission::Replace(text.clone()));
                 break StopReason::StopSequence;
             }
@@ -812,6 +904,152 @@ mod tests {
         assert!(json.contains("\"motivo\":null"));
         assert!(json.contains("\"alojado\":null"));
         assert!(json.contains("\"janelaInteira\":null"));
+    }
+
+    /// WordLevel + Fuse com `<|im_start|>` como token especial adicionado —
+    /// a forma como Granite/Qwen publicam o marcador de turno no tokenizer.json.
+    /// É exatamente ela que torna inerte uma parada procurada no texto decodificado
+    /// com `skip_special_tokens = true`.
+    fn tokenizer_com_marcador_especial() -> Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {
+                    "id": 7, "content": "<|im_start|>",
+                    "single_word": false, "lstrip": false,
+                    "normalized": false, "rstrip": false, "special": true
+                }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": { "type": "Fuse" },
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "capital": 0, " ": 1, "Aether": 2, ".": 3,
+                    "é": 4, "\ufffd": 5, "x": 6
+                },
+                "unk_token": "[UNK]"
+            }
+        }"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("tokenizer de teste")
+    }
+
+    /// O defeito A2 em forma de teste: o marcador de turno some do texto que a
+    /// pessoa lê (decode com especiais pulados), então a rede antiga —
+    /// `text.contains("<|im_start|>")` sobre esse texto — nunca casava. A vigia
+    /// decodifica com os especiais à vista e vê o marcador.
+    #[test]
+    fn marcador_especial_e_invisivel_no_stream_mas_nao_na_vigia() {
+        let tk = tokenizer_com_marcador_especial();
+        // "capital Aether" + marcador de turno + "x": o modelo repetindo turno.
+        let tokens = [0u32, 1, 2, 7, 6];
+        let mut usuario = TextStream::new(tk.clone());
+        let mut vigia = TextStream::bruto(tk);
+        let mut saida = String::new();
+        let mut bruto = String::new();
+        for t in tokens {
+            if let Some(p) = usuario.push(t).unwrap() {
+                saida.push_str(&p);
+            }
+            if let Some(p) = vigia.push(t).unwrap() {
+                bruto.push_str(&p);
+            }
+        }
+        assert!(!saida.contains("<|im_start|>"), "o stream do usuário esconde o especial: {saida}");
+        assert!(bruto.contains("<|im_start|>"), "a vigia tem de ver o marcador: {bruto}");
+    }
+
+    /// O corte da parada devolve à pessoa exatamente o que precede o marcador,
+    /// sem o marcador e sem o turno que ele abriria.
+    #[test]
+    fn o_corte_da_parada_devolve_o_texto_sem_o_marcador() {
+        let tk = tokenizer_com_marcador_especial();
+        let tokens = [0u32, 1, 2, 7, 6];
+        let bruto = tk.decode(&tokens, false).unwrap();
+        let corte = bruto.find("<|im_start|>").expect("marcador no bruto");
+        let k = tokens_antes_do_corte(&tk, &tokens, corte).unwrap();
+        assert_eq!(k, 3);
+        assert_eq!(tk.decode(&tokens[..k], true).unwrap(), "capital Aether");
+    }
+
+    /// Parada que não é token especial (um "." escrito no vocabulário comum)
+    /// continua sendo vista pela vigia: a correção não pode quebrar o caso normal.
+    #[test]
+    fn parada_comum_continua_visivel_na_vigia() {
+        let tk = tokenizer_com_marcador_especial();
+        let tokens = [0u32, 1, 2, 3];
+        let bruto = tk.decode(&tokens, false).unwrap();
+        assert!(bruto.contains('.'));
+        let corte = bruto.find('.').unwrap();
+        let k = tokens_antes_do_corte(&tk, &tokens, corte).unwrap();
+        assert_eq!(tk.decode(&tokens[..k], true).unwrap(), "capital Aether");
+    }
+
+    /// A sonda sem as pastas da ggml falha de verdade — é o mesmo `Err` de uma
+    /// máquina com a DLL ausente, não uma falha inventada. O motivo real tem de
+    /// chegar ao acelerador que a tela lê, nunca ser descartado por `.ok()`.
+    #[test]
+    fn sonda_que_falha_deixa_o_motivo_real_no_acelerador() {
+        let erro = super::super::alojamento::capacidade(&[]).unwrap_err();
+        let detalhe = format!("{erro:#}");
+        let a = Acelerador {
+            tipo: "gpu",
+            dispositivo: "placa de teste".to_string(),
+            motivo: motivo_de_carga([None, Some(detalhe.clone()), None]),
+            alojado: None,
+            janela_inteira: None,
+        };
+        assert!(a.motivo.as_deref().unwrap().contains(&detalhe));
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"tipo\":\"gpu\""), "{json}");
+        // O defeito A5: offload total não-medido apresentado como normal,
+        // com motivo:null e alojado:null e nenhuma explicação.
+        assert!(!json.contains("\"motivo\":null"), "{json}");
+    }
+
+    #[test]
+    fn carga_sem_falha_nao_inventa_motivo() {
+        assert_eq!(motivo_de_carga([None, None, None]), None);
+    }
+
+    #[test]
+    fn ficha_ilegivel_tambem_chega_a_tela() {
+        let motivo =
+            motivo_de_carga([Some("cabeçalho recusado".to_string()), None, None]).unwrap();
+        assert!(motivo.contains("cabeçalho recusado"));
+    }
+
+    /// A premissa da vigia no tokenizer real: o marcador de turno é especial e
+    /// o decode do usuário o apaga. Precisa de modelo ChatML em disco.
+    #[test]
+    #[ignore = "requer modelo real em disco: AETHER_TESTE_MODELO=<pasta com tokenizer.json de Granite/Qwen>"]
+    fn marcador_de_turno_e_especial_no_tokenizer_real() {
+        let dir = std::env::var("AETHER_TESTE_MODELO")
+            .expect("defina AETHER_TESTE_MODELO=<pasta do modelo>");
+        let tk = Tokenizer::from_file(Path::new(&dir).join("tokenizer.json")).unwrap();
+        let ids = tk.encode("<|im_start|>", false).unwrap().get_ids().to_vec();
+        assert!(!ids.is_empty(), "o marcador tem de existir no vocabulário");
+        assert!(!tk.decode(&ids, true).unwrap().contains("<|im_start|>"));
+        assert!(tk.decode(&ids, false).unwrap().contains("<|im_start|>"));
+    }
+
+    /// A sonda de VRAM real: ou devolve uma medida, ou devolve o motivo —
+    /// nunca um número inventado. Precisa das DLLs vendorizadas e de placa.
+    #[test]
+    #[ignore = "requer DLLs vendorizadas e placa: AETHER_TESTE_DLLS=<pasta da ggml>"]
+    fn sonda_de_vram_real_medida_ou_motivo() {
+        let pasta = std::env::var("AETHER_TESTE_DLLS")
+            .expect("defina AETHER_TESTE_DLLS=<pasta da ggml>");
+        match super::super::alojamento::capacidade(&[PathBuf::from(pasta)]) {
+            Ok(Some(c)) => assert!(c.total > 0, "placa sem memória total não é medida"),
+            // Máquina sem placa: `None` é a resposta honesta, não falha.
+            Ok(None) => {}
+            Err(e) => assert!(!format!("{e:#}").is_empty(), "a falha tem motivo real"),
+        }
     }
 
     #[test]

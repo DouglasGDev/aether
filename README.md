@@ -88,28 +88,50 @@ movido se um hash divergir. Veja
   do corpo levanta a pedida do ponto onde parou — quatro pedidas no total, com
   1s, 2s e 4s entre elas — e o mesmo caminho serve os pesos, o runtime e a voz;
   um 404, um disco cheio ou um *Parar* devolvem o motivo na primeira conexão,
-  porque retentar o que não é da rede só atrasaria a resposta certa. Um arquivo
-  de apoio que chegou como ponteiro Git LFS é tratado como ausente, não como
-  instalado.
+  porque retentar o que não é da rede só atrasaria a resposta certa. Um servidor
+  que abre, anuncia o corpo e então silencia é cortado pelo prazo de leitura — 30
+  s por leitura, não pelo corpo inteiro, então uma conexão lenta mas viva segue
+  mandando peças — e esse corte entra como falha retentável na fila. O *Parar*
+  responde no meio dessa espera: a cancelação corre contra a espera por bytes, não
+  depois dela. Um arquivo de apoio que chegou como ponteiro Git LFS é tratado como
+  ausente, não como instalado.
 - **Roteador** — classifica o pedido e escolhe o modelo pela capacidade real da
   placa; a escolha é exibida com o motivo auditável e os sinais que a produziram.
-  Um modelo fixado nas Escalas passa na frente do roteador.
+  Um modelo fixado nas Escalas passa na frente do roteador. Um candidato sem ficha
+  nunca afirma que cabe: vai por último na colocação e é lido como não comprovado.
+  A conta de alojamento é feita com aritmética que recusa estouro, então um
+  cabeçalho GGUF crafted não produz um `Inteira` falso. E quando a sonda de VRAM
+  não responde, o offload total aparece com o motivo de ser total — não é
+  apresentado como despacho medido normal.
 - **Laço de ferramentas** — o modelo chama ferramentas MCP e locais, o gate pede
   aprovação quando a ação muda algo, e o resultado volta ao modelo. As duas
   gramáticas que aparecem na prática são lidas: o XML declarado pelo template
   que o próprio GGUF publica — é ele que o modelo viu no treino, e o
   `chat_template.jinja` do repositório de pesos pode ser outra versão — e o JSON
   em que modelos pequenos às vezes
-  caem. Uma chamada cortada no meio pelo teto de tokens é retomada de onde o
+  caem. A marca de parada é procurada no texto bruto, não no descodificado com os
+  especiais ocultos: nos tokenizers que publicam o marcador de turno como token
+  adicionado (Granite e Qwen) a busca antiga nunca casava, e um modelo preso
+  repetindo turnos ia até o teto de tokens em vez de parar. Uma chamada cortada
+  no meio pelo teto de tokens é retomada de onde o
   modelo parou, tantas vezes quantas a janela permitir — o resto do corpo é ele
   quem escreve, e o app não inventa linha;
   se ainda assim faltar um argumento obrigatório, a ferramenta recusa e diz o
   que faltou, em vez de criar um arquivo vazio com a cara de sucesso; uma
-  chamada com nome que não existe devolve a lista dos nomes reais.
+  chamada com nome que não existe devolve a lista dos nomes reais. Um pensamento
+  cortado pelo teto de tokens dentro de um bloco ainda aberto devolve o motivo
+  como erro, não um `Done` com texto vazio. E um JSON que aparece dentro do corpo
+  de uma chamada XML já lida não vira segunda chamada: a varredura guarda os
+  intervalos que a leitura XML já tomou, porque executar duas vezes a mesma
+  escrita é o pior dos dois mundos.
 - **Conector local** — 12 ferramentas de arquivo, terminal, código, memória e
   sistema, dentro das pastas que a pessoa concedeu, mais `criar_mcp_local`, que
   publica o servidor abaixo. Ele entra no mesmo cadastro, na mesma allowlist e no
-  mesmo gate que um servidor MCP de terceiros.
+  mesmo gate que um servidor MCP de terceiros. A contenção é lida do caminho real,
+  não do texto: um symlink ou junção dentro da pasta concedida não abre porta para
+  fora dela, e `mover` recusa renomear a própria raiz. Um comando que emende
+  separadores do `cmd.exe` (`&`, `&&`, `|`) é tratado como composto na hora de
+  decidir o efeito — o que exige aprovação não é só o primeiro programa da linha.
 - **Conexão MCP local** — o agente publica as próprias ferramentas num servidor
   MCP real (Streamable HTTP) e conecta nele pelo mesmo cliente rmcp que usa para
   um servidor de terceiros. Abrir a conexão é uma decisão, não uma configuração:
@@ -134,6 +156,18 @@ movido se um hash divergir. Veja
   ferramentas locais e as 9 de banco de dados; `criar_mcp_local` não é anunciada
   por ele, porque publicar de dentro de uma publicação seria outra porta para a
   mesma sala.
+- **Gate e o que um servidor de terceiros alega** — o efeito de uma ferramenta de
+  fora é decidido pelo núcleo, não pela anotação dela. Um servidor que declara
+  `read_only_hint=true` recebe o teto `Altera`: a alegação não dá para verificar,
+  e uma ferramenta de escrita anotada como leitura executaria sem prompt em *Plan*
+  e *Autoaceitar*. Consequência honesta: em *Plan* essa ferramenta é negada (o
+  modo promete não mutar), em *Autoaceitar* roda como mutação — que o modo já
+  consente — e o rótulo na tela é o conservador. As ferramentas locais e as
+  leituras de banco continuam `Só lê` e continuam passando em *Plan*, porque o
+  efeito delas é declarado por este repositório. E no modo *Padrão*, destrutivo
+  pede aprovação mesmo depois de um "confiar neste servidor": `apagar` e
+  `bancos_apagar` não entram pela porta do grant de sessão, que era o caminho que
+  deixava o modo cauteloso menos seguro que o modo aberto.
 - **Bancos de dados** — conexões com SQLite, PostgreSQL, MySQL, SQL Server,
   MongoDB e Oracle cadastradas na tela *Bancos de dados* (o Oracle fala o
   protocolo do driver oficial em modo thin, sem Instant Client instalado). A
@@ -141,7 +175,10 @@ movido se um hash divergir. Veja
   e toda conexão nova nasce só de leitura. O cadastro é relido do disco a cada
   chamada — o gate aprova o ato, o cadastro aprova o alvo: o que não está
   exposto o modelo nem descreve, e a escrita sem permissão é recusada antes de o
-  motor abrir. O teto de linhas por leitura e o SQL livre são da conexão. São 9
+  motor abrir. O alvo é lido como valor, nunca como operador: um filtro com chave
+  começando com `$` não vira operador do Mongo, e uma coluna só aparece no
+  catálogo se a tabela dela tem permissão de leitura. O teto de linhas por
+  leitura e o SQL livre são da conexão. São 9
   ferramentas (`bancos_listar` a `bancos_sql`) no mesmo catálogo, na mesma
   allowlist e no mesmo gate que as locais; só `bancos_apagar` é destrutiva.
 - **Memória (RAG)** — um índice, duas fontes: os arquivos das pastas concedidas e
@@ -160,15 +197,30 @@ movido se um hash divergir. Veja
   dela (contagem de mensagens e instante da última), então um turno sem histórico
   novo não custa um vetor. O trabalho de conversa paga um teto de tokens por turno
   (8.192) e sempre entrega ao menos uma conversa inteira; a varredura, que corre
-  fora do turno com barra de progresso, drena o resto. Medido na suíte: 478 testes
-  de unidade, incluindo os que provam o isolamento das duas fontes e a
-  idempotência da prova.
+  fora do turno com barra de progresso, drena o resto — e não congela a tela: o
+  estado que a janela lê vem de um espelho pequeno, não do lock que a varredura
+  segura arquivo por arquivo. Os escritores do índice fora da varredura (revogar
+  uma pasta e revalidar as conversas de um turno) são serializados: sem isso, dois
+  leem a mesma cópia e o último publica ressuscita o trecho que o primeiro acabou
+  de apagar, no disco e na memória. Medido na suíte: 509 testes de unidade
+  passando, 516 no total com os 7 que pedem rede ou placa, incluindo os que provam
+  o isolamento das duas fontes, a idempotência da prova e os que soltam dois
+  escritores no mesmo índice por uma barreira e exigem zero efeitos perdidos.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
 - **Conversas salvas** — várias conversas no disco, com barra lateral: criar,
   trocar, renomear e apagar (com confirmação em dois cliques). Trocar de conversa
-  esquece o KV: a conversa seguinte não herda o estado da anterior. O índice e as
+  esquece o KV: a conversa seguinte não herda o estado da anterior. Trocar no meio
+  de um turno também não congela mais a tela: os comandos de conversa não esperam
+  o motor; quando ele está ocupado, a recusa diz isso em vez de travar a janela
+  até a geração acabar. O índice e as
   mensagens ficam em `%APPDATA%\ai.aether.core\conversas` e voltam onde estavam
-  depois de fechar e abrir o aplicativo. O que foi dito nelas entra na memória: a
+  depois de fechar e abrir o aplicativo. O índice é um resumo, não a fonte: os
+  arquivos de cada conversa são a fonte, então um `indice.json` corrompido refaz a
+  lista do disco em vez de abrir o aplicativo com o histórico vazio. E um lock só
+  cobre o arquivo da conversa e o índice juntos: renomear durante um save de turno
+  no mesmo id era os dois lendo o mesmo estado, com o último a escrever apagando o
+  título escrito à mão — ou as mensagens do turno.
+  O que foi dito nelas entra na memória: a
   transcrição de cada conversa (só as falas, sem as chamadas de ferramenta) vira
   índice, com o título e a data no cartão de onde o trecho saiu.
 - **Bancada** — uma suíte de nove casos que roda dentro do aplicativo e mede
@@ -255,7 +307,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 483 testes (478 passam, 5 com `#[ignore]`)
+cd src-tauri && cargo test --lib     # 516 testes (509 passam, 7 com `#[ignore]`)
 npm run build                        # tsc + vite
 ```
 
@@ -291,6 +343,9 @@ src-tauri/src/       núcleo Rust
   local/             ferramentas locais e contenção de pastas
   voz/               fala (Kokoro) e escuta (Whisper)
 docs/capturas/       as imagens desta página
+docs/melhorias/      o registro medido das frentes de auditoria: o que foi
+                     encontrado, o que virou correção, com o teste que falava
+                     antes de cada uma
 locales/             pt-BR e en-US, a única fonte de texto do produto
 src-tauri/vendor/    cabeçalhos, licenças e somas dos binários de terceiros
 ```
@@ -316,6 +371,11 @@ real só existe na memória do aplicativo, na hora de abrir a conexão.
 
 ## Limites conhecidos
 
+- A integridade de um download é conferida por tamanho, não por hash: o arquivo é
+  publicado quando os bytes recebidos batem com o que o servidor anuncia. Um
+  corpo corrompido no meio, com o tamanho certo, passaria. Conferir o sha256 que o
+  HuggingFace publica, antes do rename, é o próximo passo — registrado em
+  `docs/melhorias/PLANO.md`.
 - O modelo que o roteador escolhe para uma tarefa média tem 3 bilhões de
   parâmetros. Ele às vezes traduz o nome de uma ferramenta ao chamá-la, e o
   repositório não finge que isso é confiabilidade: o erro devolve os nomes reais
