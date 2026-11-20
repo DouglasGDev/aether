@@ -10,18 +10,29 @@ interface Props {
   onClose: () => void;
 }
 
-const TIPOS_VISTA = [
-  "arquivo",
-  "lista",
-  "busca",
-  "escrita",
-  "edicao",
-  "pasta",
-  "movido",
-  "apagado",
-  "comando",
-  "sistema",
-];
+/// Uma linha por vista que o `ToolCard` desenha. É um `Record` sobre o próprio
+/// tipo, não uma lista copiada: quando a união ganha um membro, o `tsc` para
+/// aqui — antes, sete vistas (memória, resultado e as cinco de bancos) ficaram
+/// de fora e o cartão pronto virava despejo de JSON na tela.
+const TIPOS_VISTA: Record<Vista["type"], true> = {
+  arquivo: true,
+  lista: true,
+  busca: true,
+  memoria: true,
+  escrita: true,
+  edicao: true,
+  pasta: true,
+  movido: true,
+  apagado: true,
+  comando: true,
+  sistema: true,
+  resultado: true,
+  bancoConexoes: true,
+  bancoFontes: true,
+  bancoEsquema: true,
+  bancoConsulta: true,
+  bancoLinhas: true,
+};
 
 /// O conteúdo estruturado de uma ferramenta deste computador já é o cartão; o
 /// de um servidor de terceiros é JSON qualquer, e só entra no cartão se tiver a
@@ -31,7 +42,7 @@ function comoVista(valor: unknown): Vista | null {
     return null;
   }
   const tipo = (valor as { type?: unknown }).type;
-  return typeof tipo === "string" && TIPOS_VISTA.includes(tipo)
+  return typeof tipo === "string" && tipo in TIPOS_VISTA
     ? (valor as Vista)
     : null;
 }

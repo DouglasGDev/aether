@@ -339,6 +339,16 @@ export type BancadaEvento =
   | { type: "caso"; id: string }
   | ({ type: "resultado" } & BancadaResultado);
 
+/// A rodada como a tela a guarda: o veredito de cada caso e o que está em
+/// curso. Mora no aplicativo, não na folha — fechar a bancada não apaga o que
+/// ela mediu, e o núcleo continua mandando resultado para quem não está olhando.
+export interface BancadaRodada {
+  resultados: Record<string, BancadaResultado>;
+  andando: boolean;
+  atual: string | null;
+  modelo: string | null;
+}
+
 export interface AiStatus {
   models: ModelStatus[];
   loaded: string | null;
@@ -444,9 +454,12 @@ export type ChatEvent =
   | {
       /// O modelo dobrou os turnos antigos no resumo para caber na janela. Não é
       /// rodapé: é o assistente dizendo que parou de ler aquilo ao pé da letra.
+      /// `mensagens` é o que ele leu; `descartadas` é o que saiu do prompt sem
+      /// ser lido nem condensado porque não coube na régua do resumo.
       type: "resumo";
       texto: string;
       mensagens: number;
+      descartadas: number;
       tokens: number;
     }
   | { type: "toolCall"; name: string; arguments: unknown }
@@ -652,6 +665,7 @@ export interface ConexaoBanco {
   temSenha: boolean;
   limiteLinhas: number;
   sqlLivre: boolean;
+  tlsVerificado: boolean;
   fontes: Record<string, FontePolitica>;
 }
 
@@ -668,6 +682,7 @@ export interface ConexaoRegistro {
   arquivo: string;
   limiteLinhas: number;
   sqlLivre: boolean;
+  tlsVerificado: boolean;
   fontes: Record<string, FontePolitica>;
 }
 

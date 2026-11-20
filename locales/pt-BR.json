@@ -4,7 +4,8 @@
     "titulo": "Idioma",
     "escolher": "Escolher idioma",
     "sistema": "Idioma do sistema",
-    "descricao": "Todos os textos da aplicação vêm da pasta de idiomas."
+    "descricao": "Todos os textos da aplicação vêm da pasta de idiomas.",
+    "recusa": "o núcleo não aceitou o idioma: {motivo}"
   },
   "geral": {
     "fechar": "Fechar",
@@ -32,7 +33,9 @@
     "itens": "itens",
     "truncado": "mostrando só o começo",
     "nenhumDado": "Nenhum dado necessário",
-    "listaValores": "valor, valor, valor"
+    "listaValores": "valor, valor, valor",
+    "invalidoNumero": "espera um número",
+    "invalidoJson": "precisa ser JSON válido"
   },
   "app": {
     "grafo": "Ver as ligações",
@@ -49,7 +52,10 @@
     "motor": "Motor",
     "conexoes": "Conexões",
     "local": "Local",
-    "sistema": "Sistema"
+    "sistema": "Sistema",
+    "marcaLigada": "ajuste ativo",
+    "marcaAviso": "falta alguma coisa",
+    "marcaPulso": "acontecendo agora"
   },
   "voz": {
     "titulo": "Voz",
@@ -117,6 +123,7 @@
     "resumo": "Resumo das mensagens anteriores desta conversa — o texto delas não está mais aqui: {texto}",
     "resumoTitulo": "Resumo",
     "resumoMensagens": "{n} mensagens dobradas",
+    "resumoDescartadas": "{n} ficaram de fora do resumo",
     "codigoLinhas": "{n} linhas",
     "codigoSemLinguagem": "código",
     "mostrarTudo": "Mostrar tudo",
@@ -836,10 +843,13 @@
     "falhaChamarFerramenta": "falha ao chamar a ferramenta: {detalhe}",
     "falhaIniciarServidor": "não consegui iniciar o processo do servidor",
     "falhaConectarServidor": "não consegui conectar ao servidor: {detalhe}",
+    "servidorSemResposta": "o servidor {id} não respondeu ao aperto de mão em {segundos}s; ele inicia, mas não fala",
     "downloadCancelado": "download cancelado",
     "modeloBaixando": "este modelo já está sendo baixado",
     "modeloEmUso": "o modelo está em uso; comece outra conversa antes de excluí-lo",
     "motorOcupado": "o motor está ocupado carregando ou trocando o modelo; tente de novo em instantes",
+    "motorEnvenenado": "a trava do motor ficou envenenada por um erro interno; o modelo em memória foi descartado e será carregado de novo no próximo pedido",
+    "corpoTrocado": "o corpo baixado de {arquivo} não é o que o repositório publica, mesmo depois de {recomecos} recomeços do zero",
     "modeloIncompleto": "o modelo {nome} não está completo em disco",
     "modeloFixoIncompleto": "o modelo fixado {nome} não está completo em disco — baixe-o ou deixe o roteador decidir",
     "semPastas": "nenhuma pasta foi concedida; conceda uma pasta antes de mexer em arquivos",
@@ -1051,6 +1061,7 @@
     "servidorMcpParar": "o servidor MCP não parou",
     "servidorMcpToken": "não foi possível sortear o token do servidor MCP: {detalhe}",
     "bancoAbrir": "não foi possível abrir a conexão com o banco: {detalhe}",
+    "bancoSemTls": "o conector {tipo} não sabe falar TLS neste aplicativo: a ligação foi recusada em vez de seguir em texto puro",
     "bancoErro": "o banco recusou a operação: {detalhe}",
     "bancoArquivoFaltando": "conexão SQLite precisa do arquivo do banco",
     "bancoValoresVazios": "os valores estão vazios: informe ao menos uma coluna",
@@ -1118,6 +1129,7 @@
     "senhaGuardada": "deixar vazio mantém a senha salva",
     "campoLimite": "Limite de linhas",
     "campoSqlLivre": "SQL livre",
+    "campoTls": "TLS verificado",
     "descobrir": "Descobrir tabelas",
     "descobrindo": "Descobrindo…",
     "salvando": "Salvando…",

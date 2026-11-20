@@ -49,10 +49,13 @@ const ATENCAO_RAPIDA: c_int = 1;
 
 /// O sentinela do llama.cpp para "todas as camadas": negativo não é "quantas
 /// couberem" — a biblioteca manda todas e a conta de caber é de quem escolhe.
-/// É por isso que o caminho do LLM passa um número medido (`alojamento::despacho`)
-/// e só usa esta constante quando não há ficha lida — sem medida, a escolha é a
-/// de sempre, não um número chutado. O embutidor, dezenas de megabytes, vai
-/// inteiro.
+/// É por isso que os dois caminhos passam um número medido
+/// (`alojamento::despacho`, no LLM; `super::despachar_codificador`, no
+/// embutidor) e só usam esta constante quando o veredito diz `Inteira` — ou
+/// quando não houve veredito possível, e aí o motivo vai junto, nunca calado.
+/// O embutidor costuma ouvir `-1`: dezenas de megabytes contra a VRAM livre
+/// medida costumam caber inteiros. O que não pode é isso ser uma prescrição do
+/// arquivo em vez de uma conta lida nele.
 pub(crate) const CAMADAS_NA_GPU: c_int = -1;
 
 /// `enum llama_pooling_type`. `UNSPECIFIED` é o que o `llama_context_default_params`
@@ -163,7 +166,6 @@ pub struct Ggml {
     _llama: Library,
     _registro: Library,
     _base: Library,
-    versao: unsafe extern "C" fn() -> *const c_char,
     init_backend: unsafe extern "C" fn(),
     params_modelo: unsafe extern "C" fn() -> ParamsModelo,
     params_contexto: unsafe extern "C" fn() -> ParamsContexto,
@@ -256,20 +258,71 @@ fn abrir_biblioteca(caminho: &Path) -> Result<Library, libloading::Error> {
 ///
 /// Um handle a mais deixa o contador acima de zero quando o `Ggml` da chamada
 /// cai, e o assert deixa de ser alcançável.
-fn segurar_no_processo(llama: &Path, registro: &Path, base: &Path) {
-    struct Pin {
-        _llama: Library,
-        _registro: Library,
-        _base: Library,
+///
+/// Devolve o erro do carregador em vez de entrar em pânico, e é escolha de
+/// projeto, não pudor: o pino vivia dentro de `OnceLock::get_or_init` com um
+/// `expect` no fechamento, e o que esse `expect` fazia estava medido — a thread
+/// caía com a nossa frase (`llama.dll já abriu nesta chamada: LoadLibraryExW
+/// { source: 126 }`) e o erro real do carregador nunca chegava à tela. Um
+/// `expect` dentro de `get_or_init` também re-executa o fechamento a cada
+/// chamada seguinte — conferido com `std::sync::OnceLock` nesta toolchain, que
+/// ao contrário de `std::sync::Once` não envenena: o fechamento rodou duas vezes
+/// e a terceira abertura funcionou. `set` é outra história: ou o pino entra, ou a
+/// chamada devolve o `detalhe` que a Windows deu, e a próxima tentativa acontece
+/// de novo.
+fn segurar_no_processo(llama: &Path, registro: &Path, base: &Path) -> Result<(), String> {
+    static PIN: OnceLock<Pino> = OnceLock::new();
+    pinar(&PIN, llama, registro, base)
+}
+
+/// As três bibliotecas que o processo se recusa a descarregar.
+struct Pino {
+    _llama: Library,
+    _registro: Library,
+    _base: Library,
+}
+
+/// O corpo de `segurar_no_processo` com o destino como argumento. Não é
+/// gosto: o destino real é um estático do processo, e um teste que escrevesse
+/// nele dependeria da ordem em que os outros testes rodam — hoje
+/// `abrir_soltar_abrir_nao_aborta` pinar com as DLLs reais e a recusa simulada
+/// deste arquivo passaria a ver `Ok(())` por acaso. Com o `OnceLock` passado
+/// por parâmetro a recusa do carregador é conferida numa instância própria,
+/// e o que muda de comportamento é só o corpo abaixo.
+fn pinar(
+    destino: &OnceLock<Pino>,
+    llama: &Path,
+    registro: &Path,
+    base: &Path,
+) -> Result<(), String> {
+    if destino.get().is_some() {
+        // Já preso por uma abertura anterior deste processo: nada a fazer, e
+        // nada a abrir — o contador já está guardado.
+        return Ok(());
     }
-    static PIN: OnceLock<Pin> = OnceLock::new();
-    let _ = PIN.get_or_init(|| Pin {
-        // Acabamos de abrir os mesmos caminhos nesta chamada: falhar aqui
-        // seria o carregador do Windows mudando de ideia no meio do caminho.
-        _llama: abrir_biblioteca(llama).expect("llama.dll já abriu nesta chamada"),
-        _registro: abrir_biblioteca(registro).expect("ggml.dll já abriu nesta chamada"),
-        _base: abrir_biblioteca(base).expect("ggml-base.dll já abriu nesta chamada"),
-    });
+    // Acabamos de abrir os mesmos caminhos nesta chamada: falhar aqui é o
+    // carregador do Windows recusando um módulo que ele mesmo acabou de mapear.
+    // Raro, e por isso mesmo merece o erro dele, não uma frase nossa.
+    let presa = |c: &Path, rotulo: &str| -> Result<Library, String> {
+        abrir_biblioteca(c).map_err(|e| {
+            tr(
+                "erros.motorDllNaoAbriu",
+                &[
+                    ("caminho", &c.display().to_string()),
+                    ("detalhe", &format!("pino de {rotulo}: {e}")),
+                ],
+            )
+        })
+    };
+    let pino = Pino {
+        _llama: presa(llama, "llama.dll")?,
+        _registro: presa(registro, "ggml.dll")?,
+        _base: presa(base, "ggml-base.dll")?,
+    };
+    // Duas threads podem chegar aqui juntas; a que perde solta os três handles
+    // extras dela, e a contagem continua acima de zero pelo pino que venceu.
+    let _ = destino.set(pino);
+    Ok(())
 }
 
 fn simbolo<T: Copy>(lib: &Library, nome: &str) -> Result<T, String> {
@@ -304,9 +357,18 @@ impl Ggml {
             let base = abrir(&caminhos[2])?;
             // Antes de qualquer `Drop` de `Ggml`: sem isto, a próxima abertura
             // no mesmo processo aborta no assert do terminate handler.
-            segurar_no_processo(&caminhos[0], &caminhos[1], &caminhos[2]);
+            if let Err(motivo) = segurar_no_processo(&caminhos[0], &caminhos[1], &caminhos[2]) {
+                // O pino falhou, mas estes três mapeamentos já aconteceram e o
+                // `set_terminate` da `ggml-base.dll` já está no slot do
+                // processo. Descarregá-los agora é exatamente o estado pendurado
+                // que o pino existe para impedir: o próximo `LoadLibrary` aborta
+                // com `0xC0000409`. Então os handles desta chamada viram o pino
+                // — ficam no processo — e o erro real do carregador vai para a
+                // tela em vez de virar um texto nosso.
+                std::mem::forget((llama, registro, base));
+                return Err(motivo);
+            }
             let ggml = Ggml {
-                versao: simbolo(&llama, "llama_version")?,
                 init_backend: simbolo(&llama, "llama_backend_init")?,
                 params_modelo: simbolo(&llama, "llama_model_default_params")?,
                 params_contexto: simbolo(&llama, "llama_context_default_params")?,
@@ -351,10 +413,6 @@ impl Ggml {
             return Ok((ggml, pasta.clone()));
         }
         Err(tr("erros.motorDllNaoEncontrada", &[("caminhos", &tentadas.join(", "))]))
-    }
-
-    pub fn versao(&self) -> String {
-        texto(unsafe { (self.versao)() })
     }
 
     /// Todos os devices que a ggml registrou, na ordem do registro.
@@ -735,5 +793,67 @@ impl Ggml {
         // O buffer pertence ao contexto e é reescrito a cada decodificação: a
         // cópia é o que sai daqui.
         Ok(unsafe { std::slice::from_raw_parts(base, n_vocab) }.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    /// Um caminho que nenhuma DLL tem, e que o carregador do Windows recusa com
+    /// o erro dele mesmo: não é um falso montado por este teste, é a resposta
+    /// real do `LoadLibraryW` a um módulo que não existe.
+    fn dll_inexistente(rotulo: &str) -> PathBuf {
+        PathBuf::from(std::env::temp_dir()).join(format!("aether-ffi-sem-dll-{rotulo}.dll"))
+    }
+
+    /// A recusa do pino tem de voltar como erro do carregador, e o destino tem
+    /// de continuar vazio para a próxima tentativa. O defeito original era o
+    /// `expect` dentro de `get_or_init`, medido na experimentação: a thread caía
+    /// com a nossa frase (`llama.dll já abriu nesta chamada: LoadLibraryExW {
+    /// source: 126 }`) e o erro real nunca chegava à tela.
+    ///
+    /// O destino é um `OnceLock` deste teste, não o pino do processo: escrever no
+    /// estático deixaria o resultado dependente da ordem dos testes, porque
+    /// `abrir_soltar_abrir_nao_aborta` já o preencheu com as DLLs reais.
+    ///
+    /// O ramo do `Ok(())` para pino já vivo não tem teste aqui: ele só existe
+    /// com três `Library` reais dentro do `Pino`, e é exatamente o que
+    /// `reload::abrir_soltar_abrir_nao_aborta` faz — ele chama `Ggml::abrir`
+    /// duas vezes no mesmo processo, e a segunda passagem é por esse ramo; se
+    /// ele devolvesse `Err`, a segunda abertura falharia e aquele teste também.
+    #[test]
+    fn prender_dlls_recusadas_devolve_o_motivo_do_carregador_sem_panico() {
+        let alvo = dll_inexistente("pino");
+        let destino: OnceLock<Pino> = OnceLock::new();
+
+        let primeira = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pinar(&destino, &alvo, &alvo, &alvo)
+        }))
+        .unwrap_or_else(|_| panic!("o pino entrou em pânico em vez de devolver o erro"));
+        let motivo = primeira.expect_err("um caminho sem DLL não pode pinar nada");
+        assert!(
+            motivo.contains(&alvo.display().to_string()),
+            "o motivo não diz qual caminho o carregador recusou: {motivo}"
+        );
+        assert!(
+            motivo.contains("llama.dll"),
+            "o motivo não diz qual das três o carregador recusou primeiro: {motivo}"
+        );
+        assert!(
+            destino.get().is_none(),
+            "o pino recusou e mesmo assim entrou no destino: {motivo}"
+        );
+
+        // Segunda chamada: o carregador recusa de novo, e é a resposta dele que
+        // tem de vir — não um pânico de inicialização.
+        let segunda = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pinar(&destino, &alvo, &alvo, &alvo)
+        }))
+        .unwrap_or_else(|_| panic!("a segunda chamada panicou em vez de devolver o erro"));
+        assert!(
+            segunda.is_err(),
+            "a segunda chamada deveria devolver o erro do carregador de novo: {segunda:?}"
+        );
     }
 }

@@ -86,13 +86,40 @@ fn pedido_de_resumo(anterior: Option<&str>, corpo: &[ChatMessage]) -> Vec<ChatMe
     conversa
 }
 
+/// Os ids do pedido de resumo e quantas mensagens dele chegam ao motor dentro
+/// de `teto`. Não coube tudo? Cai a ponta mais antiga — dos antigos, o que
+/// importa lembrar é o que chegou mais perto do que ainda está na janela — e o
+/// número devolvido é o que restou, porque é a única verdade sobre o que foi
+/// lido. Contar o trecho inteiro quando as mais antigas ficaram de fora seria o
+/// aplicativo garantindo uma memória que a janela não teve.
+///
+/// A medição entra por callback: o custo real é do template renderizado e
+/// tokenizado na placa, e a conta tem de poder ser conferida sem ela.
+fn apara_ate_caber(
+    trecho: &[ChatMessage],
+    teto: usize,
+    medir: &dyn Fn(&[ChatMessage]) -> Result<Vec<u32>>,
+) -> Result<(Vec<u32>, usize)> {
+    let mut corpo = trecho.to_vec();
+    loop {
+        let ids = medir(&corpo)?;
+        // Uma mensagem não se corta: mandá-la assim mesmo é o que deixa o motor
+        // decidir o que ler dela. Chegar a zero não resumiria nada e o turno
+        // giraria para sempre pedindo o resumo de um corpo vazio.
+        if ids.len() <= teto || corpo.len() <= 1 {
+            return Ok((ids, corpo.len()));
+        }
+        corpo.remove(0);
+    }
+}
+
 /// Dobra `trecho` dentro do resumo e devolve o texto novo com o que o motor
 /// gastou para escrevê-lo. `anterior` é o resumo dos turnos passados: ele entra
 /// na conta para o modelo consolidar, não para esquecer o começo da conversa.
 ///
-/// O trecho a ser lido também tem de caber. Quando não cabe, cai a mensagem
-/// mais antiga dele — dos antigos, o que importa lembrar é o que chegou mais
-/// perto do que ainda está na janela.
+/// O terceiro número é quantas mensagens do trecho o modelo leu de fato. Ele não
+/// é enfeite: quem mostra "mensagens dobradas" na tela tem de mostrar este, e
+/// não o tamanho do trecho.
 pub fn dobrar(
     engine: &mut Engine,
     template: &ChatTemplate,
@@ -100,7 +127,7 @@ pub fn dobrar(
     anterior: Option<&str>,
     trecho: &[ChatMessage],
     cancel: &AtomicBool,
-) -> Result<(String, Generation)> {
+) -> Result<(String, Generation, usize)> {
     if trecho.is_empty() {
         bail!(tr("erros.nadaParaResumir", &[]));
     }
@@ -108,19 +135,15 @@ pub fn dobrar(
     // curta. A gramática de chamada custaria tokens e convidaria o modelo a
     // executar em vez de narrar o que já foi executado.
     let amostra = SamplingParams { max_tokens: TETO_TOKENS, ..params.clone() };
-    let teto = limite(engine.context(), TETO_TOKENS);
-    let mut corpo = trecho.to_vec();
-    let ids = loop {
-        let conversa = pedido_de_resumo(anterior, &corpo);
-        let prompt = template
-            .render(&conversa, &[], false)
-            .context(tr("erros.renderizarConversa", &[]))?;
-        let ids = codificar(engine, prompt.as_str())?;
-        if ids.len() <= teto || corpo.len() <= 1 {
-            break ids;
-        }
-        corpo.remove(0);
-    };
+    let (ids, lidas) = apara_ate_caber(trecho, limite(engine.context(), TETO_TOKENS), &|corpo| {
+        Ok(codificar(
+            engine,
+            template
+                .render(&pedido_de_resumo(anterior, corpo), &[], false)
+                .context(tr("erros.renderizarConversa", &[]))?
+                .as_str(),
+        )?)
+    })?;
 
     let mut stop = engine.paradas().to_vec();
     if !stop.iter().any(|s| s == TURN_MARKER) {
@@ -142,7 +165,7 @@ pub fn dobrar(
         // guardar. O turno para aqui com a verdade.
         bail!(tr("erros.resumoVazio", &[]));
     }
-    Ok((texto, generation))
+    Ok((texto, generation, lidas))
 }
 
 #[cfg(test)]
@@ -203,5 +226,49 @@ mod testes {
         let papeis: Vec<&str> = pedido.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(&papeis[1..4], ["user", "assistant", "tool"]);
         assert!(pedido[2].tool_calls.is_some());
+    }
+
+    /// Custo em tokens de mentira: cada mensagem custa o número escrito no seu
+    /// corpo. É a única forma de conferir a conta da régua sem placa — o que se
+    /// testa é a aritmética do corte, não o tokenizer.
+    fn medir_por_corpo(corpo: &[ChatMessage]) -> Result<Vec<u32>> {
+        let n = corpo
+            .iter()
+            .map(|m| m.content.parse::<usize>().unwrap_or(1))
+            .sum();
+        Ok(vec![0u32; n])
+    }
+
+    /// O trecho que não coube: caem as mais antigas e o número devolvido é o que
+    /// restou. Medir o trecho inteiro aqui é o defeito original — a tela dizia
+    /// "5 mensagens dobradas" com 3 na frente do modelo.
+    #[test]
+    fn o_que_nao_cabe_fica_de_fora_e_o_numero_diz_o_que_foi_lido() {
+        let trecho: Vec<ChatMessage> = (0..5)
+            .map(|_| ChatMessage::new("user", "100"))
+            .collect();
+        let (ids, lidas) = apara_ate_caber(&trecho, 300, &medir_por_corpo).unwrap();
+        assert_eq!(lidas, 3, "as duas mais antigas não couberam em 300 tokens");
+        assert_eq!(ids.len(), 300);
+    }
+
+    #[test]
+    fn quando_cabe_tudo_nada_e_descartado() {
+        let trecho: Vec<ChatMessage> = (0..5)
+            .map(|_| ChatMessage::new("user", "100"))
+            .collect();
+        let (ids, lidas) = apara_ate_caber(&trecho, 900, &medir_por_corpo).unwrap();
+        assert_eq!(lidas, 5);
+        assert_eq!(ids.len(), 500);
+    }
+
+    /// Uma mensagem só, maior que a régua: não há o que cortar sem sobrar nada
+    /// para ler, então ela vai assim mesmo e o motor cuida do resto. O número
+    /// continua sendo 1 — dizer 0 seria afirmar que o resumo não leu nada.
+    #[test]
+    fn uma_mensagem_acima_da_regua_e_a_unica_lida() {
+        let trecho = vec![ChatMessage::new("tool", "900")];
+        let (_, lidas) = apara_ate_caber(&trecho, 100, &medir_por_corpo).unwrap();
+        assert_eq!(lidas, 1);
     }
 }

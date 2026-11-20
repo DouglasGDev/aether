@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
-use tiberius::{AuthMethod, Client, Config, ExecuteResult, Row};
+use tiberius::{AuthMethod, Client, Config, EncryptionLevel, ExecuteResult, Row};
 
 type ClienteTds = Client<tokio_util::compat::Compat<TcpStream>>;
 
@@ -189,19 +189,59 @@ fn onde_sql(
     }
 }
 
+/// O que a conexão pede do canal TDS. Duas possibilidades, e nenhuma delas é
+/// um número: quem decide é a flag `tls_verificado` do cadastro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confianca {
+    /// Como era antes da flag existir: qualquer certificado é aceito. Numa rede
+    /// local com servidor auto-assinado — o caso mais comum desta máquina — é o
+    /// que deixa a ligação de pé.
+    ConfiarEmQualquerCertificado,
+    /// O certificado do servidor só vale se a cadeia da máquina o reconhecer,
+    /// e o tráfego sai cifrado de ponta a ponta.
+    Conferido,
+}
+
+/// A única leitura da flag neste motor. Medível sem servidor: o `Config` do
+/// tiberius guarda seus campos como `pub(crate)` e não devolve a postura, então
+/// a decisão vive aqui, separada da aplicação.
+fn confianca_da(conexao: &Conexao) -> Confianca {
+    if conexao.tls_verificado {
+        Confianca::Conferido
+    } else {
+        Confianca::ConfiarEmQualquerCertificado
+    }
+}
+
+/// A ficha do tiberius, inteira, a partir do cadastro. Nada aqui depende de
+/// porta ou host: mudar a porta não muda a confiança, e confiar é sempre um
+/// ato do cadastro, nunca um número escrito à mão.
+fn ficha_de(conexao: &Conexao, senha: &str) -> Config {
+    let mut ficha = Config::new();
+    ficha.host(conexao.host.trim());
+    ficha.port(conexao.porta_efetiva());
+    if !conexao.banco.trim().is_empty() {
+        ficha.database(conexao.banco.trim());
+    }
+    ficha.authentication(AuthMethod::sql_server(conexao.usuario.trim(), senha));
+    match confianca_da(conexao) {
+        // Sem a marca, o comportamento é o de sempre: confiar. A certificação
+        // é da rede do dono, e sem confiar aqui o login falha no certificado
+        // antes de qualquer SQL ser falado.
+        Confianca::ConfiarEmQualquerCertificado => ficha.trust_cert(),
+        // Marcada: nada de `trust_cert`. A cifra é obrigada (o tiberius já
+        // traz `native-tls`, e `Required` é o que ele usa por defeito — dito
+        // aqui para a intenção ficar no código, não herdada de um defeito) e o
+        // certificado passa pela cadeia do sistema.
+        Confianca::Conferido => ficha.encryption(EncryptionLevel::Required),
+    }
+    ficha
+}
+
 impl Mssql {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         let senha = conexao.senha()?;
-        let mut ficha = Config::new();
-        ficha.host(conexao.host.trim());
-        ficha.port(conexao.porta_efetiva());
-        if !conexao.banco.trim().is_empty() {
-            ficha.database(conexao.banco.trim());
-        }
-        ficha.authentication(AuthMethod::sql_server(conexao.usuario.trim(), senha.as_str()));
-        // A certificação do servidor é da rede do dono: sem confiar, o login
-        // falha no certificado antes de qualquer SQL ser falado.
-        ficha.trust_cert();
+        let ficha = ficha_de(conexao, senha.as_str());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -584,4 +624,73 @@ fn erro_abrir(e: tiberius::error::Error) -> anyhow::Error {
 
 fn erro(e: tiberius::error::Error) -> anyhow::Error {
     anyhow!(tr("erros.bancoErro", &[("detalhe", &e.to_string())]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bancos::config::{conexao_de_teste, Tipo};
+
+    /// A confiança sai da flag, e de nada mais. Numeral de porta e host são
+    /// escritos à mão pelo dono e não podem, sozinhos, decidir se o canal é
+    /// conferido.
+    #[test]
+    fn a_confianca_tds_sai_da_flag_e_nao_de_um_numero() {
+        let mut sem_marca = conexao_de_teste(Tipo::Mssql);
+        assert_eq!(
+            confianca_da(&sem_marca),
+            Confianca::ConfiarEmQualquerCertificado,
+            "sem a marca fica o comportamento de antes: `trust_cert`"
+        );
+        sem_marca.porta = Some(1433);
+        sem_marca.host = "127.0.0.1".into();
+        assert_eq!(
+            confianca_da(&sem_marca),
+            Confianca::ConfiarEmQualquerCertificado,
+            "nem a porta dita nem o host ligam a confiança"
+        );
+        sem_marca.tls_verificado = true;
+        assert_eq!(
+            confianca_da(&sem_marca),
+            Confianca::Conferido,
+            "a marca é a única coisa que muda a postura"
+        );
+    }
+
+    /// A ficha é uma só para as duas posturas: o que a flag escolhe é a
+    /// confiança, nunca o endereço. `Config` do tiberius não devolve os campos
+    /// de TLS (são `pub(crate)`), então o que se mede sem servidor é isto.
+    #[test]
+    fn a_flag_nao_troca_o_endereco_da_ficha() {
+        let lisa = conexao_de_teste(Tipo::Mssql);
+        let mut conferida = conexao_de_teste(Tipo::Mssql);
+        conferida.tls_verificado = true;
+        assert_eq!(
+            ficha_de(&conferida, "").get_addr(),
+            ficha_de(&lisa, "").get_addr(),
+            "a mesma conexão, com ou sem a flag, aponta para o mesmo lugar"
+        );
+        let mut outra_porta = conexao_de_teste(Tipo::Mssql);
+        outra_porta.porta = Some(21433);
+        assert_eq!(ficha_de(&outra_porta, "").get_addr(), "10.0.0.8:21433");
+    }
+
+    /// O que só um servidor de verdade responde: com a flag ligada, um SQL
+    /// Server de certificado auto-assinado tem de ser recusado no certificado
+    /// antes de qualquer SQL; desligada, a ligação tem de continuar de pé.
+    /// Fica ignorado porque esta máquina não tem SQL Server — medir isto aqui
+    /// seria fingir.
+    #[ignore = "precisa de um SQL Server real com certificado auto-assinado; sem ele a handshake não existe"]
+    #[test]
+    fn um_servidor_auto_assinado_e_recusado_com_a_flag_ligada() {
+        let mut conferida = conexao_de_teste(Tipo::Mssql);
+        conferida.tls_verificado = true;
+        assert!(
+            Mssql::abrir(&conferida).is_err(),
+            "com a marca, o certificado que a máquina não reconhece tem de barrar a ligação"
+        );
+
+        let lisa = conexao_de_teste(Tipo::Mssql);
+        assert!(Mssql::abrir(&lisa).is_ok(), "sem a marca, a ligação continua como sempre");
+    }
 }

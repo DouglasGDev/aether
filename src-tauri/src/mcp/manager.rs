@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -75,7 +75,9 @@ struct Connection {
 }
 
 pub struct McpManager {
-    registry: RwLock<Registry>,
+    /// Compartilhado com a execução: o grafo decide uma vez, e as duas portas
+    /// (laço de conversa e servidor publicado) leem a mesma allowlist.
+    registry: Arc<RwLock<Registry>>,
     /// O único lugar onde um efeito é decidido e executado. O laço de conversa e
     /// o servidor publicado chegam por portas diferentes e passam por aqui.
     execucao: Arc<Execucao>,
@@ -133,10 +135,19 @@ impl McpManager {
         derrame: Arc<PathBuf>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
-        let execucao = Execucao::nova(gate, events.clone(), pastas, memoria, bancos_path, derrame);
+        let registry = Arc::new(RwLock::new(registry));
+        let execucao = Execucao::nova(
+            gate,
+            Arc::clone(&registry),
+            events.clone(),
+            pastas,
+            memoria,
+            bancos_path,
+            derrame,
+        );
         let publicador = Arc::new(Publicador::novo(Arc::clone(&execucao)));
         Self {
-            registry: RwLock::new(registry),
+            registry,
             execucao,
             connections: RwLock::new(HashMap::new()),
             events,
@@ -340,11 +351,24 @@ impl McpManager {
             _ => entry.clone(),
         };
 
-        let client = Self::dial(&entry).await?;
-        let advertised = client
-            .list_all_tools()
-            .await
-            .context(tr("erros.falhaListarFerramentas", &[]))?;
+        let client = dentro_do_prazo(Self::dial(&entry), PRAZO_CONEXAO, connector_id).await?;
+        // A descoberta também tem prazo, e aqui há algo a limpar: o cliente já
+        // está de pé, com o processo do servidor vivo atrás dele. Devolver o
+        // erro sem fechar a conexão deixaria um filho órfão com a tela dizendo
+        // apenas que não conseguiu conectar.
+        let descoberta = dentro_do_prazo(
+            async { client.list_all_tools().await.context(tr("erros.falhaListarFerramentas", &[])) },
+            PRAZO_CONEXAO,
+            connector_id,
+        )
+        .await;
+        let advertised = match descoberta {
+            Ok(ferramentas) => ferramentas,
+            Err(erro) => {
+                let _ = client.cancel().await;
+                return Err(erro);
+            }
+        };
 
         let anunciadas: Vec<ToolInfo> = advertised
             .iter()
@@ -600,6 +624,19 @@ impl McpManager {
         Ok(parada)
     }
 
+    /// Desliga tudo o que o aplicativo abriu. A porta de retorno vem primeiro
+    /// porque derrubar a própria ligação é o que fecha o `CONECTOR` publicado;
+    /// depois vem cada servidor stdio — é o `Drop` do transporte que mata o
+    /// filho, e ele só acontece quando a conexão sai daqui. Sem este caminho,
+    /// fechar a janela deixava `node.exe` servindo uma ferramenta que ninguém
+    /// mais chama, com o token ainda válido na memória de um processo órfão.
+    pub async fn desligar(&self) {
+        let _ = self.despublicar().await;
+        for id in self.connected_ids() {
+            let _ = self.disconnect(&id).await;
+        }
+    }
+
     pub fn estado_servidor(&self) -> servidor::Estado {
         self.publicador.estado()
     }
@@ -677,9 +714,63 @@ fn resultado_publicado(estado: &servidor::Estado) -> CallToolResult {
     resultado
 }
 
+/// O aperto de mão e a descoberta de ferramentas têm prazo. Sem ele, um
+/// servidor que nasce mudo — o script certo esperando uma entrada que nunca
+/// chega, o binário que abre o socket e não responde — pendurava `conectar` para
+/// sempre: a tela girava sem devolver erro nenhum.
+const PRAZO_CONEXAO: Duration = Duration::from_secs(45);
+
+/// Espera `fazer` até `prazo` e diz qual servidor não respondeu. O prazo é
+/// parâmetro, não constante embutida, para que a conta possa ser conferida num
+/// teste sem esperar quarenta e cinco segundos reais.
+///
+/// Cortar pelo meio é seguro nos dois transportes: no stdio a futura carregava
+/// o `TokioChildProcess` e o `Drop` dele mata o filho (rmcp
+/// `transport/child_process.rs`, `ChildWithCleanup`); no HTTP não há processo
+/// nenhum para matar.
+async fn dentro_do_prazo<T, F>(fazer: F, prazo: Duration, id: &str) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(prazo, fazer).await {
+        Ok(feito) => feito,
+        Err(_) => bail!(tr(
+            "erros.servidorSemResposta",
+            &[("id", id), ("segundos", &prazo.as_secs().to_string())],
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Um servidor mudo não pode pendurar o botão de conectar: o prazo estoura,
+    /// o erro diz qual servidor ficou sem resposta e a espera acaba na hora, não
+    /// quando o processo do servidor resolver falar.
+    #[tokio::test]
+    async fn o_servidor_que_nao_responde_devolve_um_erro_em_vezes_de_ficar_pendurado() {
+        let mudo = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        };
+        let inicio = Instant::now();
+        let erro = dentro_do_prazo(mudo, Duration::from_millis(50), "filesystem")
+            .await
+            .expect_err("um servidor mudo não pode devolver sucesso");
+        let texto = erro.to_string();
+        assert!(texto.contains("filesystem"), "{texto}");
+        assert!(texto.contains("respondeu"), "{texto}");
+        assert!(inicio.elapsed() < Duration::from_secs(1), "o prazo não cortou a espera: {:?} para lá do que 50 ms", inicio.elapsed());
+    }
+
+    #[tokio::test]
+    async fn o_servidor_que_responde_passa_pela_regua_inteiro() {
+        let resposta = dentro_do_prazo(async { Ok(7usize) }, Duration::from_secs(5), "fetch")
+            .await
+            .expect("resposta dentro do prazo é sucesso");
+        assert_eq!(resposta, 7);
+    }
 
     /// A ferramenta de publicar é do conector embutido. Dentro do servidor
     /// publicado a conexão já estaria de pé; anunciá-la lá seria um convite para

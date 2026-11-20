@@ -147,6 +147,17 @@ pub struct Conexao {
     /// autorizar qualquer declaração na conexão, inclusive de escrita.
     #[serde(default)]
     pub sql_livre: bool,
+    /// Canal conferido nesta conexão: TLS de verdade, com o certificado do
+    /// servidor aceito apenas pela cadeia que a máquina do dono reconhece.
+    /// Desligado por padrão, e o padrão é exatamente o comportamento de antes
+    /// da flag existir — postgres falava em texto puro (`NoTls`) e sqlserver
+    /// confiava em qualquer certificado (`trust_cert`). Não se mudou o padrão
+    /// às cegas: um certificado auto-assinado em rede local é o caso mais
+    /// comum, e quebrar a ligação sem aviso deixaria o dono sem banco. Ligar
+    /// aqui é pedir o contrário, e cada motor que sabe falar TLS obedece; o
+    /// que não sabe se recusa a fingir.
+    #[serde(default)]
+    pub tls_verificado: bool,
     /// Tabelas (ou coleções) expostas e a política de cada uma. O que não está
     /// aqui o conector não toca, nem para descrever.
     #[serde(default)]
@@ -297,25 +308,39 @@ impl Config {
 }
 
 #[cfg(test)]
+/// A base de uma conexão de teste, para qualquer módulo deste crate: sem senha
+/// — nem em claro nem cifrada, nem em formato falso — e sem rede real. Cada
+/// teste muda apenas o campo que está medindo. Não é dado de demonstração nem
+/// fixture de tela: existe só para as decisões de política poderem ser
+/// conferidas sem servidor nenhum.
+pub fn conexao_de_teste(tipo: Tipo) -> Conexao {
+    Conexao {
+        id: "id-teste".into(),
+        nome: "teste".into(),
+        tipo,
+        host: "10.0.0.8".into(),
+        porta: None,
+        usuario: "rosto".into(),
+        banco: "estoque".into(),
+        arquivo: "C:/dados/estoque.db".into(),
+        senha_cifrada: None,
+        senha_clara: None,
+        limite_linhas: 200,
+        sql_livre: false,
+        tls_verificado: false,
+        fontes: BTreeMap::new(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn conexao(nome: &str) -> Conexao {
-        Conexao {
-            id: format!("id-{nome}"),
-            nome: nome.to_string(),
-            tipo: Tipo::Sqlite,
-            host: String::new(),
-            porta: None,
-            usuario: String::new(),
-            banco: String::new(),
-            arquivo: "C:/dados/estoque.db".into(),
-            senha_cifrada: None,
-            senha_clara: None,
-            limite_linhas: 200,
-            sql_livre: false,
-            fontes: BTreeMap::new(),
-        }
+        let mut entrada = conexao_de_teste(Tipo::Sqlite);
+        entrada.id = format!("id-{nome}");
+        entrada.nome = nome.to_string();
+        entrada
     }
 
     #[test]
@@ -390,6 +415,62 @@ mod tests {
         assert_eq!(de_volta.fontes.get("clientes").map(|f| f.ler), Some(true));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// O `bancos.json` que já existe no disco não carrega a chave nova. Abrir
+    /// esse cadastro tem de dar exatamente o que dava antes: texto puro no
+    /// postgres, confiança cega no sqlserver. Uma política nova não pode nascer
+    /// por defeito de leitura.
+    #[test]
+    fn um_cadastro_antigo_sem_a_flag_abre_com_o_padrao_de_hoje() {
+        let antigo = r#"{
+            "conexoes": [{
+                "id": "id-velho",
+                "nome": "Estoque",
+                "tipo": "postgres",
+                "host": "10.0.0.8",
+                "porta": 5433,
+                "usuario": "rosto",
+                "banco": "estoque",
+                "arquivo": "",
+                "senhaCifrada": null,
+                "limiteLinhas": 200,
+                "sqlLivre": false,
+                "fontes": {}
+            }]
+        }"#;
+        let config: Config = serde_json::from_str(antigo).expect("o cadastro de antes continua abrindo");
+        let guarda = &config.conexoes[0];
+        assert!(!guarda.tls_verificado, "sem a chave, o padrão de hoje: nada de canal conferido");
+        assert_eq!(guarda.porta_efetiva(), 5433);
+    }
+
+    /// O round-trip preserva o que a pessoa marcou, nos dois sentidos, e a
+    /// chave gravada é o nome do que ela faz.
+    #[test]
+    fn a_flag_de_tls_sobrevive_ao_disco_como_a_pessoa_a_marcou() {
+        for marcada in [true, false] {
+            let dir = std::env::temp_dir().join(format!("aether-bancos-tls-{}", std::process::id()));
+            let path = dir.join("bancos.json");
+            let mut config = Config::default();
+            let mut entrada = conexao("Estoque");
+            entrada.tipo = Tipo::Postgres;
+            entrada.host = "10.0.0.8".into();
+            entrada.banco = "estoque".into();
+            entrada.tls_verificado = marcada;
+            config.upsert(&mut entrada).expect("cadastra");
+            config.save(&path).expect("salva");
+
+            let texto = std::fs::read_to_string(&path).expect("lê o disco");
+            assert!(
+                texto.contains(&format!("\"tlsVerificado\": {marcada}")),
+                "a chave vai para o disco com o nome do que faz: {texto}"
+            );
+
+            let de_volta = Config::load(&path).expect("carrega");
+            assert_eq!(de_volta.conexoes[0].tls_verificado, marcada);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

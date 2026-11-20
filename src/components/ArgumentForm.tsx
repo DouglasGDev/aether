@@ -25,6 +25,18 @@ interface Props {
   onRun: (args: Record<string, unknown>) => void;
 }
 
+function valoresIniciais(
+  keys: string[],
+  properties: Record<string, Property>,
+): Record<string, string> {
+  const initial: Record<string, string> = {};
+  for (const key of keys) {
+    const value = properties[key].default;
+    initial[key] = value === undefined || value === null ? "" : String(value);
+  }
+  return initial;
+}
+
 export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
   const t = useT();
   const schema = (tool.inputSchema ?? {}) as Schema;
@@ -32,19 +44,32 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
   const required = schema.required ?? [];
   const keys = Object.keys(properties);
 
-  const [values, setValues] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const key of keys) {
-      const value = properties[key].default;
-      initial[key] = value === undefined || value === null ? "" : String(value);
-    }
-    return initial;
-  });
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    valoresIniciais(keys, properties),
+  );
   const [missing, setMissing] = useState<string[]>([]);
+  const [invalidos, setInvalidos] = useState<Record<string, string>>({});
+  const [ferramenta, setFerramenta] = useState(tool.name);
+
+  // O cartão é o mesmo formulário trocando de ferramenta: os valores nascem uma
+  // vez no estado, e sem este reset a segunda ferramenta receberia os argumentos
+  // da primeira — um caminho de arquivo onde devia ir um termo de busca.
+  if (ferramenta !== tool.name) {
+    setFerramenta(tool.name);
+    setValues(valoresIniciais(keys, properties));
+    setMissing([]);
+    setInvalidos({});
+  }
 
   function set(key: string, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
     setMissing((current) => current.filter((entry) => entry !== key));
+    setInvalidos((current) => {
+      if (!(key in current)) return current;
+      const limpo = { ...current };
+      delete limpo[key];
+      return limpo;
+    });
   }
 
   function submit(event: React.FormEvent) {
@@ -55,6 +80,7 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
       return;
     }
     const args: Record<string, unknown> = {};
+    const erros: Record<string, string> = {};
     for (const key of keys) {
       const raw = (values[key] ?? "").trim();
       const property = properties[key];
@@ -64,21 +90,40 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
       } else if (property.type === "boolean") {
         args[key] = raw === "true";
       } else if (property.type === "number" || property.type === "integer") {
-        args[key] = Number(raw);
+        // Number("duas") é NaN, e JSON.stringify(NaN) é null: a ferramenta
+        // receberia null sem ninguém ter digitado null.
+        const numero = Number(raw);
+        if (Number.isFinite(numero)) args[key] = numero;
+        else erros[key] = t("geral.invalidoNumero");
       } else if (property.type === "array") {
-        const parts = raw.split(",").map((part) => part.trim()).filter(Boolean);
-        args[key] =
-          property.items?.type === "number" || property.items?.type === "integer"
-            ? parts.map(Number)
-            : parts;
+        const partes = raw.split(",").map((parte) => parte.trim()).filter(Boolean);
+        if (
+          property.items?.type === "number" ||
+          property.items?.type === "integer"
+        ) {
+          const numeros = partes.map(Number);
+          if (numeros.every((numero) => Number.isFinite(numero))) args[key] = numeros;
+          else erros[key] = t("geral.invalidoNumero");
+        } else {
+          args[key] = partes;
+        }
       } else if (property.type === "object") {
-        args[key] = JSON.parse(raw);
+        try {
+          args[key] = JSON.parse(raw);
+        } catch {
+          // Sem o try, o JSON malformado estourava aqui dentro e o clique em
+          // Executar não fazia nada: o erro ficava só no console.
+          erros[key] = t("geral.invalidoJson");
+        }
       } else {
         args[key] = raw;
       }
     }
-    onRun(args);
+    setInvalidos(erros);
+    if (Object.keys(erros).length === 0) onRun(args);
   }
+
+  const camposRuins = Object.keys(invalidos);
 
   return (
     <form className="sheet" onSubmit={submit}>
@@ -111,18 +156,22 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
           {keys.map((key) => {
             const property = properties[key];
             const isMissing = missing.includes(key);
+            const erro = invalidos[key];
+            const obrigatoria = required.includes(key);
             return (
               <label
                 key={key}
-                className={isMissing ? "field missing" : "field"}
+                className={isMissing || erro ? "field missing" : "field"}
               >
                 <span className="field-label">
                   {property.title ?? humanize(key)}
-                  {required.includes(key) && <span className="field-dot" />}
+                  {obrigatoria && <span className="field-dot" aria-hidden="true" />}
                 </span>
                 {property.enum ? (
                   <select
                     value={values[key] ?? ""}
+                    aria-required={obrigatoria || undefined}
+                    aria-invalid={erro ? true : undefined}
                     onChange={(event) => set(key, event.target.value)}
                   >
                     <option value="">—</option>
@@ -149,6 +198,8 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
                   <textarea
                     rows={3}
                     value={values[key] ?? ""}
+                    aria-required={obrigatoria || undefined}
+                    aria-invalid={erro ? true : undefined}
                     onChange={(event) => set(key, event.target.value)}
                     spellCheck={false}
                   />
@@ -164,6 +215,8 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
                       property.type === "array" ? t("geral.listaValores") : ""
                     }
                     autoComplete="off"
+                    aria-required={obrigatoria || undefined}
+                    aria-invalid={erro ? true : undefined}
                     onChange={(event) => set(key, event.target.value)}
                   />
                 )}
@@ -174,6 +227,20 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
             );
           })}
         </div>
+      )}
+
+      {camposRuins.length > 0 && (
+        <p className="sheet-error" role="alert">
+          <Icon name="warning" />
+          <span>
+            {camposRuins
+              .map(
+                (key) =>
+                  `${properties[key].title ?? humanize(key)}: ${invalidos[key]}`,
+              )
+              .join(" · ")}
+          </span>
+        </p>
       )}
 
       <footer className="sheet-actions">

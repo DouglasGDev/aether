@@ -117,8 +117,17 @@ fn interpolar(texto: &str, args: &[(&str, &str)]) -> String {
     saida
 }
 
-/// Traduz uma chave no idioma atual. Chave ausente cai na referência; ausente
-/// nas duas, a própria chave volta — um defeito visível, nunca um texto inventado.
+/// A chave tem texto em todo idioma publicado. Serve para as chaves montadas em
+/// runtime (`bancada.caso.{id}`, `servidores.pronto.{id}.nome`), que o teste de
+/// paridade não alcança: ele compara os arquivos entre si, e uma chave que falta
+/// nos dois passa nele. Sem texto, a tela mostra o caminho da chave como palavra.
+pub fn tem_texto(chave: &str) -> bool {
+    catalogos().values().all(|c| c.mensagens.contains_key(chave))
+}
+
+/// A chave tem texto no idioma atual, com a referência por baixo. Chave ausente
+/// cai na referência; ausente nas duas, a própria chave volta — um defeito
+/// visível, nunca um texto inventado.
 pub fn tr(chave: &str, args: &[(&str, &str)]) -> String {
     let todos = catalogos();
     let idioma = escolhido().read().expect("idioma envenenado").clone();
@@ -216,6 +225,130 @@ mod tests {
     #[test]
     fn chave_inexistente_devolve_a_propria_chave() {
         assert_eq!(tr("nao.existe.em.lugar.nenhum", &[]), "nao.existe.em.lugar.nenhum");
+    }
+
+    /// A guarda existe para a chave montada em runtime, que a paridade não vê.
+    /// Ela só vale se recusar o que não tem texto: aqui está a prova disso.
+    #[test]
+    fn tem_texto_recusa_o_que_nao_foi_escrito_e_aceita_o_que_esta_la() {
+        assert!(
+            !tem_texto("bancada.caso.quem-nunca-foi-escrito"),
+            "chave sem texto passou na guarda"
+        );
+        assert!(tem_texto("idioma.nome"), "idioma.nome não está nos catálogos");
+    }
+
+    /// A paridade compara um catálogo com o outro e por isso não enxerga a chave
+    /// que falta nos dois: foi assim que `erros.motorEnvenenado` entrou no código
+    /// sem texto em lugar nenhum. Esta guarda parte do outro lado — lê o que o
+    /// próprio código pede e cobra que todo idioma publicado tenha a palavra.
+    #[test]
+    fn toda_chave_pedida_pelo_codigo_existe_em_todo_idioma() {
+        // Chaves montadas em runtime têm `{}` no meio e caem fora da varredura;
+        // cada família composta tem guarda própria no módulo que a forma
+        // (`bancada::testes`, `mcp::instalador::testes`).
+        const EXCECOES: &[&str] = &[
+            // não tem texto de propósito: prova que a chave sem catálogo devolve
+            // o próprio caminho em vez de inventar palavra
+            "nao.existe.em.lugar.nenhum",
+        ];
+
+        let raiz = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut faltando: Vec<String> = Vec::new();
+        let mut pedidas = 0usize;
+        for arquivo in arquivos_rs(&raiz) {
+            let codigo = std::fs::read_to_string(&arquivo)
+                .unwrap_or_else(|e| panic!("não li {}: {e}", arquivo.display()));
+            for chave in chaves_pedidas(&codigo) {
+                pedidas += 1;
+                if EXCECOES.contains(&chave.as_str()) || tem_texto(&chave) {
+                    continue;
+                }
+                faltando.push(format!("{} → {chave}", arquivo.display()));
+            }
+        }
+        // Um varredor que não acha nada passa verde sobre o defeito que existe
+        // para impedir: o piso está aqui, medido, não é uma impressão.
+        assert!(
+            pedidas > 200,
+            "a varredura achou só {pedidas} chaves: o leitor de `tr(\"...\")` quebrou"
+        );
+        assert!(
+            faltando.is_empty(),
+            "chaves pedidas pelo código sem texto em algum idioma:\n{}",
+            faltando.join("\n")
+        );
+    }
+
+    /// Caminha a árvore de código-fonte do núcleo procurando os `.rs`.
+    fn arquivos_rs(pasta: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut saida = Vec::new();
+        let mut pendentes = vec![pasta.to_path_buf()];
+        while let Some(atual) = pendentes.pop() {
+            let Ok(entradas) = std::fs::read_dir(&atual) else {
+                continue;
+            };
+            for entrada in entradas.flatten() {
+                let caminho = entrada.path();
+                if caminho.is_dir() {
+                    pendentes.push(caminho);
+                } else if caminho.extension().is_some_and(|e| e == "rs") {
+                    saida.push(caminho);
+                }
+            }
+        }
+        saida.sort();
+        saida
+    }
+
+    /// As chaves pedidas por `tr("...")` num texto-fonte, inclusive quando o
+    /// argumento quebra linha depois do parêntese.
+    fn chaves_pedidas(codigo: &str) -> Vec<String> {
+        let bytes = codigo.as_bytes();
+        let mut achadas = Vec::new();
+        let mut from = 0usize;
+        while let Some(relativo) = codigo[from..].find("tr(") {
+            let inicio = from + relativo;
+            let anterior = if inicio == 0 { b' ' } else { bytes[inicio - 1] };
+            from = inicio + 3;
+            // `traduzir(`, `contra(`: só conta o nome exato da função.
+            if anterior.is_ascii_alphanumeric() || anterior == b'_' {
+                continue;
+            }
+            let mut abre = from;
+            while abre < bytes.len() && matches!(bytes[abre], b' ' | b'\n' | b'\t') {
+                abre += 1;
+            }
+            if abre >= bytes.len() || bytes[abre] != b'"' {
+                continue;
+            }
+            let Some(resto) = codigo[abre + 1..].find('"') else {
+                continue;
+            };
+            let chave = &codigo[abre + 1..abre + 1 + resto];
+            from = abre + 1 + resto;
+            // runtime não é literal: `tr(&format!("servidores.pronto.{id}.nome"))`
+            if chave.contains('{') || chave.contains('}') || !parece_chave(chave) {
+                continue;
+            }
+            achadas.push(chave.to_string());
+        }
+        achadas
+    }
+
+    /// Chave de catálogo é um caminho de identificadores separados por ponto. O
+    /// filtro importa porque o texto-fonte também carrega `tr("...")` dentro de
+    /// comentário e de mensagem de teste, e um texto assim não pede nada.
+    fn parece_chave(chave: &str) -> bool {
+        chave.split('.').all(|pedaco| {
+            let mut letras = pedaco.chars();
+            match letras.next() {
+                Some(inicial) if inicial.is_ascii_alphabetic() || inicial == '_' => {
+                    pedaco.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                }
+                _ => false,
+            }
+        })
     }
 
     #[test]

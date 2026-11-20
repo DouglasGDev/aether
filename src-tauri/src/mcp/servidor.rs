@@ -75,12 +75,12 @@ pub struct Estado {
 }
 
 impl Estado {
-    fn inativa() -> Self {
+    fn inativa(ferramentas: usize) -> Self {
         Self {
             ativa: false,
             url: String::new(),
             porta: 0,
-            ferramentas: catalogo_publicado().len(),
+            ferramentas,
         }
     }
 }
@@ -115,7 +115,15 @@ impl Publicador {
             .expect("publicador envenenado")
             .as_ref()
             .map(|ativa| ativa.estado.clone())
-            .unwrap_or_else(Estado::inativa)
+            .unwrap_or_else(|| Estado::inativa(self.ferramentas()))
+    }
+
+    /// Quantas ferramentas o servidor anuncia agora: o catálogo já recortado
+    /// pelo grafo. É este número que a tela mostra, e ele tem de bater com o que
+    /// um `tools/list` devolve — contar o catálogo inteiro diria "ligada" uma
+    /// ferramenta que o usuário desligou.
+    fn ferramentas(&self) -> usize {
+        catalogo_publicado(&self.execucao).len()
     }
 
     /// O token em memória, para quem precisa apresentá-lo a um cliente externo.
@@ -172,7 +180,7 @@ impl Publicador {
             ativa: true,
             url: format!("http://127.0.0.1:{porta}/mcp"),
             porta,
-            ferramentas: catalogo_publicado().len(),
+            ferramentas: self.ferramentas(),
         };
         *self.ativa.lock().expect("publicador envenenado") = Some(Ativa {
             estado: estado.clone(),
@@ -277,7 +285,11 @@ impl ServerHandler for Manipulador {
     ) -> impl std::future::Future<Output = std::result::Result<ListToolsResult, ErrorData>>
     + Send
     + '_ {
-        async move { Ok(ListToolsResult::with_all_items(ferramentas_anunciadas())) }
+        async move {
+            Ok(ListToolsResult::with_all_items(ferramentas_anunciadas(
+                &self.execucao,
+            )))
+        }
     }
 
     fn call_tool(
@@ -294,13 +306,17 @@ impl ServerHandler for Manipulador {
                 None => Value::Object(Map::new()),
             };
             // O efeito vem do catálogo, e a resposta de um nome que não está nele
-            // diz quais são as ferramentas: a mesma regra do laço de conversa.
-            let Some(efeito) = catalogo_publicado()
-                .into_iter()
-                .find(|f| f.nome == nome)
-                .map(|f| f.efeito)
-            else {
-                let lista = catalogo_publicado()
+            // diz quais são as ferramentas: a mesma regra do laço de conversa. O
+            // catálogo é o recorte do grafo, não o catálogo interno: uma
+            // ferramenta desligada na tela não está aqui, e chamar o que não
+            // existe é o erro que um `FullAccess` do cliente não reabre.
+            let publicadas = catalogo_publicado(&self.execucao);
+            let efeito = publicadas
+                .iter()
+                .find(|ferramenta| ferramenta.nome == nome)
+                .map(|ferramenta| ferramenta.efeito);
+            let Some(efeito) = efeito else {
+                let lista = publicadas
                     .into_iter()
                     .map(|t| format!("{CONECTOR}__{}", t.nome))
                     .collect::<Vec<_>>()
@@ -332,20 +348,25 @@ impl ServerHandler for Manipulador {
 }
 
 /// O catálogo que este servidor anuncia: as ferramentas locais e as de banco de
-/// dados, no idioma da vez. `criar_mcp_local` fica de fora — dentro do servidor
-/// publicado a conexão já estaria de pé, e anunciá-la seria um convite para
-/// abrir a porta outra vez.
-fn catalogo_publicado() -> Vec<Ferramenta> {
+/// dados, no idioma da vez, passadas pela allowlist do grafo. `criar_mcp_local`
+/// fica de fora — dentro do servidor publicado a conexão já estaria de pé, e
+/// anunciá-la seria um convite para abrir a porta outra vez.
+///
+/// O recorte é o do conector embutido, dono dessas ferramentas: a mesma lista
+/// que o laço de conversa recebe. Um cliente na placa de retorno é uma segunda
+/// mão pedindo a mesma capacidade, não um segundo cadastro.
+fn catalogo_publicado(execucao: &Execucao) -> Vec<Ferramenta> {
     local::catalogo()
         .into_iter()
         .chain(bancos::ferramentas::catalogo())
+        .filter(|ferramenta| execucao.permite_local(&ferramenta.nome))
         .collect()
 }
 
 /// O catálogo como ferramenta MCP. As anotações vão porque um cliente precisa
 /// poder dizer leitura de escrita; a decisão do gate, aqui dentro, não usa elas.
-fn ferramentas_anunciadas() -> Vec<Tool> {
-    catalogo_publicado()
+fn ferramentas_anunciadas(execucao: &Execucao) -> Vec<Tool> {
+    catalogo_publicado(execucao)
         .into_iter()
         .map(|ferramenta| {
             let mut anotacoes = ToolAnnotations::default();
@@ -480,6 +501,7 @@ pub fn cabecalho_autenticacao(token: &str) -> Result<(HeaderName, HeaderValue)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::Registry;
     use crate::local::pastas::Pastas;
     use crate::permissions::{AgentMode, PermissionGate};
     use rmcp::ServiceExt;
@@ -491,14 +513,30 @@ mod tests {
     /// Um publicador com gate de verdade e pasta concedida de verdade: o mesmo
     /// objeto que roda no aplicativo, montado com o mínimo de arranjo.
     fn publicador(modo: AgentMode) -> (Publicador, PathBuf) {
+        publicador_com_grafo(modo, None)
+    }
+
+    /// O mesmo arranjo com a allowlist do grafo no lugar: é o que o cadastro do
+    /// `computador` carrega depois de alguém desligar uma ferramenta na tela, e
+    /// é ela que o servidor publicado tem de obedecer.
+    fn publicador_com_grafo(
+        modo: AgentMode,
+        allowlist: Option<Vec<String>>,
+    ) -> (Publicador, PathBuf) {
         let (eventos, _) = tokio::sync::broadcast::channel(4);
         let raiz = std::env::temp_dir().join(format!("aether-servidor-{}", std::process::id()));
         std::fs::create_dir_all(&raiz).expect("pasta de teste");
         let pastas = Arc::new(RwLock::new(Pastas {
             raizes: vec![raiz.clone()],
         }));
+        let mut embutido = crate::local::conector();
+        embutido.tool_allowlist = allowlist;
+        let registry = Arc::new(RwLock::new(
+            Registry::new(vec![embutido]).expect("o conector embutido é registrável"),
+        ));
         let execucao = Execucao::nova(
             Arc::new(Mutex::new(PermissionGate::new(modo))),
+            registry,
             eventos,
             Arc::clone(&pastas),
             Arc::new(crate::ai::memoria::Custodio::novo(
@@ -531,15 +569,31 @@ mod tests {
 
     #[test]
     fn o_estado_inativo_mostra_o_catalogo_inteiro_sem_endereco() {
-        let estado = Estado::inativa();
+        let (publicador, _) = publicador(AgentMode::FullAccess);
+        let estado = publicador.estado();
         assert!(!estado.ativa);
         assert_eq!(estado.url, "");
         assert_eq!(estado.porta, 0);
-        assert_eq!(estado.ferramentas, catalogo_publicado().len());
+        assert_eq!(
+            estado.ferramentas,
+            catalogo_publicado(&publicador.execucao).len()
+        );
         assert!(
             estado.ferramentas > local::catalogo().len(),
             "as ferramentas de banco entram na contagem publicada"
         );
+    }
+
+    /// Fechado ou aberto, o número da tela é o `tools/list` que um cliente
+    /// recebe. Contar o catálogo interno diria "ligada" uma ferramenta que o
+    /// grafo desligou.
+    #[test]
+    fn a_contagem_do_estado_e_o_recorte_do_grafo() {
+        let (publicador, _) = publicador_com_grafo(
+            AgentMode::FullAccess,
+            Some(vec!["ler_arquivo".into(), "info_sistema".into()]),
+        );
+        assert_eq!(publicador.estado().ferramentas, 2, "inativo também conta o recorte");
     }
 
     #[test]
@@ -686,6 +740,63 @@ mod tests {
             .expect("o servidor responde");
         assert_eq!(resposta.is_error, Some(true), "Plan recusa a escrita");
         assert!(!alvo.exists(), "recusada é não escrita");
+        cliente.cancel().await.ok();
+        publicador.fechar().await.expect("fecha");
+    }
+
+    /// Desligar uma ferramenta no grafo decide sobre o catálogo, não sobre uma
+    /// porta só. O servidor publicado é a segunda porta pelas mesmas mãos: o que
+    /// ele anuncia e o que ele aceita é o recorte, nem um nome a mais — e um
+    /// `FullAccess` no cliente não reabre o que o usuário fechou na tela.
+    #[tokio::test]
+    async fn o_recorte_do_grafo_vale_na_placa_publicada() {
+        let (publicador, raiz) = publicador_com_grafo(
+            AgentMode::FullAccess,
+            Some(vec!["ler_arquivo".into(), "info_sistema".into()]),
+        );
+        let (estado, token) = publicador.abrir().await.expect("abre");
+        let cliente = conectar(&estado.url, &token).await.expect("conecta");
+
+        let nomes: Vec<String> = cliente
+            .list_all_tools()
+            .await
+            .expect("tools/list responde")
+            .into_iter()
+            .map(|ferramenta| ferramenta.name.to_string())
+            .collect();
+        assert!(nomes.contains(&"ler_arquivo".to_string()), "{nomes:?}");
+        assert!(
+            !nomes.contains(&"escrever_arquivo".to_string()),
+            "desligada no grafo não é anúncio: {nomes:?}"
+        );
+        assert_eq!(
+            estado.ferramentas,
+            nomes.len(),
+            "a contagem da tela é o que o servidor anuncia de fato"
+        );
+
+        let alvo = raiz.join("desligada.txt");
+        let _ = std::fs::remove_file(&alvo);
+        let resposta = cliente
+            .call_tool(
+                CallToolRequestParams::new("escrever_arquivo").with_arguments(
+                    serde_json::json!({
+                        "caminho": alvo.to_string_lossy(),
+                        "conteudo": "escrita que o grafo não deixou existir",
+                    })
+                    .as_object()
+                    .cloned()
+                    .expect("objeto"),
+                ),
+            )
+            .await
+            .expect("o servidor responde");
+        assert_eq!(
+            resposta.is_error,
+            Some(true),
+            "o modo do cliente não reabre uma ferramenta fechada no grafo"
+        );
+        assert!(!alvo.exists(), "desligada é não escrita");
         cliente.cancel().await.ok();
         publicador.fechar().await.expect("fecha");
     }

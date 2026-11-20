@@ -6,6 +6,7 @@ import type {
   ConexaoRegistro,
   FontePolitica,
 } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 const TIPOS = ["sqlite", "postgres", "mysql", "sqlserver", "mongodb", "oracle"] as const;
@@ -43,6 +44,7 @@ interface Ficha {
   senha: string;
   limiteLinhas: string;
   sqlLivre: boolean;
+  tlsVerificado: boolean;
   temSenha: boolean;
   fontes: Record<string, FontePolitica>;
 }
@@ -59,6 +61,7 @@ const FICHA_NOVA: Ficha = {
   senha: "",
   limiteLinhas: "200",
   sqlLivre: false,
+  tlsVerificado: false,
   temSenha: false,
   fontes: {},
 };
@@ -68,6 +71,7 @@ interface Props {
 }
 
 export function BancosDialog({ onClose }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const [conexoes, setConexoes] = useState<ConexaoBanco[]>([]);
   const [ficha, setFicha] = useState<Ficha | null>(null);
@@ -107,6 +111,7 @@ export function BancosDialog({ onClose }: Props) {
       senha: "",
       limiteLinhas: String(conexao.limiteLinhas),
       sqlLivre: conexao.sqlLivre,
+      tlsVerificado: conexao.tlsVerificado,
       temSenha: conexao.temSenha,
       fontes: { ...conexao.fontes },
     });
@@ -123,6 +128,7 @@ export function BancosDialog({ onClose }: Props) {
     arquivo: f.arquivo.trim(),
     limiteLinhas: Math.max(1, Math.floor(Number(f.limiteLinhas) || 200)),
     sqlLivre: f.sqlLivre,
+    tlsVerificado: f.tlsVerificado,
     fontes: f.fontes,
   });
 
@@ -227,6 +233,9 @@ export function BancosDialog({ onClose }: Props) {
                   {conexao.sqlLivre && (
                     <span className="server-chip aviso">{t("bancos.campoSqlLivre")}</span>
                   )}
+                  {conexao.tlsVerificado && (
+                    <span className="server-chip">{t("bancos.campoTls")}</span>
+                  )}
                 </div>
                 <div className="server-acoes">
                   <button
@@ -278,7 +287,15 @@ export function BancosDialog({ onClose }: Props) {
                   <select
                     value={ficha.tipo}
                     onChange={(event) =>
-                      setFicha({ ...ficha, tipo: event.target.value as Tipo, porta: "" })
+                      setFicha({
+                        ...ficha,
+                        tipo: event.target.value as Tipo,
+                        porta: "",
+                        // SQLite é um arquivo: não há canal a conferir. Mudar o
+                        // tipo sem apagar a marca deixaria a ligação salvar um
+                        // estado que a tela não mostra mais.
+                        tlsVerificado: false,
+                      })
                     }
                   >
                     {TIPOS.map((tipo) => (
@@ -381,6 +398,24 @@ export function BancosDialog({ onClose }: Props) {
                   </span>
                 </div>
               </div>
+
+              {ficha.tipo !== "sqlite" && (
+                <div className="field-row">
+                  <div className="field">
+                    <span className="field-label">{t("bancos.campoTls")}</span>
+                    <span className="toggle-row">
+                      <button
+                        type="button"
+                        className={ficha.tlsVerificado ? "toggle on" : "toggle"}
+                        aria-pressed={ficha.tlsVerificado}
+                        onClick={() => setFicha({ ...ficha, tlsVerificado: !ficha.tlsVerificado })}
+                      >
+                        <span className="toggle-knob" />
+                      </button>
+                    </span>
+                  </div>
+                </div>
+              )}
 
               {Object.keys(ficha.fontes).length > 0 && (
                 <div className="field">

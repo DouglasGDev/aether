@@ -141,12 +141,12 @@ const COMPONENTES: Components = {
   img: ({ alt }) => (
     <span className="rich-endereco">{alt ?? ""}</span>
   ),
-  h1: ({ children }) => <p className="rich-titulo rich-titulo-1">{children}</p>,
-  h2: ({ children }) => <p className="rich-titulo rich-titulo-2">{children}</p>,
-  h3: ({ children }) => <p className="rich-titulo rich-titulo-3">{children}</p>,
-  h4: ({ children }) => <p className="rich-titulo rich-titulo-4">{children}</p>,
-  h5: ({ children }) => <p className="rich-titulo rich-titulo-5">{children}</p>,
-  h6: ({ children }) => <p className="rich-titulo rich-titulo-6">{children}</p>,
+  h1: ({ children }) => <h1 className="rich-titulo rich-titulo-1">{children}</h1>,
+  h2: ({ children }) => <h2 className="rich-titulo rich-titulo-2">{children}</h2>,
+  h3: ({ children }) => <h3 className="rich-titulo rich-titulo-3">{children}</h3>,
+  h4: ({ children }) => <h4 className="rich-titulo rich-titulo-4">{children}</h4>,
+  h5: ({ children }) => <h5 className="rich-titulo rich-titulo-5">{children}</h5>,
+  h6: ({ children }) => <h6 className="rich-titulo rich-titulo-6">{children}</h6>,
   table: ({ children }) => (
     <div className="rich-tabela-pasta">
       <table className="rich-tabela">{children}</table>

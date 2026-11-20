@@ -1,34 +1,26 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AdaptadoresDialog } from "./components/AdaptadoresDialog";
+import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { AppMenu, type Marca, type TelaAjuste } from "./components/AppMenu";
 import { ApprovalCard } from "./components/ApprovalCard";
-import { BancadaDialog } from "./components/BancadaDialog";
-import { BancosDialog } from "./components/BancosDialog";
 import { ArgumentForm } from "./components/ArgumentForm";
 import { CapabilityCards } from "./components/CapabilityCards";
 import { Chats } from "./components/Chats";
 import { ConnectorNodes } from "./components/ConnectorNodes";
 import { Conversation, emptyTurn, turnsDe, type Turn } from "./components/Conversation";
 import { Core, type CorePhase } from "./components/Core";
-import { GeracaoDialog } from "./components/GeracaoDialog";
-import { GrafoNeural, type Disparo } from "./components/GrafoNeural";
+import type { Disparo } from "./components/GrafoNeural";
 import { Icon } from "./components/Icon";
-import { IdiomaDialog } from "./components/IdiomaDialog";
 import { IntentBar } from "./components/IntentBar";
-import { MemoriaDialog } from "./components/MemoriaDialog";
-import { ModelManager } from "./components/ModelManager";
-import { PastasDialog } from "./components/PastasDialog";
 import { ResultCard } from "./components/ResultCard";
-import { RuntimeDialog } from "./components/RuntimeDialog";
-import { ServerDialog } from "./components/ServerDialog";
 import { TrustDial } from "./components/TrustDial";
-import { VozDialog } from "./components/VozDialog";
-import { api, message, onChatEvent, onMcpEvent, onMcpLagged, onVozEvent } from "./lib/api";
+import { api, message, onBancadaEvent, onChatEvent, onMcpEvent, onMcpLagged, onVozEvent } from "./lib/api";
 import { toolTitle } from "./lib/display";
 import { useIdioma } from "./lib/i18n";
 import type {
   AgentMode,
   AjustesGeracao,
+  BancadaEvento,
+  BancadaRodada,
   CallToolResult,
   ChatEvent,
   Connector,
@@ -43,7 +35,78 @@ import type {
   VozEvento,
 } from "./lib/types";
 
+/// Rota e dialogs por import dinâmico: nada aqui é pintado no primeiro quadro,
+/// e o que só aparece num clique não precisa estar no arquivo que o aplicativo
+/// lê ao abrir. Os componentes são exports nomeados, então `lazy` recebe o
+/// adaptador que devolve o `default` — o chunk continua sendo o módulo próprio.
+const GrafoNeural = lazy(() =>
+  import("./components/GrafoNeural").then((m) => ({ default: m.GrafoNeural })),
+);
+const AdaptadoresDialog = lazy(() =>
+  import("./components/AdaptadoresDialog").then((m) => ({ default: m.AdaptadoresDialog })),
+);
+const BancadaDialog = lazy(() =>
+  import("./components/BancadaDialog").then((m) => ({ default: m.BancadaDialog })),
+);
+const BancosDialog = lazy(() =>
+  import("./components/BancosDialog").then((m) => ({ default: m.BancosDialog })),
+);
+const GeracaoDialog = lazy(() =>
+  import("./components/GeracaoDialog").then((m) => ({ default: m.GeracaoDialog })),
+);
+const IdiomaDialog = lazy(() =>
+  import("./components/IdiomaDialog").then((m) => ({ default: m.IdiomaDialog })),
+);
+const MemoriaDialog = lazy(() =>
+  import("./components/MemoriaDialog").then((m) => ({ default: m.MemoriaDialog })),
+);
+const ModelManager = lazy(() =>
+  import("./components/ModelManager").then((m) => ({ default: m.ModelManager })),
+);
+const PastasDialog = lazy(() =>
+  import("./components/PastasDialog").then((m) => ({ default: m.PastasDialog })),
+);
+const RuntimeDialog = lazy(() =>
+  import("./components/RuntimeDialog").then((m) => ({ default: m.RuntimeDialog })),
+);
+const ServerDialog = lazy(() =>
+  import("./components/ServerDialog").then((m) => ({ default: m.ServerDialog })),
+);
+const VozDialog = lazy(() =>
+  import("./components/VozDialog").then((m) => ({ default: m.VozDialog })),
+);
+
 const SEM_MEDIDOR: MedidorVoz = { falando: false, ouvindo: false, nivel: 0 };
+
+const SEM_RODADA: BancadaRodada = { resultados: {}, andando: false, atual: null, modelo: null };
+
+/// Import dinâmico é leitura de disco: se o chunk não vier, o throw do React
+/// desmontaria a árvore inteira e a tela ficaria branca no meio de um turno. A
+/// borda devolve o motivo real na barra de falha que o aplicativo já usa.
+class FronteiraDeCarregamento extends Component<
+  { children: ReactNode },
+  { erro: string | null }
+> {
+  state: { erro: string | null } = { erro: null };
+
+  static getDerivedStateFromError(cause: unknown) {
+    return { erro: message(cause) };
+  }
+
+  render() {
+    if (this.state.erro !== null) {
+      return (
+        <div className="stage-alertas">
+          <div className="fault-bar" role="alert">
+            <Icon name="warning" />
+            <span>{this.state.erro}</span>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   const { id: idioma, t } = useIdioma();
@@ -75,6 +138,13 @@ export default function App() {
   const [showRuntime, setShowRuntime] = useState(false);
   const [showBancada, setShowBancada] = useState(false);
   const [showBancos, setShowBancos] = useState(false);
+  /// A rodada da bancada mora aqui, não no dialog. A folha é desmontada quando
+  /// fecha, e com ela sumia o que cada caso mediu — reabrir era obrigatório
+  /// rodar tudo de novo contra a placa. Pior: o núcleo continua correndo depois
+  /// de a folha fechar, e sem ouvinte aqui os resultados caiam no vazio.
+  const [bancadaCasos, setBancadaCasos] = useState<string[]>([]);
+  const [bancada, setBancada] = useState<BancadaRodada>(SEM_RODADA);
+  const [bancadaErro, setBancadaErro] = useState<string | null>(null);
   /// O runtime nativo nas pastas do carregador. Incompleto é o estado de um PC
   /// novo: os pesos baixam e a inferência não abre porque a DLL não está lá.
   const [runtime, setRuntime] = useState<RuntimePacote[]>([]);
@@ -143,6 +213,24 @@ export default function App() {
       setConnected(nextConnected);
       setMode(nextMode);
       setPending(nextPending);
+      /// `requests` só existe para segurar os argumentos que o evento
+      /// `approvalRequested` trouxe e que o `pending_approvals` não devolve.
+      /// O pedido morre no núcleo — resolvido, expirado ou derrubado com o
+      /// conector — então o snapshot que manda o cartão ir embora é também o
+      /// que manda a entrada ir junto: sem isto o mapa cresceria uma chave por
+      /// aprovação da vida inteira do processo. A poda é aqui, e não no clique
+      /// de resolver, porque só o refresh conhece todas as formas de morrer.
+      setRequests((current) => {
+        const vivos = new Set(nextPending.map((entrada) => entrada.id));
+        const proximo: Record<string, Record<string, unknown>> = {};
+        for (const [id, args] of Object.entries(current)) {
+          if (vivos.has(id)) proximo[id] = args;
+        }
+        // Nenhuma chave fora: devolve o objeto atual para não reacender render.
+        return Object.keys(proximo).length === Object.keys(current).length
+          ? current
+          : proximo;
+      });
       setCapabilities(nextTools);
       setPastas(nextPastas);
       setConcedidas(nextConcedidas);
@@ -295,7 +383,11 @@ export default function App() {
             turn.text = event.text;
             break;
           case "resumo":
-            turn.resumo = { texto: event.texto, mensagens: event.mensagens };
+            turn.resumo = {
+              texto: event.texto,
+              mensagens: event.mensagens,
+              descartadas: event.descartadas,
+            };
             break;
           case "memoria":
             turn.memoria = {
@@ -356,6 +448,64 @@ export default function App() {
       cancelled = true;
       unlisten?.();
     };
+  }, []);
+
+  useEffect(() => {
+    void api
+      .bancadaCasos()
+      .then(setBancadaCasos)
+      .catch((cause) => setBancadaErro(message(cause)));
+  }, []);
+
+  /// O ouvido fica aqui, vivo enquanto o aplicativo existe. A folha é só o
+  /// desenho: fechar a bancada no meio de uma rodada não desliga mais o
+  /// ouvinte, então o que o núcleo medir depois continua chegando.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const handle = (event: BancadaEvento) => {
+      setBancada((atual) => {
+        switch (event.type) {
+          case "iniciou":
+            return { resultados: {}, andando: true, atual: null, modelo: event.modelo };
+          case "caso":
+            return { ...atual, atual: event.id };
+          case "resultado":
+            return {
+              ...atual,
+              atual: null,
+              resultados: { ...atual.resultados, [event.id]: event },
+            };
+        }
+      });
+    };
+    void onBancadaEvent(handle).then((un) => {
+      if (cancelled) un();
+      else unlisten = un;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const rodarBancada = useCallback(async () => {
+    setBancadaErro(null);
+    try {
+      await api.bancadaRodar();
+    } catch (cause) {
+      setBancadaErro(message(cause));
+    } finally {
+      setBancada((atual) => ({ ...atual, andando: false, atual: null }));
+    }
+  }, []);
+
+  const pararBancada = useCallback(async () => {
+    try {
+      await api.bancadaParar();
+    } catch (cause) {
+      setBancadaErro(message(cause));
+    }
   }, []);
 
   useEffect(() => {
@@ -680,6 +830,11 @@ export default function App() {
     (ajustes.modelo !== "" || ajustes.pensamento || ajustes.semente !== 0)
   )
     marcasMenu.geracao = "ligada";
+  // A bancada também se vê daqui: uma rodada em curso continuava correndo sem
+  // ninguém olhando, e uma reprovada some quando a folha fecha.
+  if (bancada.andando) marcasMenu.bancada = "pulso";
+  else if (Object.values(bancada.resultados).some((r) => r.estado === "reprovado"))
+    marcasMenu.bancada = "aviso";
 
   /// Uma linha por tela: o Record completo é o que impede o menu de anunciar
   /// uma porta que o app não abre.
@@ -718,7 +873,9 @@ export default function App() {
         <header className="stage-top">
           <span className="brand">
             <span className="brand-mark" aria-hidden="true" />
-            Aether
+            {/* A marca é uma string visível como qualquer outra: vem do locale,
+                pela mesma chave que o hub do grafo já usa. */}
+            {t("ligacoes.aether")}
           </span>
           <span className="stage-actions">
             <button
@@ -759,13 +916,17 @@ export default function App() {
 
         <div className="stage-core">
           {palco === "grafo" ? (
-            <GrafoNeural
-              disparos={disparos}
-              sinal={connected.join("|")}
-              onConectar={(id) => void toggleConnector(id)}
-              onAdicionar={() => setShowServers(true)}
-              onChange={() => void refresh()}
-            />
+            <FronteiraDeCarregamento>
+              <Suspense fallback={<p className="sheet-note">{t("geral.carregando")}</p>}>
+                <GrafoNeural
+                  disparos={disparos}
+                  sinal={connected.join("|")}
+                  onConectar={(id) => void toggleConnector(id)}
+                  onAdicionar={() => setShowServers(true)}
+                  onChange={() => void refresh()}
+                />
+              </Suspense>
+            </FronteiraDeCarregamento>
           ) : (
             <Core phase={phase} />
           )}
@@ -877,69 +1038,86 @@ export default function App() {
           </div>
         )}
 
-        {showModels && (
-          <ModelManager
-            onClose={() => setShowModels(false)}
-            onLoaded={() => void refresh()}
-          />
-        )}
+        {/* Os dialogs são o caminho lento do import dinâmico: nada aqui existe
+            antes de um clique, então nada aqui pesa no chunk da abertura. A
+            moldura vazia enquanto o módulo chega é o estado real — não há
+            cartão para meio mostrar. */}
+        <FronteiraDeCarregamento>
+          <Suspense fallback={null}>
+            {showModels && (
+              <ModelManager
+                onClose={() => setShowModels(false)}
+                onLoaded={() => void refresh()}
+              />
+            )}
 
-        {showServers && (
-          <ServerDialog
-            connectors={connectors}
-            onRemove={(id) => void removeConnector(id)}
-            onSaved={() => void refresh()}
-            onClose={() => setShowServers(false)}
-          />
-        )}
+            {showServers && (
+              <ServerDialog
+                connectors={connectors}
+                onRemove={(id) => void removeConnector(id)}
+                onSaved={() => void refresh()}
+                onClose={() => setShowServers(false)}
+              />
+            )}
 
-        {showPastas && (
-          <PastasDialog
-            pastas={pastas}
-            onChange={setPastas}
-            onClose={() => setShowPastas(false)}
-          />
-        )}
+            {showPastas && (
+              <PastasDialog
+                pastas={pastas}
+                onChange={setPastas}
+                onClose={() => setShowPastas(false)}
+              />
+            )}
 
-        {showMemoria && (
-          <MemoriaDialog
-            onClose={() => setShowMemoria(false)}
-            onChange={() => void refresh()}
-          />
-        )}
+            {showMemoria && (
+              <MemoriaDialog
+                onClose={() => setShowMemoria(false)}
+                onChange={() => void refresh()}
+              />
+            )}
 
-        {showGeracao && (
-          <GeracaoDialog
-            onClose={() => setShowGeracao(false)}
-            onChange={() => void refresh()}
-          />
-        )}
+            {showGeracao && (
+              <GeracaoDialog
+                onClose={() => setShowGeracao(false)}
+                onChange={() => void refresh()}
+              />
+            )}
 
-        {showAjuste && (
-          <AdaptadoresDialog
-            onClose={() => setShowAjuste(false)}
-            onChange={() => void refresh()}
-          />
-        )}
+            {showAjuste && (
+              <AdaptadoresDialog
+                onClose={() => setShowAjuste(false)}
+                onChange={() => void refresh()}
+              />
+            )}
 
-        {showIdioma && <IdiomaDialog onClose={() => setShowIdioma(false)} />}
+            {showIdioma && <IdiomaDialog onClose={() => setShowIdioma(false)} />}
 
-        {showRuntime && (
-          <RuntimeDialog onClose={() => setShowRuntime(false)} onChange={refresh} />
-        )}
+            {showRuntime && (
+              <RuntimeDialog onClose={() => setShowRuntime(false)} onChange={refresh} />
+            )}
 
-        {showBancada && <BancadaDialog onClose={() => setShowBancada(false)} />}
+            {showBancada && (
+              <BancadaDialog
+                casos={bancadaCasos}
+                rodada={bancada}
+                erro={bancadaErro}
+                onRodar={() => void rodarBancada()}
+                onParar={() => void pararBancada()}
+                onClose={() => setShowBancada(false)}
+              />
+            )}
 
-        {showBancos && <BancosDialog onClose={() => setShowBancos(false)} />}
+            {showBancos && <BancosDialog onClose={() => setShowBancos(false)} />}
 
-        {showVoz && (
-          <VozDialog
-            estado={voz}
-            medidor={medidor}
-            onClose={() => setShowVoz(false)}
-            onRefresh={() => void refreshVoz()}
-          />
-        )}
+            {showVoz && (
+              <VozDialog
+                estado={voz}
+                medidor={medidor}
+                onClose={() => setShowVoz(false)}
+                onRefresh={() => void refreshVoz()}
+              />
+            )}
+          </Suspense>
+        </FronteiraDeCarregamento>
       </div>
     </div>
   );

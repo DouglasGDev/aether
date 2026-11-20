@@ -11,6 +11,7 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
 use tokio_postgres::NoTls;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::types::Type;
 
 use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql};
@@ -131,6 +132,37 @@ fn valor_para_texto(valor: &Value) -> Result<String> {
     }
 }
 
+/// A ficha do tokio-postgres, inteira, a partir do cadastro. É aqui, e só
+/// aqui, que a flag `tls_verificado` é lida neste motor.
+///
+/// Sem a marca, o modo fica `Prefer` — o de fábrica — e como este build só
+/// tem `NoTls`, `Prefer` derruba para texto puro sem avisar: exatamente o
+/// comportamento de sempre, preservado de propósito, porque um servidor local
+/// com certificado auto-assinado pararia de conectar.
+///
+/// Com a marca, o modo vira `Require`, o mais forte que este driver conhece.
+/// `Require` não aceita cair para texto puro: se o servidor não sobe para TLS,
+/// ou sobe e o `NoTls` deste build não sabe fazer o aperto de mão, a ligação
+/// falha com erro. Ou seja, a flag nunca é ignorada em silêncio — ela falha
+/// fechado. Para o canal ser cifrado *e* o certificado conferido de verdade
+/// falta um adaptador TLS no `Cargo.toml` (`tokio-postgres-rustls` ou
+/// `postgres-native-tls`); sem ele não há `MakeTlsConnect` neste crate, e
+/// inventar um estaria mentindo sobre o que a rede faz.
+fn ficha_de(conexao: &Conexao, senha: &str) -> tokio_postgres::Config {
+    let mut ficha = tokio_postgres::Config::new();
+    ficha.host(conexao.host.trim());
+    ficha.port(conexao.porta_efetiva());
+    ficha.user(conexao.usuario.trim());
+    ficha.dbname(conexao.banco.trim());
+    if !senha.is_empty() {
+        ficha.password(senha);
+    }
+    if conexao.tls_verificado {
+        ficha.ssl_mode(SslMode::Require);
+    }
+    ficha
+}
+
 impl Postgres {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         let senha = conexao.senha()?;
@@ -139,17 +171,7 @@ impl Postgres {
             .build()
             .map_err(|e| anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())])))?;
         let (cliente, driver) = runtime
-            .block_on(async {
-                let mut ficha = tokio_postgres::Config::new();
-                ficha.host(conexao.host.trim());
-                ficha.port(conexao.porta_efetiva());
-                ficha.user(conexao.usuario.trim());
-                ficha.dbname(conexao.banco.trim());
-                if !senha.is_empty() {
-                    ficha.password(senha.as_str());
-                }
-                ficha.connect(NoTls).await
-            })
+            .block_on(async { ficha_de(conexao, senha.as_str()).connect(NoTls).await })
             .map_err(erro_abrir)?;
         // O driver da conexão é uma tarefa à parte: sem ele rodando, nenhuma
         // consulta é respondida. Morre junto com o runtime, quando o motor é
@@ -579,4 +601,79 @@ fn erro_abrir(e: tokio_postgres::Error) -> anyhow::Error {
 
 fn erro(e: tokio_postgres::Error) -> anyhow::Error {
     anyhow!(tr("erros.bancoErro", &[("detalhe", &e.to_string())]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bancos::config::{conexao_de_teste, Tipo};
+
+    /// A escolha do canal sai da flag. O estado da ficha é legível de verdade
+    /// (`Config::get_ssl_mode`), então isto mede o que o driver vai fazer, não
+    /// uma cópia da decisão.
+    #[test]
+    fn a_flag_de_tls_escolhe_o_modo_ssl_da_ficha() {
+        let lisa = conexao_de_teste(Tipo::Postgres);
+        assert_eq!(
+            ficha_de(&lisa, "").get_ssl_mode(),
+            SslMode::Prefer,
+            "sem a marca fica o de fábrica, que com `NoTls` é texto puro como sempre"
+        );
+
+        let mut conferida = conexao_de_teste(Tipo::Postgres);
+        conferida.tls_verificado = true;
+        assert_eq!(
+            ficha_de(&conferida, "").get_ssl_mode(),
+            SslMode::Require,
+            "com a marca, o modo mais forte que este driver conhece: sem queda para texto puro"
+        );
+    }
+
+    /// Nem a porta, nem o host, nem o nome do banco mudam a postura: só a flag.
+    #[test]
+    fn o_numero_escrito_a_mao_nao_escolhe_o_canal() {
+        let mut outra_porta = conexao_de_teste(Tipo::Postgres);
+        outra_porta.porta = Some(5433);
+        outra_porta.host = "127.0.0.1".into();
+        outra_porta.banco = "outro".into();
+        assert_eq!(outra_porta.porta_efetiva(), 5433, "a porta dita continua valendo");
+        assert_eq!(ficha_de(&outra_porta, "").get_ssl_mode(), SslMode::Prefer);
+
+        outra_porta.tls_verificado = true;
+        assert_eq!(ficha_de(&outra_porta, "").get_ssl_mode(), SslMode::Require);
+    }
+
+    /// O endereço e a credencial não dependem da flag: a mesma conexão aponta
+    /// para o mesmo lugar com ou sem ela, e a senha só entra quando existe.
+    #[test]
+    fn a_flag_nao_troca_o_que_a_ficha_aponta() {
+        use tokio_postgres::config::Host;
+        let lisa = ficha_de(&conexao_de_teste(Tipo::Postgres), "");
+        let mut com_flag = conexao_de_teste(Tipo::Postgres);
+        com_flag.tls_verificado = true;
+        let conferida = ficha_de(&com_flag, "");
+        for ficha in [lisa, conferida] {
+            assert!(
+                matches!(ficha.get_hosts().first(), Some(Host::Tcp(h)) if h == "10.0.0.8"),
+                "a flag não escolhe o servidor"
+            );
+            assert_eq!(ficha.get_ports(), [5432], "a porta de fábrica de cada família");
+            assert_eq!(ficha.get_dbname(), Some("estoque"));
+        }
+    }
+
+    /// O que só um servidor de verdade responde: com a flag ligada contra um
+    /// Postgres que não fala TLS, a ligação tem de falhar; contra um que fala,
+    /// o `NoTls` deste build ainda assim tem de recusar — falhar fechado, nunca
+    /// cair para texto puro. Ignorado porque não há Postgres nesta máquina.
+    #[ignore = "precisa de um Postgres real; sem servidor não há aperto de mão para medir, e um falso diria o contrário do que a rede faz"]
+    #[test]
+    fn com_a_flag_ligada_texto_puro_nunca_e_aceito() {
+        let mut conferida = conexao_de_teste(Tipo::Postgres);
+        conferida.tls_verificado = true;
+        assert!(
+            Postgres::abrir(&conferida).is_err(),
+            "sem adaptador TLS neste build, a marca tem de barrar a ligação em vez de falar em claro"
+        );
+    }
 }

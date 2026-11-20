@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 /// Teto do que uma leitura devolve. Acima dele o modelo precisa pedir um trecho:
@@ -349,6 +350,20 @@ pub fn buscar(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
     ))
 }
 
+/// Uma escrita pode cair ao lado de outra: o chat e um cliente MCP loopback
+/// chamam a mesma ferramenta. É o que separa os temporários delas.
+static ESCRITAS: AtomicU64 = AtomicU64::new(0);
+
+/// Nome do temporário que vira o alvo: o nome inteiro do alvo, para um
+/// `aether-tmp` perdido na pasta dizer de que arquivo ele era, mais um sufixo
+/// único por escrita. Sem o sufixo, `LEIA-ME.md` e `LEIA-ME.txt` caem no mesmo
+/// nome, e a escrita que renomeia primeiro publica o corpo da outra.
+fn temporario_de(alvo: &Path) -> PathBuf {
+    let nome = alvo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let vez = ESCRITAS.fetch_add(1, Ordering::Relaxed);
+    alvo.with_file_name(format!("{nome}.aether-tmp.{}.{}", std::process::id(), vez))
+}
+
 /// Escreve por arquivo temporário e renomeia: uma queda no meio não deixa o
 /// arquivo original pela metade.
 fn escrever_atomico(alvo: &Path, conteudo: &str) -> Result<()> {
@@ -360,10 +375,7 @@ fn escrever_atomico(alvo: &Path, conteudo: &str) -> Result<()> {
             ))
         })?;
     }
-    let temporario = alvo.with_extension(format!(
-        "{}aether-tmp",
-        alvo.extension().map(|e| format!("{}.", e.to_string_lossy())).unwrap_or_default()
-    ));
+    let temporario = temporario_de(alvo);
     let resultado = (|| -> std::io::Result<()> {
         let mut arquivo = OpenOptions::new().write(true).create(true).truncate(true).open(&temporario)?;
         arquivo.write_all(conteudo.as_bytes())?;
@@ -746,8 +758,44 @@ mod tests {
         assert!(criado);
         assert_eq!(linhas, 1);
         assert_eq!(bytes, 13);
-        assert!(!alvo.with_extension("rsaether-tmp").exists());
+        let sobras: Vec<String> = fs::read_dir(alvo.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|nome| nome.contains("aether-tmp"))
+            .collect();
+        assert!(sobras.is_empty(), "a escrita deixou {sobras:?} na pasta");
         limpar(&raiz);
+    }
+
+    /// Duas escritas na mesma pasta não podem disputar um mesmo temporário: se
+    /// `LEIA-ME.md` e `LEIA-ME.txt` caem no mesmo nome, quem renomeia primeiro
+    /// publica o corpo do outro.
+    #[test]
+    fn dois_alvos_com_o_mesmo_tronco_tem_temporarios_diferentes() {
+        let um = temporario_de(Path::new("p/LEIA-ME.md"));
+        let dois = temporario_de(Path::new("p/LEIA-ME.txt"));
+        assert_ne!(um, dois, "{} e {} escreveriam no mesmo arquivo", um.display(), dois.display());
+        let tres = temporario_de(Path::new("p/LEIA-ME.md"));
+        assert_ne!(um, tres, "duas escritas do mesmo arquivo não podem se atropelar");
+    }
+
+    /// O temporário é um arquivo ao lado do alvo, não uma mudança de extensão:
+    /// um alvo sem extensão (`Makefile`) continua tendo onde escrever.
+    #[test]
+    fn um_alvo_sem_extensao_tem_temporario_ao_lado() {
+        let alvo = Path::new("p/Makefile");
+        let temporario = temporario_de(alvo);
+        assert_eq!(temporario.parent(), alvo.parent());
+        assert!(
+            temporario
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("Makefile"),
+            "{}",
+            temporario.display()
+        );
     }
 
     #[test]

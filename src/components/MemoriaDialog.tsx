@@ -12,7 +12,9 @@ import type {
   ModoMemoria,
   RespostaMemoria,
 } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
+import { BarraDeTrabalho, Regua } from "./BarraDeTrabalho";
 
 interface Props {
   onClose: () => void;
@@ -63,6 +65,7 @@ const AUTO_KEY: Record<AutoMemoria, string> = {
 };
 
 export function MemoriaDialog({ onClose, onChange }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
   const [estado, setEstado] = useState<EstadoMemoria | null>(null);
@@ -268,10 +271,11 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
     );
   }
 
-  const percent =
-    estado.progresso.total > 0
-      ? Math.min(100, (estado.progresso.concluidos / estado.progresso.total) * 100)
-      : 0;
+  /// Os dois caminhos da falha: a rejeição deste aqui agora e o motivo que o
+  /// núcleo guardou da última varredura (`memoria.rs` só limpa quando uma
+  /// varredura nova começa). Reabrir a janela sem o segundo apagaria a prova de
+  /// que o índice falhou.
+  const falha = erro ?? estado.erro;
 
   return (
     <div className="modal" role="dialog" aria-modal="true" aria-label={t("memoria.titulo")}>
@@ -378,60 +382,37 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
           </div>
         </div>
 
-        {ESCALAS.map((escala) => {
-          const valor = ajustes[escala.chave];
-          return (
-            <label className="field" key={escala.chave}>
-              <span className="field-label">
-                {t(`memoria.${escala.chave}`)}
-                <span className="geracao-valor">
-                  {numero(valor, idioma, escala.casas)}
-                </span>
-              </span>
-              <input
-                type="range"
-                min={escala.minimo}
-                max={escala.maximo}
-                step={escala.passo}
-                value={valor}
-                disabled={ocupada}
-                aria-label={t(`memoria.${escala.chave}`)}
-                onChange={(event) =>
-                  setAjustes({ ...ajustes, [escala.chave]: Number(event.target.value) })
-                }
-                onPointerUp={() => void gravar(ajustes)}
-                onBlur={() => void gravar(ajustes)}
-              />
-            </label>
-          );
-        })}
+        {ESCALAS.map((escala) => (
+          <Regua
+            key={escala.chave}
+            titulo={t(`memoria.${escala.chave}`)}
+            valor={ajustes[escala.chave]}
+            minimo={escala.minimo}
+            maximo={escala.maximo}
+            passo={escala.passo}
+            casas={escala.casas}
+            ocupada={ocupada}
+            aoMudar={(novo) => setAjustes({ ...ajustes, [escala.chave]: novo })}
+            aoGravar={() => void gravar(ajustes)}
+          />
+        ))}
 
         <div className="memoria-varredura">
           {estado.indexando ? (
-            <div className="model-job">
-              <span className="model-job-phase">{estado.progresso.arquivo}</span>
-              <span className="model-bar">
-                <span
-                  className="model-bar-fill"
-                  style={{ width: `${percent}%` }}
-                />
-              </span>
-              <span className="model-job-read">
-                {`${numero(estado.progresso.concluidos, idioma, 0)}/`}
-                {numero(estado.progresso.total, idioma, 0)}
-                {` · ${t("memoria.trechosIndexados", {
-                  n: numero(estado.progresso.trechos, idioma, 0),
-                })}`}
-              </span>
-              <button
-                type="button"
-                className="icon-only"
-                onClick={() => void agir(() => api.ragIndexarCancelar())}
-                aria-label={t("memoria.parar")}
-              >
-                <Icon name="cross" />
-              </button>
-            </div>
+            <BarraDeTrabalho
+              fase={estado.progresso.arquivo}
+              feito={estado.progresso.concluidos}
+              total={estado.progresso.total}
+              leitura={`${numero(estado.progresso.concluidos, idioma, 0)}/${numero(
+                estado.progresso.total,
+                idioma,
+                0,
+              )} · ${t("memoria.trechosIndexados", {
+                n: numero(estado.progresso.trechos, idioma, 0),
+              })}`}
+              aoCancelar={() => void agir(() => api.ragIndexarCancelar())}
+              rotuloCancelar={t("memoria.parar")}
+            />
           ) : (
             <div className="model-actions">
               <button
@@ -543,10 +524,10 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
           )}
         </div>
 
-        {erro !== null && (
+        {falha !== null && (
           <p className="sheet-error" role="alert">
             <Icon name="warning" />
-            {erro}
+            {falha}
           </p>
         )}
       </div>
@@ -598,10 +579,6 @@ function Linha({
 }: LinhaProps) {
   const t = useT();
   const interrompido = modelo.partialBytes > 0 && !modelo.complete;
-  const percent =
-    job !== undefined && job.total > 0
-      ? Math.min(100, (job.done / job.total) * 100)
-      : 0;
 
   return (
     <div className={emUso ? "model-variant loaded" : "model-variant"}>
@@ -623,24 +600,14 @@ function Linha({
       </div>
 
       {job !== undefined ? (
-        <div className="model-job">
-          <span className="model-job-phase">{t("modelos.pesos")}</span>
-          <span className="model-bar">
-            <span className="model-bar-fill" style={{ width: `${percent}%` }} />
-          </span>
-          <span className="model-job-read">
-            {job.total > 0 ? `${numero(percent, idioma, 1)}%` : "—"}
-            {job.speed > 0 && ` · ${bytes(job.speed, idioma)}/s`}
-          </span>
-          <button
-            type="button"
-            className="icon-only"
-            onClick={onCancelar}
-            aria-label={t("modelos.cancelar", { nome: modelo.display })}
-          >
-            <Icon name="cross" />
-          </button>
-        </div>
+        <BarraDeTrabalho
+          fase={t("modelos.pesos")}
+          feito={job.done}
+          total={job.total}
+          velocidade={job.speed}
+          aoCancelar={onCancelar}
+          rotuloCancelar={t("modelos.cancelar", { nome: modelo.display })}
+        />
       ) : (
         <div className="model-actions">
           {modelo.complete && (

@@ -774,18 +774,31 @@ export function GrafoNeural({
 
   /// Ajustar é encostar a lente na moldura: o mundo inteiro à vista, porque uma
   /// janela que corta metade dos cartões não mostra a ligação de nada. Para de
-  /// valer no instante em que alguém mexe no zoom.
+  /// valer no instante em que alguém mexe no zoom. A moldura também muda sem
+  /// gesto nenhum — a janela do aplicativo foi arrastada, a lista de conversas
+  /// abriu ao lado — e sem o `ResizeObserver` o reenquadramento só rodava quando
+  /// uma dependência mudasse, deixando o grafo cortado até o próximo clique.
   useEffect(() => {
     if (!ajustada) return;
     const caixa = quadro.current;
     if (caixa === null) return;
-    setZoom(
-      limitar(
-        Math.min(1, caixa.clientWidth / LARGURA, caixa.clientHeight / mundoHoje.altura),
-        AJUSTE_MINIMO,
-        ZOOM_MAXIMO,
-      ),
-    );
+    const reenquadrar = () => {
+      setZoom(
+        limitar(
+          Math.min(
+            1,
+            caixa.clientWidth / LARGURA,
+            caixa.clientHeight / mundoHoje.altura,
+          ),
+          AJUSTE_MINIMO,
+          ZOOM_MAXIMO,
+        ),
+      );
+    };
+    reenquadrar();
+    const observador = new ResizeObserver(reenquadrar);
+    observador.observe(caixa);
+    return () => observador.disconnect();
   }, [ajustada, central, mundoHoje]);
 
   /// Central o Aether na lente atual. A moldura não muda de tamanho com o zoom,
@@ -908,6 +921,15 @@ export function GrafoNeural({
             >
               {fios.map((linha) => {
                 const pulso = disparos[linha.chave];
+                /// O tempo do fio é o que o núcleo mediu e devolveu no
+                /// `toolResult`/`memoria`. Enquanto a sinapse dispara não há
+                /// número ainda — e o traço é o que a casa já usa para "não
+                /// medido" (RuntimeDialog, ToolCard). Um `0 ms` inventado
+                /// diria "instantâneo" justamente para a chamada em curso.
+                const medida =
+                  pulso === undefined || typeof pulso.ms !== "number"
+                    ? null
+                    : `${pulso.ms} ms`;
                 return (
                   <g key={linha.chave}>
                     <path
@@ -934,7 +956,7 @@ export function GrafoNeural({
                       <title>
                         {pulso === undefined
                           ? linha.rotulo
-                          : `${linha.rotulo} · ${pulso.ms ?? 0} ms`}
+                          : `${linha.rotulo} · ${medida ?? "—"}`}
                       </title>
                     </path>
                   </g>

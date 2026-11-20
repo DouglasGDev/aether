@@ -17,7 +17,7 @@ use crate::idiomas::{self, tr};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Medido no Granite 4.2 3B: system prompt curto e em português é o que o modelo
@@ -85,8 +85,9 @@ pub enum SessionEvent {
     Replace { text: String },
     /// O modelo dobrou turnos antigos no resumo para caber na janela. Não é
     /// recado de rodapé: é o assistente dizendo que parou de ler aquilo ao pé da
-    /// letra, e o que ele escreveu no lugar.
-    Resumo { texto: String, mensagens: usize, tokens: usize },
+    /// letra, e o que ele escreveu no lugar. `mensagens` é o que ele leu, não o
+    /// que saiu do prompt: o que saiu sem ser lido está em `descartadas`.
+    Resumo { texto: String, mensagens: usize, descartadas: usize, tokens: usize },
     ToolCall { name: String, arguments: serde_json::Value },
     /// O que a injeção automática pôs no prompt antes do primeiro token. Não é
     /// uma ferramenta que o modelo pediu: é memória que ele recebeu sem ter que
@@ -273,7 +274,30 @@ fn visible_end(raw: &str, from: usize) -> usize {
 /// O histórico é compartilhado com a UI, que o lê durante a geração. O lock é
 /// tomado só pelo tempo de um push, nunca segurado enquanto o modelo gera.
 fn push(history: &Mutex<Vec<ChatMessage>>, message: ChatMessage) {
-    history.lock().expect("histórico envenenado").push(message);
+    trava_historico(history).push(message);
+}
+
+/// Trava do histórico com a política de envenenamento do projeto (A8): devolve a
+/// conversa, não um panic. Toda mutação feita sob esta trava é uma operação
+/// **inteira** do vetor — `push`, `pop`, `clear`, atribuição — e nenhuma delas
+/// deixa um `Vec<ChatMessage>` pela metade quando um panic passa por cima: ou o
+/// elemento entra, ou não entra (e o que faz a alocação falhar aborta o processo
+/// em vez de fazer unwind). O que um panic segurando esta trava pode deixar é a
+/// conversa como ela estava.
+///
+/// E o panic cairia na thread errada: `chat_history` e `ai_status` são comandos
+/// síncronos que leem esta mesma trava sem `Result` na assinatura — recuperar é
+/// a única saída que devolve alguma coisa à tela. Onde o estado **não** é
+/// recuperável (o motor, com pesos que podem ter sido montados pela metade) a
+/// política é outra, e está documentada em `state::AiRuntime::trava_motor`.
+pub fn trava_historico(history: &Mutex<Vec<ChatMessage>>) -> MutexGuard<'_, Vec<ChatMessage>> {
+    history.lock().unwrap_or_else(|envenenado| envenenado.into_inner())
+}
+
+/// Trava do resumo da conversa viva, com a mesma política e a mesma razão do
+/// histórico acima: `Option<Resumo>` só muda por atribuição inteira.
+pub fn trava_resumo(resumo: &Mutex<Option<Resumo>>) -> MutexGuard<'_, Option<Resumo>> {
+    resumo.lock().unwrap_or_else(|envenenado| envenenado.into_inner())
 }
 
 /// O que um resultado de ferramenta deixa no histórico. O cartão da pessoa já
@@ -556,7 +580,7 @@ pub fn run_turn(
         }
         // A conversa viva, fora do lock: dobrar é um turno de geração, e segurar
         // o histórico enquanto o modelo escreve é prender a tela que o lê.
-        let conversa = history.lock().expect("histórico envenenado").to_vec();
+        let conversa = trava_historico(history).to_vec();
         let (ids, dobradas) = loop {
             let decidido =
                 encaixe(engine, template, &conversa, config, cabecilha.as_deref(), resumo.as_ref())?;
@@ -566,7 +590,7 @@ pub fn run_turn(
                     if cancel.load(Ordering::Relaxed) {
                         bail!(tr("erros.pedidoCancelado", &[]));
                     }
-                    let (texto, gasto) = compactacao::dobrar(
+                    let (texto, gasto, lidas) = compactacao::dobrar(
                         engine,
                         template,
                         config.params,
@@ -585,7 +609,12 @@ pub fn run_turn(
                     decode_ms += gasto.decode_ms;
                     emit(SessionEvent::Resumo {
                         texto: texto.clone(),
-                        mensagens: ate - desde,
+                        mensagens: lidas,
+                        // O trecho saiu do prompt inteiro; o que não coube na
+                        // régua do resumo não foi lido nem condensado. Esconder
+                        // essa conta é a mesma falta de dizer que dobrou o que
+                        // não dobrou — com um número a menos na tela.
+                        descartadas: (ate - desde).saturating_sub(lidas),
                         tokens: gasto.generated_tokens,
                     });
                     resumo = Some(Resumo { texto, ate });
@@ -788,6 +817,38 @@ pub fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vermelho-primeiro (A8): `push` fazia `expect("histórico envenenado")` e
+    /// derrubava a thread. O histórico é `Vec<ChatMessage>` e toda mutação feita
+    /// sob esta trava é uma operação **inteira** do vetor (`push`, `pop`,
+    /// `clear`, atribuição): um panic segurando-a não deixa lista pela metade,
+    /// deixa a conversa. E o panic cairia na thread errada — `chat_history` e
+    /// `ai_status` são comandos síncronos que leem esta mesma trava sem `Result`
+    /// na assinatura, então não há motivo real a devolver: o que há é a
+    /// conversa, e é ela que tem de voltar.
+    #[test]
+    fn o_historico_envenenado_devolve_a_conversa_em_vez_de_panicar() {
+        let historia = std::sync::Arc::new(Mutex::new(vec![ChatMessage::new(
+            "user",
+            "a primeira fala",
+        )]));
+        let dentro = std::sync::Arc::clone(&historia);
+        let envenenador = std::thread::spawn(move || {
+            let _guard = dentro.lock().expect("histórico envenenado");
+            panic!("um panic segurando o histórico");
+        });
+        let _ = envenenador.join();
+        assert!(historia.is_poisoned(), "o teste não envenenou a trava do histórico");
+
+        push(&historia, ChatMessage::new("assistant", "a resposta"));
+
+        // Lido com a política explícita do teste, não com a do código: o que se
+        // confere aqui é que `push` escreveu na conversa recuperada.
+        let viva = historia.lock().unwrap_or_else(|envenenado| envenenado.into_inner());
+        assert_eq!(viva.len(), 2, "a conversa envenenada perdeu linhas");
+        assert_eq!(viva[0].content, "a primeira fala");
+        assert_eq!(viva[1].content, "a resposta");
+    }
 
     fn call_block(name: &str) -> String {
         format!(

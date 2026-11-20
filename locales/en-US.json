@@ -4,7 +4,8 @@
     "titulo": "Language",
     "escolher": "Choose language",
     "sistema": "System language",
-    "descricao": "All application text comes from the languages folder."
+    "descricao": "All application text comes from the languages folder.",
+    "recusa": "the core did not accept the language: {motivo}"
   },
   "geral": {
     "fechar": "Close",
@@ -32,7 +33,9 @@
     "itens": "items",
     "truncado": "showing only the beginning",
     "nenhumDado": "No data required",
-    "listaValores": "value, value, value"
+    "listaValores": "value, value, value",
+    "invalidoNumero": "expects a number",
+    "invalidoJson": "must be valid JSON"
   },
   "app": {
     "grafo": "Show the wiring",
@@ -49,7 +52,10 @@
     "motor": "Engine",
     "conexoes": "Connections",
     "local": "Local",
-    "sistema": "System"
+    "sistema": "System",
+    "marcaLigada": "adjustment on",
+    "marcaAviso": "something is missing",
+    "marcaPulso": "happening now"
   },
   "voz": {
     "titulo": "Voice",
@@ -117,6 +123,7 @@
     "resumo": "Summary of the earlier messages in this conversation — their text is no longer here: {texto}",
     "resumoTitulo": "Summary",
     "resumoMensagens": "{n} messages folded",
+    "resumoDescartadas": "{n} left out of the summary",
     "codigoLinhas": "{n} lines",
     "codigoSemLinguagem": "code",
     "mostrarTudo": "Show all",
@@ -836,10 +843,13 @@
     "falhaChamarFerramenta": "failed to call the tool: {detalhe}",
     "falhaIniciarServidor": "couldn't start the server process",
     "falhaConectarServidor": "couldn't connect to the server: {detalhe}",
+    "servidorSemResposta": "the server {id} didn't answer the handshake within {segundos}s; it starts but never speaks",
     "downloadCancelado": "download canceled",
     "modeloBaixando": "this model is already being downloaded",
     "modeloEmUso": "the model is in use; start another conversation before deleting it",
     "motorOcupado": "the engine is busy loading or switching the model; try again in a moment",
+    "motorEnvenenado": "the engine lock was poisoned by an internal error; the model in memory was dropped and will load again on the next request",
+    "corpoTrocado": "the downloaded body of {arquivo} is not what the repository publishes, even after {recomecos} restarts from zero",
     "modeloIncompleto": "the model {nome} isn't complete on disk",
     "modeloFixoIncompleto": "the pinned model {nome} isn't complete on disk — download it or let the router decide",
     "semPastas": "no folder was granted; grant a folder before touching files",
@@ -1051,6 +1061,7 @@
     "servidorMcpParar": "the MCP server did not stop",
     "servidorMcpToken": "could not draw the MCP server token: {detalhe}",
     "bancoAbrir": "could not open the database connection: {detalhe}",
+    "bancoSemTls": "the {tipo} connector cannot speak TLS in this app: the connection was refused instead of going on in plain text",
     "bancoErro": "the database refused the operation: {detalhe}",
     "bancoArquivoFaltando": "a SQLite connection needs the database file",
     "bancoValoresVazios": "the values are empty: provide at least one column",
@@ -1118,6 +1129,7 @@
     "senhaGuardada": "leave empty to keep the saved password",
     "campoLimite": "Row limit",
     "campoSqlLivre": "Free SQL",
+    "campoTls": "Verified TLS",
     "descobrir": "Discover tables",
     "descobrindo": "Discovering…",
     "salvando": "Saving…",

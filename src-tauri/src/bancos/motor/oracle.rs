@@ -160,6 +160,26 @@ pub struct Oracle {
     conexao: Connection,
 }
 
+/// A string Easy Connect desta conexão — a única leitura da flag
+/// `tls_verificado` neste motor, e ela muda só o protocolo da string.
+///
+/// Sem a marca, a forma lisa de sempre (`host:porta/serviço`), que o driver
+/// resolve como TCP puro: é o que havia antes, e é o que continua havendo para
+/// quem não marcou nada. Com a marca, o prefixo `tcps://`: o próprio
+/// `oracledb` decide o canal pelo protocolo escrito na string, e o TLS que ele
+/// monta em cima é `rustls`, compilado sem feature nenhuma — conferir
+/// `Cargo.lock` na entrada de `oracledb`. Não é número escrito à mão: a porta
+/// é a mesma dos dois lados.
+fn string_de_conexao(conexao: &Conexao) -> String {
+    let servidor = format!("{}:{}", conexao.host.trim(), conexao.porta_efetiva());
+    let servico = conexao.banco.trim();
+    if conexao.tls_verificado {
+        format!("tcps://{servidor}/{servico}")
+    } else {
+        format!("{servidor}/{servico}")
+    }
+}
+
 impl Oracle {
     pub fn abrir(ficha: &Conexao) -> Result<Self> {
         let usuario = ficha.usuario.trim().to_string();
@@ -169,10 +189,10 @@ impl Oracle {
         if ficha.banco.trim().is_empty() {
             bail!(tr("erros.bancoNomeBancoFaltando", &[]));
         }
-        // Easy Connect: host:porta/serviço. O driver fala TNS por baixo; a
-        // string é a forma que o protocolo aceita sem tnsnames.ora.
-        let string_conexao =
-            format!("{}:{}/{}", ficha.host.trim(), ficha.porta_efetiva(), ficha.banco.trim());
+        // Easy Connect: host:porta/serviço (ou tcps://host:porta/serviço com a
+        // flag ligada). O driver fala TNS por baixo; a string é a forma que o
+        // protocolo aceita sem tnsnames.ora.
+        let string_conexao = string_de_conexao(ficha);
         let config = ConfigOracle::default()
             .set_connect_string(&string_conexao)
             .map_err(erro)?
@@ -593,6 +613,44 @@ impl Motor for Oracle {
             self.conexao.commit().map_err(erro)?;
             Ok(ResultadoSql::Afetadas(resultado.rows_affected()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bancos::config::{conexao_de_teste, Tipo};
+
+    /// A flag é a única coisa que muda a string, e ela muda só o protocolo: o
+    /// mesmo servidor, a mesma porta de fábrica e o mesmo serviço dos dois
+    /// lados. É o que este motor pode medir sem servidor — o `tcps://` é a
+    /// resposta; o aperto de mão em cima dele é do `rustls` do driver.
+    #[test]
+    fn a_marca_troca_so_o_protocolo_da_string() {
+        let lisa = conexao_de_teste(Tipo::Oracle);
+        assert_eq!(
+            string_de_conexao(&lisa),
+            "10.0.0.8:1521/estoque",
+            "sem a marca continua a forma de sempre"
+        );
+
+        let mut conferida = conexao_de_teste(Tipo::Oracle);
+        conferida.tls_verificado = true;
+        assert_eq!(
+            string_de_conexao(&conferida),
+            "tcps://10.0.0.8:1521/estoque",
+            "com a marca, só o protocolo muda"
+        );
+    }
+
+    /// Uma porta dita pelo dono vale com ou sem a flag — a marca não empurra a
+    /// conexão para a de fábrica.
+    #[test]
+    fn a_marca_nao_amassa_a_porta_dita() {
+        let mut conferida = conexao_de_teste(Tipo::Oracle);
+        conferida.porta = Some(2484);
+        conferida.tls_verificado = true;
+        assert_eq!(string_de_conexao(&conferida), "tcps://10.0.0.8:2484/estoque");
     }
 }
 

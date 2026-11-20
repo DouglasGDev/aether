@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use mongodb::{
     Client,
     bson::{Bson, Document as DocBson, doc},
-    options::{ClientOptions, Credential, ServerAddress},
+    options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions},
 };
 use serde_json::{Map, Value};
 use std::time::Duration;
@@ -236,6 +236,19 @@ fn erro(e: mongodb::error::Error) -> anyhow::Error {
     anyhow!(tr("erros.bancoErro", &[("detalhe", &e.to_string())]))
 }
 
+/// O que a flag `tls_verificado` pede desta conexão. É a única leitura dela
+/// neste motor, e não há número escrito à mão: `TlsOptions::default()` deixa
+/// `allow_invalid_certificates` vazio, que no driver quer dizer "erro se o
+/// servidor apresentar certificado inválido" — a cadeia conferida é a da
+/// máquina do dono (as raízes que o `rustls-tls`, feature padrão do `mongodb`,
+/// já trazem compilado).
+///
+/// Sem a marca devolve `None`, e `None` é o defeito do driver: TLS desligado,
+/// como sempre foi aqui.
+fn tls_da(conexao: &Conexao) -> Option<Tls> {
+    conexao.tls_verificado.then(|| Tls::Enabled(TlsOptions::default()))
+}
+
 impl Mongo {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         if conexao.banco.trim().is_empty() {
@@ -250,6 +263,7 @@ impl Mongo {
             .connect_timeout(Some(Duration::from_secs(10)))
             .server_selection_timeout(Some(Duration::from_secs(10)))
             .build();
+        opcoes.tls = tls_da(conexao);
         if !conexao.usuario.trim().is_empty() {
             opcoes.credential = Some(
                 Credential::builder()
@@ -481,6 +495,7 @@ impl Motor for Mongo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bancos::config::{conexao_de_teste, Tipo};
     use crate::bancos::motor::filtro_de;
     use serde_json::json;
 
@@ -518,5 +533,39 @@ mod tests {
         let filtro =
             filtro_de(Some(&json!({"campo": {"op": "igual", "valor": {"a": 1}}}))).unwrap();
         assert!(filtro_bson(&filtro).is_ok());
+    }
+
+    /// A escolha de TLS sai da flag, não de um número: sem marca o driver
+    /// continua com o defeito de sempre (desligado); com ela, entra a opção
+    /// padrão do driver, que é conferir o certificado.
+    #[test]
+    fn a_flag_de_tls_escolhe_a_opcao_do_driver() {
+        let lisa = conexao_de_teste(Tipo::Mongo);
+        assert_eq!(tls_da(&lisa), None, "sem a marca fica o defeito do driver, como hoje");
+
+        let mut outra_porta = conexao_de_teste(Tipo::Mongo);
+        outra_porta.porta = Some(27018);
+        outra_porta.host = "127.0.0.1".into();
+        assert_eq!(tls_da(&outra_porta), None, "nem a porta, nem o host ligam o TLS");
+
+        let mut conferida = conexao_de_teste(Tipo::Mongo);
+        conferida.tls_verificado = true;
+        assert_eq!(
+            tls_da(&conferida),
+            Some(Tls::Enabled(TlsOptions::default())),
+            "com a marca, as opções do driver sem exceção de certificado"
+        );
+    }
+
+    /// O que só um servidor de verdade responde: com a flag ligada, um Mongo
+    /// que não fala TLS tem de recusar a conexão; um que fala TLS com
+    /// certificado auto-assinado tem de ser barrado pela cadeia. Ignorado
+    /// porque não há mongod nesta máquina.
+    #[ignore = "precisa de um servidor Mongo real com --tlsMode; sem ele não há aperto de mão para medir"]
+    #[test]
+    fn tls_conferido_so_falha_com_servidor_verdadeiro() {
+        let mut conferida = conexao_de_teste(Tipo::Mongo);
+        conferida.tls_verificado = true;
+        assert!(Mongo::abrir(&conferida).is_err());
     }
 }

@@ -290,9 +290,12 @@ async fn rodar_npm(
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: nada de console na tela.
 
-    let mut filho = cmd.spawn().map_err(|e| {
-        anyhow!(tr("erros.falhaIniciarInstalador", &[("detalhe", &e.to_string())]))
-    })?;
+    let mut filho = cmd
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            anyhow!(tr("erros.falhaIniciarInstalador", &[("detalhe", &e.to_string())]))
+        })?;
 
     let stdout = filho.stdout.take().ok_or_else(|| {
         anyhow!(tr("erros.falhaIniciarInstalador", &[("detalhe", "stdout")]))
@@ -301,10 +304,21 @@ async fn rodar_npm(
         anyhow!(tr("erros.falhaIniciarInstalador", &[("detalhe", "stderr")]))
     })?;
 
+    // O cano de stderr cabe alguns kilobytes: quem escreve mais que isso para
+    // até alguém ler. Ler o despejo depois do `wait()` era esperar que um
+    // processo bloqueado terminasse sozinho — o instalador pendurava para
+    // sempre num npm que só fala pelos warnings. A leitura corre ao lado.
+    let derrame = tokio::spawn(async move {
+        let mut texto = String::new();
+        let _ = stderr.read_to_string(&mut texto).await;
+        texto
+    });
+
     let mut saida = String::new();
     let mut linhas = BufReader::new(stdout).lines();
     loop {
         if cancel.load(Ordering::Relaxed) {
+            derrame.abort();
             let _ = filho.start_kill();
             let _ = filho.wait().await;
             bail!(tr("erros.instalacaoCancelada", &[]));
@@ -325,8 +339,10 @@ async fn rodar_npm(
     }
 
     let status = filho.wait().await.context(tr("erros.instalacaoSemSaida", &[]))?;
-    let mut erro = String::new();
-    stderr.read_to_string(&mut erro).await.ok();
+    // O cano fecha quando o processo morre, então esta espera termina. Uma
+    // tarefa que estourou deixa o stderr vazio, e a mensagem cai na saída
+    // padrão — o mesmo caminho de antes, quando não havia nada para ler.
+    let erro = derrame.await.unwrap_or_default();
     if !status.success() {
         let cauda = erro.trim();
         return Err(anyhow!(tr("erros.instaladorFalhou", &[
@@ -553,6 +569,35 @@ mod testes {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("pasta de teste");
         dir
+    }
+
+    /// O cano de stderr de um processo tem poucos kilobytes. Quem escreve mais
+    /// que isso para de escrever até alguém ler, e a leitura do stderr estava
+    /// depois do `wait()`: quem deveria ler está esperando o processo terminar.
+    /// Um npm que despeja warnings vira um instalador que nunca volta, e a única
+    /// saída era o *Parar*. Este teste é o travamento, medido pelo prazo.
+    #[tokio::test]
+    async fn um_filho_que_inunda_o_stderr_nao_prende_o_instalador() {
+        let dir = pasta_temporaria("stderr-cheio");
+        let arquivo = dir.join("despejo.txt");
+        fs::write(&arquivo, "x".repeat(200_000)).expect("arquivo de despejo");
+
+        let cancel = AtomicBool::new(false);
+        let despejo = [format!("type {} 1>&2", arquivo.display())];
+        let corrida = rodar_npm(
+            Path::new("cmd"),
+            Path::new("/C"),
+            &despejo,
+            &cancel,
+            |_| {},
+        );
+        let prazo = tokio::time::timeout(std::time::Duration::from_secs(10), corrida).await;
+        let _ = fs::remove_dir_all(&dir);
+
+        let terminou = prazo.unwrap_or_else(|_| {
+            panic!("o instalador ficou 10 s pendurado num processo que só despejou stderr")
+        });
+        terminou.expect("o despejo de stderr saiu com erro");
     }
 
     /// Cria o esqueleto de um pacote npm instalado de verdade: manifesto e o

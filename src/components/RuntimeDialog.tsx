@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, message, onRuntimeEvent } from "../lib/api";
-import { bytes, inteiro, numero } from "../lib/display";
+import { bytes, inteiro } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
 import type {
   RuntimeEvento,
   RuntimePacote,
   RuntimeVeredito,
 } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
+import { BarraDeTrabalho } from "./BarraDeTrabalho";
 
 interface Props {
   onClose: () => void;
@@ -25,6 +27,7 @@ interface Job {
 /// a inferência não abre. Esta tela é o passo que faltava — baixar o pacote
 /// oficial, conferir cada hash e pô-lo onde o carregador procura.
 export function RuntimeDialog({ onClose, onChange }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
   const [pacotes, setPacotes] = useState<RuntimePacote[]>([]);
@@ -33,10 +36,14 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
   const [faults, setFaults] = useState<Record<string, string>>({});
   const [conferindo, setConferindo] = useState(false);
   const [erro, setErro] = useState<string | null>(null);
+  /// A primeira leitura terminou. Sem isto, a lista vazia de um
+  /// `runtime_estado` que ainda não respondeu é exibida como "não há pacotes".
+  const [lido, setLido] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
       setPacotes(await api.runtimeEstado());
+      setLido(true);
       setErro(null);
     } catch (cause) {
       setErro(message(cause));
@@ -133,7 +140,11 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
     }
   }
 
+  /// Parar também é um pedido ao núcleo: a falha de antes não pode continuar na
+  /// faixa quando este clique já produziu outra resposta. É o que `instalar` e
+  /// `conferir` fazem neste mesmo arquivo.
   async function cancelar() {
+    setErro(null);
     try {
       await api.runtimeCancelar();
     } catch (cause) {
@@ -212,15 +223,15 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
           )}
         </div>
 
+        {!lido && erro === null && (
+          <p className="sheet-note">{t("geral.carregando")}</p>
+        )}
+
         <ul className="runtime-lista">
           {pacotes.map((pacote) => {
             const job = jobs[pacote.id];
             const fault = faults[pacote.id] ?? "";
             const veredito = vereditos[pacote.id];
-            const percent =
-              job !== undefined && job.total > 0
-                ? Math.min(100, (job.done / job.total) * 100)
-                : 0;
             const batem = veredito?.arquivos.filter((a) => a.bateu).length ?? 0;
             return (
               <li
@@ -278,23 +289,16 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
                 )}
 
                 {job !== undefined && (
-                  <div className="model-job">
-                    <span className="model-job-phase">
-                      {t(`runtime.${job.fase}`)}
-                    </span>
-                    <span className="model-bar">
-                      <span
-                        className="model-bar-fill"
-                        style={{ width: `${percent}%` }}
-                      />
-                    </span>
-                    <span className="model-job-read">
-                      {job.fase === "baixando" && job.total > 0
-                        ? `${numero(percent, idioma, 1)}%`
-                        : "—"}
-                      {job.speed > 0 && ` · ${bytes(job.speed, idioma)}/s`}
-                    </span>
-                  </div>
+                  <BarraDeTrabalho
+                    fase={t(`runtime.${job.fase}`)}
+                    feito={job.done}
+                    total={job.total}
+                    velocidade={job.speed}
+                    // Só o download conta bytes. Na extração e na conferência a
+                    // ponta já dizia "—"; a barra cheia ali era o percentual de
+                    // outra fase, relido como se fosse desta.
+                    contavel={job.fase === "baixando"}
+                  />
                 )}
 
                 {fault !== "" && (

@@ -1,5 +1,6 @@
 import { useIdioma } from "../lib/i18n";
 import { idiomas, resolver } from "../lib/idiomas";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -9,7 +10,8 @@ interface Props {
 /// Uma linha por arquivo da pasta de idiomas. Acréscimo de idioma não pede
 /// código: o catálogo é lido de `locales/`.
 export function IdiomaDialog({ onClose }: Props) {
-  const { id, definir, t } = useIdioma();
+  useFecharComEscape(onClose);
+  const { id, definir, t, falha } = useIdioma();
   const doSistema = resolver(navigator.language);
 
   return (
@@ -35,9 +37,11 @@ export function IdiomaDialog({ onClose }: Props) {
               <button
                 type="button"
                 className={idioma.id === id ? "locale-row on" : "locale-row"}
-                onClick={() => {
-                  definir(idioma.id);
-                  onClose();
+                onClick={async () => {
+                  // Fecha só com o núcleo confirmado no mesmo idioma: fechar
+                  // antes era mostrar a tela nova com o assistente ainda na
+                  // língua antiga, sem nenhum aviso.
+                  if ((await definir(idioma.id)) === null) onClose();
                 }}
                 aria-pressed={idioma.id === id}
               >
@@ -54,6 +58,13 @@ export function IdiomaDialog({ onClose }: Props) {
             </li>
           ))}
         </ul>
+
+        {falha !== null && (
+          <p className="sheet-error" role="alert">
+            <Icon name="warning" />
+            <span>{t("idioma.recusa", { motivo: falha })}</span>
+          </p>
+        )}
       </div>
     </div>
   );

@@ -10,6 +10,7 @@ use super::approval::{ApprovalBroker, ApprovalOutcome, ApprovalRequest, wait_for
 use super::manager::McpEvent;
 use crate::ai::memoria::Custodio;
 use crate::bancos;
+use crate::connectors::Registry;
 use crate::idiomas::tr;
 use crate::local::{self, pastas::Pastas};
 use crate::permissions::{Decision, PendingApproval, PermissionGate, ToolEffect};
@@ -23,6 +24,10 @@ use tokio::sync::broadcast;
 
 pub struct Execucao {
     gate: Arc<Mutex<PermissionGate>>,
+    /// O cadastro com as allowlists do grafo, dividido com o gerente. O modo diz
+    /// *como* uma ferramenta roda; isto diz *se ela existe*, e as duas portas
+    /// precisam ler a mesma resposta.
+    registry: Arc<RwLock<Registry>>,
     approvals: Arc<ApprovalBroker>,
     events: broadcast::Sender<McpEvent>,
     next_id: AtomicU64,
@@ -44,6 +49,7 @@ pub struct Execucao {
 impl Execucao {
     pub fn nova(
         gate: Arc<Mutex<PermissionGate>>,
+        registry: Arc<RwLock<Registry>>,
         events: broadcast::Sender<McpEvent>,
         pastas: Arc<RwLock<Pastas>>,
         memoria: Arc<Custodio>,
@@ -52,6 +58,7 @@ impl Execucao {
     ) -> Arc<Self> {
         Self::nova_com_aprovacoes(
             gate,
+            registry,
             Arc::new(ApprovalBroker::new()),
             events,
             pastas,
@@ -63,6 +70,7 @@ impl Execucao {
 
     pub fn nova_com_aprovacoes(
         gate: Arc<Mutex<PermissionGate>>,
+        registry: Arc<RwLock<Registry>>,
         approvals: Arc<ApprovalBroker>,
         events: broadcast::Sender<McpEvent>,
         pastas: Arc<RwLock<Pastas>>,
@@ -72,6 +80,7 @@ impl Execucao {
     ) -> Arc<Self> {
         Self {
             gate,
+            registry,
             approvals,
             events,
             next_id: AtomicU64::new(1),
@@ -89,6 +98,23 @@ impl Execucao {
 
     pub fn gate(&self) -> Arc<Mutex<PermissionGate>> {
         Arc::clone(&self.gate)
+    }
+
+    /// Se o grafo deixou esta ferramenta ligada no conector embutido. A allowlist
+    /// é uma só, guardada no cadastro do `computador`, e quem a escreve é a tela
+    /// do grafo (`ligacoes_aplicar`); o servidor publicado roda as mesmas
+    /// ferramentas do laço de conversa, então é a mesma lista que ele tem de
+    /// obedecer.
+    ///
+    /// Um cadastro onde o conector embutido não está responde "nada", igual a
+    /// `manager::permitidas`: sem cadastro não há decisão registrada, e uma
+    /// permissão não se deduz do silêncio de quem decide.
+    pub fn permite_local(&self, nome: &str) -> bool {
+        self.registry
+            .read()
+            .expect("registry envenenada")
+            .get(local::CONECTOR)
+            .is_some_and(|c| c.allows_tool(nome))
     }
 
     /// As pastas concedidas, como um servidor de linha de comando as recebe: a
@@ -280,6 +306,46 @@ mod tests {
         }
     }
 
+    /// O cadastro do conector embutido como a tela do grafo o escreve: `None` é
+    /// o catálogo todo ligado, `Some` é o recorte que o usuário deixou.
+    fn cadastro(allowlist: Option<Vec<&str>>) -> Arc<RwLock<Registry>> {
+        let mut embutido = local::conector();
+        embutido.tool_allowlist = allowlist.map(|v| v.into_iter().map(String::from).collect());
+        Arc::new(RwLock::new(
+            Registry::new(vec![embutido]).expect("o conector embutido é registrável"),
+        ))
+    }
+
+    /// A execução de verdade — gate, pastas e memória montados como no
+    /// aplicativo — sobre o cadastro que a teste quiser.
+    fn execucao_com(
+        modo: crate::permissions::AgentMode,
+        registry: Arc<RwLock<Registry>>,
+    ) -> (Arc<Execucao>, PathBuf) {
+        let (eventos, _) = broadcast::channel(4);
+        let raiz = std::env::temp_dir().join(format!("aether-execucao-{}", std::process::id()));
+        std::fs::create_dir_all(&raiz).expect("pasta de teste");
+        let pastas = Arc::new(RwLock::new(Pastas {
+            raizes: vec![raiz.clone()],
+        }));
+        let execucao = Execucao::nova(
+            Arc::new(Mutex::new(PermissionGate::new(modo))),
+            registry,
+            eventos,
+            Arc::clone(&pastas),
+            Arc::new(Custodio::novo(
+                &[],
+                &raiz.join("modelos"),
+                &raiz.join("memoria"),
+                raiz.join("rag.json"),
+                pastas,
+            )),
+            Arc::new(raiz.join("bancos.json")),
+            Arc::new(raiz.join("resultados")),
+        );
+        (execucao, raiz)
+    }
+
     #[test]
     fn argumentos_simples_nao_sao_compostos() {
         assert!(!argumentos_contem_composto(&mapa(
@@ -352,26 +418,7 @@ mod tests {
     /// e é por isso que o caso testado é o de escrever.
     #[tokio::test]
     async fn o_gate_decide_antes_de_a_ferramenta_rodar() {
-        let (eventos, _) = broadcast::channel(4);
-        let raiz = std::env::temp_dir().join(format!("aether-execucao-{}", std::process::id()));
-        std::fs::create_dir_all(&raiz).expect("pasta de teste");
-        let pastas = Arc::new(RwLock::new(Pastas {
-            raizes: vec![raiz.clone()],
-        }));
-        let execucao = Execucao::nova(
-            Arc::new(Mutex::new(PermissionGate::new(crate::permissions::AgentMode::Plan))),
-            eventos,
-            Arc::clone(&pastas),
-            Arc::new(Custodio::novo(
-                &[],
-                &raiz.join("modelos"),
-                &raiz.join("memoria"),
-                raiz.join("rag.json"),
-                pastas,
-            )),
-            Arc::new(raiz.join("bancos.json")),
-            Arc::new(raiz.join("resultados")),
-        );
+        let (execucao, raiz) = execucao_com(crate::permissions::AgentMode::Plan, cadastro(None));
         let alvo = raiz.join("proibido.txt");
         let erro = execucao
             .ferramenta(
@@ -387,5 +434,39 @@ mod tests {
             tr("erros.negadaPeloModo", &[("nome", "escrever_arquivo")])
         );
         assert!(!alvo.exists(), "negada é não escrita");
+    }
+
+    /// O recorte do grafo, lido pela execução que atende as duas portas:
+    /// desligada é `false`; sem recorte é o catálogo todo.
+    #[test]
+    fn a_allowlist_do_grafo_decide_o_que_a_execucao_aceita() {
+        let (recortada, _) = execucao_com(
+            crate::permissions::AgentMode::FullAccess,
+            cadastro(Some(vec!["ler_arquivo"])),
+        );
+        assert!(recortada.permite_local("ler_arquivo"), "ligada está");
+        assert!(
+            !recortada.permite_local("escrever_arquivo"),
+            "desligada no grafo não passa aqui também"
+        );
+
+        let (inteira, _) = execucao_com(crate::permissions::AgentMode::FullAccess, cadastro(None));
+        assert!(
+            inteira.permite_local("escrever_arquivo"),
+            "sem recorte é o catálogo que o aplicativo sabe rodar"
+        );
+    }
+
+    /// Cadastro vazio não é cadastro aberto: sem o conector embutido não houve
+    /// decisão, e permissão não se deduz do silêncio — a mesma resposta de
+    /// `manager::permitidas`, para o mesmo ato não ter duas.
+    #[test]
+    fn sem_cadastro_nao_ha_permicao() {
+        let vazio = Arc::new(RwLock::new(Registry::new(vec![]).expect("cadastro vazio")));
+        let (execucao, _) = execucao_com(crate::permissions::AgentMode::FullAccess, vazio);
+        assert!(
+            !execucao.permite_local("ler_arquivo"),
+            "um cadastro sem o conector embutido não autoriza nada"
+        );
     }
 }

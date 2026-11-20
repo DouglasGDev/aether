@@ -141,6 +141,113 @@ macro_rules! ornith {
     };
 }
 
+/// Os pesos do Granite 4.2 3B com a soma que o HuggingFace publica. Cada linha
+/// é `(arquivo, lfs.oid)` lido de
+/// `curl -s https://huggingface.co/api/models/ibm-granite/granite-4.2-3b-GGUF/tree/main`
+/// em 2026-11-20, arquivo por arquivo, no mesmo espírito dos `weights_bytes`:
+/// medido, não estimado. O `lfs.oid` é o sha256 do *conteúdo*; o `oid` do git,
+/// que vem na mesma resposta, é a soma SHA-1 do ponteiro LFS e não vale como
+/// prova do arquivo. A tabela completa conferida está em `docs/melhorias/M8.md`.
+const SHA256_GRANITE_3B_GGUF: [(&str, &str); 15] = [
+    ("granite-4.2-3b-Q2_K.gguf", "a66f94672d05104517ae844664cac86086f627e29f8e6410bce4c42849afc71b"),
+    ("granite-4.2-3b-Q3_K_S.gguf", "cd7dd8e5c38523514d70083e4cbd88a0cecb5c8f86ef57cd0b80c15b84aa369e"),
+    ("granite-4.2-3b-Q3_K_M.gguf", "cf620d4d440f544ece5e6257ed86539d7729d75c3585c9e17dd74d2632a34322"),
+    ("granite-4.2-3b-Q3_K_L.gguf", "99f8a87638f740420b415017901e1b23a3701e4f12b76cf42518bdaa01482e83"),
+    ("granite-4.2-3b-Q4_0.gguf", "d34a4a7c0b230d3f544eca502beb7e04efc3a0ebd59e2f2df50058f23cc20711"),
+    ("granite-4.2-3b-Q4_K_S.gguf", "2719546cd7202b70099aa6b9e03b4d4d69851bef12089bcf5c351a72b61a1de9"),
+    ("granite-4.2-3b-Q4_K_M.gguf", "e0406663965846ae22a403456eb826ccce5f450840491f71952f18a7cb78e7d5"),
+    ("granite-4.2-3b-Q4_1.gguf", "2fe0f96ec5c7aff6f0713e5970ec68a1066231b78d5a48783338106a90abfb7e"),
+    ("granite-4.2-3b-Q5_0.gguf", "edf6a67910492f875646347fe9df5a1ca584831c1acde19923ba9a73b145d951"),
+    ("granite-4.2-3b-Q5_K_S.gguf", "345c66d60ca7a7b43e2cde9b8876cf06bf47775ba9cc23253a3235afd0d72726"),
+    ("granite-4.2-3b-Q5_K_M.gguf", "982e797413f842329266a00c2a85ce540bb5c1b65ac4646276bfb9d2886c5efe"),
+    ("granite-4.2-3b-Q5_1.gguf", "42804ba675926aeacb4c5940d656caaa3869667fdaf42e5966244c1ab10c973d"),
+    ("granite-4.2-3b-Q6_K.gguf", "2e08e2790489162105be79b7f26a81fde28ea30119fa6df12594acd59f12dd96"),
+    ("granite-4.2-3b-Q8_0.gguf", "fbe986738041418e26de9e123ba740cb654931f85bf572a71bd01f9e6b85e53d"),
+    ("granite-4.2-3b-bf16.gguf", "8aad15f38ab5796190c9701b1913fd8f0bef01968a42cd16ffe469831564ef47"),
+];
+
+/// O Granite 4.2 8B, mesma leitura (`tree/main` de 2026-11-20).
+const SHA256_GRANITE_8B_GGUF: [(&str, &str); 15] = [
+    ("granite-4.2-8b-Q2_K.gguf", "dbaf5bba1dff2e37fb4e9563ae322001f2228d37d2080e55796fef6c8b81ef1f"),
+    ("granite-4.2-8b-Q3_K_S.gguf", "7b9849e1d501e7d85a6a7ef1c9acc23733c5bb1b63ecf0bac1c48bbdb6b5500c"),
+    ("granite-4.2-8b-Q3_K_M.gguf", "921fd8b015a34420607300831cf70ed306581b9bf33742ae804e42b894a2ca9a"),
+    ("granite-4.2-8b-Q3_K_L.gguf", "6230bceb89841b65d0455019f134a47fb6f4316dbc1f909747ec4329518220eb"),
+    ("granite-4.2-8b-Q4_0.gguf", "82af51c80f8c2913430aa020f97bd3d4708c5fc49c5bfbff09ac012f3c2132d2"),
+    ("granite-4.2-8b-Q4_K_S.gguf", "6b2438a9177be0883b27722dadd5271c8e18806e068a7fc30a42c481c000c092"),
+    ("granite-4.2-8b-Q4_K_M.gguf", "16a9369d0805f80b7377d25d87f937a90c05dc04ad79173a52001e42c9aab311"),
+    ("granite-4.2-8b-Q4_1.gguf", "02c58f69dcd7a5f75ce2dbb22da706872c859fe6fa4b321d33f22dab19180463"),
+    ("granite-4.2-8b-Q5_0.gguf", "49efb3a7a5bd51c92d72f5d3f858ab5f2a00cbf05f853909d443da1e53725bf5"),
+    ("granite-4.2-8b-Q5_K_S.gguf", "fd9866f3fdd5b3fd8a0a7942ede9f7e96f53a02e13b9ad77f295b8e08446b0dd"),
+    ("granite-4.2-8b-Q5_K_M.gguf", "074ac7ee98b1703674657a65051caebe188d543656e0ad71eb1f6bb3ae063407"),
+    ("granite-4.2-8b-Q5_1.gguf", "76f9e24373c2848c207f669ceac1755f8b851606c4de7d4f22c0dfac0a7a8d2b"),
+    ("granite-4.2-8b-Q6_K.gguf", "5ad3d67f6fe09a448031029bead7f6a088697ca2787c0c5640bf964c59df1a21"),
+    ("granite-4.2-8b-Q8_0.gguf", "fb66ad5750680c77c76b9dc095961375f14fc88ba15fd5fc084ef6e6701bad77"),
+    ("granite-4.2-8b-bf16.gguf", "d82690e0dc827f2c43effeb3d489f572afbe2541fa8b4895b0d958ce473925a6"),
+];
+
+/// Os pesos do Ornith 1.5 9B, lidos do mesmo endpoint (`tree/main` de
+/// `ornith-ai/Ornith-1.5-9B-GGUF`).
+const SHA256_ORNITH_GGUF: [(&str, &str); 5] = [
+    ("Ornith-1.5-9B-Q4_K_M.gguf", "70c112196e0b7023803c9762752e46d29e612a92c83f995bc3ba1ceb07e8fab6"),
+    ("Ornith-1.5-9B-Q5_K_M.gguf", "e4d9634a3b6546a5c00a8680568fe1125f6c98c704ee51ae52ba07650fb4247d"),
+    ("Ornith-1.5-9B-Q6_K.gguf", "b6f76e74f86245b3caee014b797c10dca931c4dfdaabfb134eab655f81e4154a"),
+    ("Ornith-1.5-9B-Q8_0.gguf", "22086870b009dbe9815ee752c48a82de930118a7c5ce5599590892ae03b8b010"),
+    ("Ornith-1.5-9B-BF16.gguf", "a72af9b7f34727a49e030627092e7ebd782e9c3459a0c95afa4b9a07a8650f50"),
+];
+
+/// Os pesos do codificador.
+const SHA256_QWEN_EMBEDS_GGUF: [(&str, &str); 2] = [
+    ("Qwen3-Embedding-0.6B-Q8_0.gguf", "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"),
+    ("Qwen3-Embedding-0.6B-f16.gguf", "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340"),
+];
+
+/// O único arquivo de apoio que tem soma publicada: o tokenizador rápido do
+/// Ornith e o do codificador são Git LFS, e o `lfs.oid` deles é o sha256 do
+/// conteúdo — conferido baixando os 11.423.705 bytes do `tokenizer.json` da Qwen
+/// e somando os bytes servidos (ver `docs/melhorias/M8.md`).
+///
+/// O tokenizador do Granite **não** está aqui de propósito: com 7.153.414 bytes
+/// ele é um blob git comum, então a API devolve só `oid` — o SHA-1 de
+/// `blob <tamanho>\0<conteúdo>`, que conferi byte a byte contra os bytes
+/// servidos. Não existe sha256 publicado desse arquivo, e calcular um a partir
+/// do que se acabou de baixar é fotografia, não verificação. Fica sem conferência
+/// de conteúdo até a soma sair do repositório (pendência no doc).
+const SHA256_APOIO: [(&str, &[(&str, &str)]); 2] = [
+    ("ornith-ai/Ornith-1.5-9B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
+    ("Qwen/Qwen3-Embedding-0.6B", &[("tokenizer.json", "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a")]),
+];
+
+/// Onde cada tabela de pesos mora, pelo nome do repositório — a mesma chave que
+/// a URL de `resolve/main` usa, então uma linha trocada não confere com nada.
+const SHA256_PESOS: [(&str, &[(&str, &str)]); 4] = [
+    ("ibm-granite/granite-4.2-3b-GGUF", &SHA256_GRANITE_3B_GGUF),
+    ("ibm-granite/granite-4.2-8b-GGUF", &SHA256_GRANITE_8B_GGUF),
+    ("ornith-ai/Ornith-1.5-9B-GGUF", &SHA256_ORNITH_GGUF),
+    ("Qwen/Qwen3-Embedding-0.6B-GGUF", &SHA256_QWEN_EMBEDS_GGUF),
+];
+
+/// O sha256 que o HuggingFace publica para `(repositório, arquivo)`. `None` é a
+/// resposta honesta: aquele arquivo não tem soma publicada, e conferir por um
+/// hash inventado seria pior que não conferir.
+pub fn sha256_publicado(repo: &str, arquivo: &str) -> Option<&'static str> {
+    SHA256_PESOS
+        .iter()
+        .chain(SHA256_APOIO.iter())
+        .find(|(r, _)| *r == repo)
+        .and_then(|(_, tabela)| tabela.iter().find(|(a, _)| *a == arquivo))
+        .map(|(_, soma)| *soma)
+}
+
+/// Os pesos deste modelo, pela pasta e pelo arquivo que o catálogo declara.
+pub fn pesos_sha256(spec: &ModelSpec) -> Option<&'static str> {
+    sha256_publicado(spec.weights_repo, spec.weights_file)
+}
+
+/// O hash publicado de um arquivo de apoio, se o repositório publica um.
+pub fn apoio_sha256(spec: &ModelSpec, arquivo: &str) -> Option<&'static str> {
+    sha256_publicado(spec.support_repo, arquivo)
+}
+
 pub const CATALOG: [ModelSpec; 35] = [
     granite!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
@@ -494,6 +601,80 @@ mod tests {
         let st = status(&dir, spec);
         assert!(st.missing_support.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Todo peso do catálogo tem de ter soma publicada. Uma quant nova que
+    /// entra sem linha na tabela volta a ser conferida só pelo tamanho — que é
+    /// exatamente o defeito que o M8 fecha — e o teste pega isso antes de
+    /// qualquer download. O formato é o do `lfs.oid`: 64 hex minúsculas.
+    #[test]
+    fn todo_peso_do_catalogo_tem_sha256_publicado() {
+        for spec in CATALOG.iter().chain(EMBEDS.iter()) {
+            let soma = pesos_sha256(spec);
+            let soma = soma.unwrap_or_else(|| panic!("{}: nenhum sha256 publicado", spec.id));
+            assert_eq!(soma.len(), 64, "{}: {soma}", spec.id);
+            assert!(
+                soma.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{}: {soma} não é hex minúsculo",
+                spec.id
+            );
+        }
+    }
+
+    /// Tabela e catálogo têm de ser a mesma lista dos dois lados: uma linha de
+    /// hash sem arquivo correspondente é dado morto que ninguém mais confere, e
+    /// foi ela que fez o `weights_bytes` mentir uma vez em outro projeto.
+    #[test]
+    fn nenhuma_soma_publicada_sobra_fora_do_catalogo() {
+        let (pesos, _): (Vec<_>, Vec<_>) =
+            SHA256_PESOS.iter().flat_map(|(_, t)| t.iter().cloned()).unzip();
+        let declarados: Vec<&str> = CATALOG
+            .iter()
+            .chain(EMBEDS.iter())
+            .map(|s| s.weights_file)
+            .collect();
+        for arquivo in &pesos {
+            assert!(declarados.contains(arquivo), "{arquivo} não é peso de nenhum modelo");
+        }
+        assert_eq!(
+            pesos.len(),
+            declarados.len(),
+            "a tabela de pesos e o catálogo diferem: {} linhas contra {} modelos",
+            pesos.len(),
+            declarados.len()
+        );
+        for (repo, tabela) in &SHA256_APOIO {
+            for (arquivo, _) in tabela.iter() {
+                let pedido = CATALOG
+                    .iter()
+                    .chain(EMBEDS.iter())
+                    .any(|s| s.support_repo == *repo && s.support_files.contains(arquivo));
+                assert!(pedido, "{repo}/{arquivo} não é pedido por nenhum modelo");
+            }
+        }
+    }
+
+    /// Os arquivos de apoio que o Granite pede não têm soma publicada — e isto
+    /// é registro do que a API devolve, não desculpa: se um dia o repositório
+    /// passar a publicar LFS nesses arquivos, a tabela tem de crescer e este
+    /// teste avisa que a premissa do doc M8 mudou.
+    #[test]
+    fn apoio_de_granite_nao_tem_hash_publicado_e_apoio_lfs_tem() {
+        let granite = find("granite-4.2-3b-Q4_K_M").unwrap();
+        for arquivo in granite.support_files {
+            assert_eq!(
+                apoio_sha256(granite, arquivo),
+                None,
+                "granite/{arquivo} passou a ter soma publicada: atualizar a tabela e o doc"
+            );
+        }
+        let codificador = find("qwen3-embedding-0.6b-q8_0").unwrap();
+        assert_eq!(
+            apoio_sha256(codificador, "tokenizer.json"),
+            Some("def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"),
+            "o tokenizador LFS da Qwen tem de chegar com a soma lida do `lfs.oid`"
+        );
+        assert_eq!(apoio_sha256(codificador, "tokenizer_config.json"), None);
     }
 
     #[test]

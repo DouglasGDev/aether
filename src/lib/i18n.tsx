@@ -26,8 +26,14 @@ export type Traduzir = (
 interface Contexto {
   id: string;
   idiomas: Idioma[];
-  definir: (id: string) => void;
+  /// Entrega a recusa do núcleo como texto, ou `null` quando ele aceitou. Quem
+  /// escolhe o idioma fecha a própria tela só depois de saber o veredito.
+  definir: (id: string) => Promise<string | null>;
   t: Traduzir;
+  /// A recusa do núcleo em falar o mesmo idioma da tela. Enquanto ela só ia
+  /// para o console, a pessoa escolhia um idioma e o assistente continuava
+  /// respondendo em outro, sem que nada na tela dissesse isso.
+  falha: string | null;
 }
 
 const IdiomaContexto = createContext<Contexto | null>(null);
@@ -37,30 +43,51 @@ export function ProvedorIdioma({ children }: { children: ReactNode }) {
     const anterior = localStorage.getItem(GUARDADO);
     return anterior !== null && existe(anterior) ? anterior : idiomaDoSistema();
   });
+  const [falha, setFalha] = useState<string | null>(null);
 
-  const definir = useCallback((proximo: string) => {
-    if (!existe(proximo)) return;
-    localStorage.setItem(GUARDADO, proximo);
-    setId(proximo);
+  /// O núcleo tem de falar o idioma da tela; se recusar, a recusa volta como
+  /// texto para quem escolheu, em vez de sumir no console.
+  const sincronizar = useCallback(async (proximo: string): Promise<string | null> => {
+    try {
+      await api.definirIdioma(proximo);
+      setFalha(null);
+      return null;
+    } catch (cause: unknown) {
+      const texto = cause instanceof Error ? cause.message : String(cause);
+      setFalha(texto);
+      return texto;
+    }
   }, []);
+
+  const definir = useCallback(
+    async (proximo: string) => {
+      if (!existe(proximo)) return null;
+      localStorage.setItem(GUARDADO, proximo);
+      setId(proximo);
+      return sincronizar(proximo);
+    },
+    [sincronizar],
+  );
 
   const t = useCallback<Traduzir>(
     (chave, valores) => traduzir(id, chave, valores),
     [id],
   );
 
-  // O núcleo responde no mesmo idioma da tela: as mensagens de erro e o motivo
-  // da escolha de modelo também saem da pasta de idiomas.
   useEffect(() => {
     document.documentElement.lang = id;
-    void api.definirIdioma(id).catch((cause: unknown) => {
-      console.error("não apliquei o idioma no núcleo", cause);
-    });
   }, [id]);
 
+  // Só na montagem: o idioma vem do depósito antes de qualquer clique, e sem
+  // este envio o núcleo acordava na língua antiga enquanto a tela já tinha
+  // trocado. `sincronizar` não muda, então esta linha roda uma vez.
+  useEffect(() => {
+    void sincronizar(id);
+  }, [sincronizar]);
+
   const valor = useMemo<Contexto>(
-    () => ({ id, idiomas, definir, t }),
-    [id, definir, t],
+    () => ({ id, idiomas, definir, t, falha }),
+    [id, definir, t, falha],
   );
 
   return (

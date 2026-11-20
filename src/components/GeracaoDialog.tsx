@@ -3,6 +3,7 @@ import { api, message } from "../lib/api";
 import { numero } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
 import type { AjustesGeracao, AiStatus, ModelStatus } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -75,6 +76,7 @@ function inteiraMedida(status: AiStatus): { modelo: string; tokens: number } | n
 }
 
 export function GeracaoDialog({ onClose, onChange }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
   const [ajustes, setAjustes] = useState<AjustesGeracao | null>(null);
@@ -113,6 +115,10 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
   /// aplica outro seria a gambiarra que este produto proíbe.
   const gravar = useCallback(
     async (novo: AjustesGeracao) => {
+      // A mesma alavanca devolve `onPointerUp` e, ao sair dela, `onBlur`: sem
+      // esta trava o segundo evento posta o mesmo ajuste outra vez, e as duas
+      // respostas chegam fora de ordem para quem lê o estado depois.
+      if (ocupada) return;
       setOcupada(true);
       try {
         const aceito = await api.aiAjustar(novo);
@@ -131,7 +137,7 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
         setOcupada(false);
       }
     },
-    [onChange],
+    [onChange, ocupada],
   );
 
   if (ajustes === null) {

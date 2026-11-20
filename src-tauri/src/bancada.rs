@@ -458,6 +458,7 @@ fn caso_bancos(inicio: Instant) -> Resultado {
             // pedido pede tudo, o cadastro devolve uma.
             limite_linhas: 1,
             sql_livre: false,
+            tls_verificado: false,
             fontes: BTreeMap::new(),
         };
         conexao.fontes.insert("clientes".into(), Fonte::default());
@@ -886,7 +887,7 @@ fn caso_dobrar(
                     break Err(t("bancada.dobrar.parou"));
                 }
                 let anterior = resumo.as_ref().map(|r| r.texto.as_str());
-                let (texto, gasto) = match compactacao::dobrar(
+                let (texto, gasto, _) = match compactacao::dobrar(
                     engine,
                     template,
                     &params,
@@ -1039,5 +1040,16 @@ mod testes {
             r.detalhe.unwrap_or_default()
         );
         assert_eq!(r.medidas.len(), 3, "{:?}", r.medidas);
+    }
+
+    /// A tela nomeia cada caso por `bancada.caso.{id}`, chave montada em runtime
+    /// a partir do `CASOS`. A paridade dos arquivos não alcança uma chave assim:
+    /// falta ela nos dois idiomas, o nome do caso vira o próprio caminho na tela.
+    #[test]
+    fn todo_caso_da_bancada_tem_nome_em_todo_idioma() {
+        for id in CASOS {
+            let chave = format!("bancada.caso.{id}");
+            assert!(crate::idiomas::tem_texto(&chave), "{id} apareceria na tela como {chave}");
+        }
     }
 }

@@ -50,10 +50,6 @@ export const api = {
   disconnectConnector: (id: string) =>
     invoke<void>("disconnect_connector", { id }),
   connectedConnectors: () => invoke<string[]>("connected_connectors"),
-  connectorTools: (id: string) => invoke<ToolInfo[]>("connector_tools", { id }),
-  toolCatalog: () => invoke<string>("tool_catalog"),
-  resolveIntent: (query: string) =>
-    invoke<ToolInfo[]>("resolve_intent", { query }),
   allTools: () => invoke<ToolInfo[]>("all_tools"),
   callTool: (qualifiedName: string, args: unknown) =>
     invoke<CallToolResult>("call_tool", { qualifiedName, arguments: args }),
@@ -77,7 +73,6 @@ export const api = {
   modelDelete: (id: string) => invoke<void>("model_delete", { id }),
   modelLoad: (id: string) => invoke<string>("model_load", { id }),
   modelSolto: () => invoke<AjustesGeracao>("model_solto"),
-  chatHistory: () => invoke<ChatMessage[]>("chat_history"),
   chatReset: () => invoke<void>("chat_reset"),
   chatCancel: () => invoke<void>("chat_cancel"),
   chatSend: (text: string) => invoke<TurnOutcome>("chat_send", { text }),

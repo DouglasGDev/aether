@@ -1784,6 +1784,13 @@ button.small {
   letter-spacing: 0;
 }
 
+/* O que ficou de fora do resumo é perda de memória, não detalhe: entra na cor
+   que o app já usa quando algo se perdeu, para ninguém ler "3 dobradas" e
+   supor que as outras três viraram texto. */
+.talk-resumo summary .contagem.aviso {
+  color: color-mix(in srgb, var(--danger) 78%, #e8eef7);
+}
+
 .talk-tool {
   width: 100%;
   display: grid;
@@ -4518,6 +4525,12 @@ button.icon-only.falta {
 .bancada-contagem {
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
+}
+
+/* A contagem ao lado do botão é o número de casos reprovados; sem a cor ela é
+   só mais um dígito monoespaçado numa linha de ações. */
+.bancada-contagem.aviso {
+  color: color-mix(in srgb, var(--danger) 78%, #e8eef7);
 }
 
 .bancada-modelo {

@@ -175,6 +175,7 @@ fn onde_sql(
 
 impl Mysql {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
+        conferir_canal(conexao)?;
         let senha = conexao.senha()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -472,6 +473,59 @@ fn erro_abrir(e: mysql_async::Error) -> anyhow::Error {
     anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())]))
 }
 
+/// A única leitura da flag `tls_verificado` neste motor — e ela só sabe dizer
+/// «não». O `mysql_async` deste aplicativo foi compilado com
+/// `features = ["minimal"]`, que não traz TLS nenhum: não há opção a habilitar,
+/// e abrir assim mesmo seria o dono marcar o canal conferido, ver a ligação
+/// pegar, e continuar mandando senha e consulta em texto puro. O postgres tem
+/// o mesmo driver sem adaptador, mas obedece à marca pedindo `SslMode::Require`
+/// e deixando a handshake falhar; aqui não há nem isso, então a recusa vem
+/// antes de tocar a rede.
+fn conferir_canal(conexao: &Conexao) -> Result<()> {
+    if conexao.tls_verificado {
+        bail!(tr(
+            "erros.bancoSemTls",
+            &[("tipo", conexao.tipo.rotulo())]
+        ));
+    }
+    Ok(())
+}
+
 fn erro(e: mysql_async::Error) -> anyhow::Error {
     anyhow!(tr("erros.bancoErro", &[("detalhe", &e.to_string())]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bancos::config::{conexao_de_teste, Tipo};
+
+    /// O cadastro promete: «cada motor que sabe falar TLS obedece; o que não
+    /// sabe se recusa a fingir». Este driver foi compilado sem TLS nenhum,
+    /// então a recusa é a única resposta honesta — abrir em texto puro com a
+    /// marca ligada faria o dono acreditar num canal que não existe.
+    ///
+    /// `127.0.0.1` não é o servidor de ninguém: se a recusa da flag não vier
+    /// antes do aperto de mão, o teste esbarra numa recusação local imediata e
+    /// falha dizendoo, em vez de esperar por uma rede que não responde.
+    #[test]
+    fn a_marca_de_canal_conferido_nao_vira_texto_puro() {
+        let mut conferida = conexao_de_teste(Tipo::Mysql);
+        conferida.host = "127.0.0.1".into();
+        conferida.tls_verificado = true;
+        let erro = Mysql::abrir(&conferida)
+            .err()
+            .expect("com a marca ligada, a ligação tem de ser recusada");
+        assert!(
+            erro.to_string().contains("TLS"),
+            "a recusa tem de dizer por quê: {erro}"
+        );
+    }
+
+    /// Sem a marca, nada muda: a ligação de sempre segue para o driver, e a
+    /// recusa não é um pedágio cobrado de quem não pediu canal conferido.
+    #[test]
+    fn sem_a_marca_o_mysql_fala_como_sempre() {
+        conferir_canal(&conexao_de_teste(Tipo::Mysql)).expect("sem a marca, nada é negado");
+    }
 }

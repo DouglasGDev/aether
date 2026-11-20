@@ -567,6 +567,7 @@ mod tests {
             senha_clara: None,
             limite_linhas: 200,
             sql_livre: false,
+            tls_verificado: false,
             fontes: BTreeMap::new(),
         };
         conexao.fontes.insert("clientes".into(), Fonte::default());

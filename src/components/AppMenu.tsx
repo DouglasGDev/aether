@@ -21,6 +21,16 @@ export type TelaAjuste =
 /// "pulso" é a fala em curso e "aviso" é o runtime que falta no PC.
 export type Marca = "ligada" | "aviso" | "pulso";
 
+/// O que cada ponto significa por extenso. O desenho é um círculo de cor, e um
+/// círculo não chega a quem usa leitor de tela: o estado tem de estar no nome
+/// acessível do botão, ou a informação existe só para quem enxerga. Um Record
+/// fechado é o que o `tsc` confere — falta uma variante e a compilação para.
+const MARCA_TEXTO: Record<Marca, string> = {
+  ligada: "menu.marcaLigada",
+  aviso: "menu.marcaAviso",
+  pulso: "menu.marcaPulso",
+};
+
 interface Item {
   tela: TelaAjuste;
   chave: string;
@@ -104,7 +114,11 @@ export function AppMenu({ onAbrir, marcas }: Props) {
         onClick={() => setAberto((atual) => !atual)}
         aria-expanded={aberto}
         aria-haspopup="true"
-        aria-label={t("menu.titulo")}
+        aria-label={
+          sinal === undefined
+            ? t("menu.titulo")
+            : `${t("menu.titulo")} · ${t(MARCA_TEXTO[sinal])}`
+        }
         title={t("menu.titulo")}
       >
         <Icon name="engrenagem" />
@@ -117,27 +131,35 @@ export function AppMenu({ onAbrir, marcas }: Props) {
           {SECOES.map((secao) => (
             <div key={secao.chave} className="app-menu-secao">
               <p className="app-menu-titulo">{t(secao.chave)}</p>
-              {secao.itens.map((item) => (
-                <button
-                  key={item.tela}
-                  type="button"
-                  role="menuitem"
-                  className="app-menu-item"
-                  onClick={() => {
-                    onAbrir(item.tela);
-                    setAberto(false);
-                  }}
-                >
-                  <Icon name={item.icon} />
-                  <span className="app-menu-nome">{t(item.chave)}</span>
-                  {marcas[item.tela] !== undefined && (
-                    <span
-                      className={`app-menu-marca app-menu-marca-${marcas[item.tela]}`}
-                      aria-hidden="true"
-                    />
-                  )}
-                </button>
-              ))}
+              {secao.itens.map((item) => {
+                const marca = marcas[item.tela];
+                return (
+                  <button
+                    key={item.tela}
+                    type="button"
+                    role="menuitem"
+                    className="app-menu-item"
+                    aria-label={
+                      marca === undefined
+                        ? undefined
+                        : `${t(item.chave)} · ${t(MARCA_TEXTO[marca])}`
+                    }
+                    onClick={() => {
+                      onAbrir(item.tela);
+                      setAberto(false);
+                    }}
+                  >
+                    <Icon name={item.icon} />
+                    <span className="app-menu-nome">{t(item.chave)}</span>
+                    {marca !== undefined && (
+                      <span
+                        className={`app-menu-marca app-menu-marca-${marca}`}
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+                );
+              })}
             </div>
           ))}
         </div>

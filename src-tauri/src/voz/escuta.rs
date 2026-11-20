@@ -345,8 +345,13 @@ fn capturar(parar: Arc<AtomicBool>, estado: Arc<Estado>, entrada: String) -> (Ve
         }
         coletado.extend_from_slice(&bloco[..lidos]);
     }
-    drop(stream);
     coletado.truncate(teto);
+    drop(stream);
+    // O microfone fechou aqui, seja pelo *Parar* seja pelo teto de 60 s: o que
+    // o medidor mostrou no último bloco não é o nível de agora, é o último que
+    // ele viu. Deixar esse valor na tela é o app continuar "gravando" com a
+    // barra congelada no meio de uma sílaba.
+    estado.nivel.store(0, Ordering::Relaxed);
     (coletado, taxa)
 }
 

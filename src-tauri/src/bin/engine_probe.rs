@@ -305,17 +305,25 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
     let inicio = Instant::now();
     let motor = ggml::Motor::novo(&pastas, &caminho, context, camadas)
         .map_err(|e| anyhow::anyhow!("carga falhou: {e}"))?;
-    let depois = vram_livre(&pastas).map(|(_, v)| v).unwrap_or(antes);
-    let cedido = antes.saturating_sub(depois);
+    // A segunda leitura é a metade medida do delta. Repetir o valor de antes
+    // quando a placa não respondeu produziria um "0 MiB cedidos" que parece uma
+    // medição e é a ausência dela.
+    let cedido = vram_livre(&pastas).map(|(_, depois)| antes.saturating_sub(depois));
     println!(
         "carga real em {:.2}s: janela={} dispositivo={} despacho={} camadas | VRAM cedida {} | previsto na placa {} | diferença {}",
         inicio.elapsed().as_secs_f64(),
         motor.janela,
         motor.dispositivo,
         camadas,
-        mib(cedido),
+        match cedido {
+            Some(cedido) => mib(cedido),
+            None => "não medida".to_string(),
+        },
         mib(na_placa),
-        mib(cedido.max(na_placa) - cedido.min(na_placa))
+        match cedido {
+            Some(cedido) => mib(cedido.max(na_placa) - cedido.min(na_placa)),
+            None => "não medida".to_string(),
+        }
     );
     Ok(())
 }
@@ -1410,7 +1418,14 @@ fn prefixo_reutilizado(
     // Lido do motor, não calculado por fora: o que a rodada 3 pode reaproveitar
     // são as células que ele mesmo declara ocupadas. Somar ids + gerados seria
     // o meu palpite sobre o KV, e um palpite não serve de régua.
-    let cache_apos_2 = engine.cache_ocupado().unwrap_or(ids2.len() + a2.generated_tokens);
+    // A régua do recorte é a célula que o motor declara ocupada. Se ele não
+    // declara, somar ids + gerados seria o meu palpite sobre o KV — e um palpite
+    // usado como régua aprova ou reprova sem medir nada.
+    let Some(cache_apos_2) = engine.cache_ocupado() else {
+        anyhow::bail!(
+            "o motor não declarou o KV ocupado depois da rodada 2; sem esta leitura a régua de recorte não existe"
+        );
+    };
     // A rodada que diverge no meio do histórico: o resultado da ferramenta é
     // outro. Aqui o cache tem de ser recortado a partir da divergência — é o
     // caminho do `seq_rm`, e sem ele a posição automática continuaria depois do

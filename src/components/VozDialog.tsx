@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, message, onVozEvent } from "../lib/api";
-import { GENERO_KEY, SERVICO_KEY, bytes, numero } from "../lib/display";
+import { GENERO_KEY, SERVICO_KEY, bytes } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
 import type { AjustesVoz, EstadoVoz, MedidorVoz, StatusVoz, VozEvento } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
+import { BarraDeTrabalho, Regua } from "./BarraDeTrabalho";
 
 interface Props {
   estado: EstadoVoz | null;
@@ -22,8 +24,8 @@ interface Job {
 type Aba = "fala" | "escuta" | "modelos";
 
 export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
-  const { id: idioma } = useIdioma();
   const [aba, setAba] = useState<Aba>("fala");
   const [jobs, setJobs] = useState<Record<string, Job>>({});
   const [faults, setFaults] = useState<Record<string, string>>({});
@@ -167,6 +169,17 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
   const doServico = (servico: StatusVoz["servico"]) =>
     (estado?.modelos ?? []).filter((modelo) => modelo.servico === servico);
 
+  /// O download em curso é o que o motor registra em `baixando`, não só o que
+  /// esta janela viu passar: reabri-la no meio do pacote do Kokoro deixava a
+  /// linha oferecendo "Baixar" de novo, e o núcleo recusaria o segundo pedido
+  /// com "já está baixando". Sem bytes lidos ainda, a barra fica vazia e a
+  /// ponta mostra o traço — o que se sabe é a fase, não o andamento.
+  const emCurso = (id: string): Job | undefined =>
+    jobs[id] ??
+    (estado?.baixando.includes(id) === true
+      ? { fase: "baixando", done: 0, total: 0, speed: 0 }
+      : undefined);
+
   const falha = erro ?? estado?.erro ?? null;
 
   return (
@@ -276,23 +289,18 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
                   </div>
                 </div>
 
-                <label className="field">
-                  <span className="field-label">
-                    {t("voz.velocidade")}
-                    <span className="voz-valor">{numero(ritmo, idioma, 2)}×</span>
-                  </span>
-                  <input
-                    type="range"
-                    min={0.5}
-                    max={2}
-                    step={0.05}
-                    value={ritmo}
-                    aria-label={t("voz.velocidade")}
-                    onChange={(event) => setVelocidade(Number(event.target.value))}
-                    onPointerUp={() => void gravar({ ...ajustes, velocidade: ritmo })}
-                    onBlur={() => void gravar({ ...ajustes, velocidade: ritmo })}
-                  />
-                </label>
+                <Regua
+                  titulo={t("voz.velocidade")}
+                  valor={ritmo}
+                  minimo={0.5}
+                  maximo={2}
+                  passo={0.05}
+                  casas={2}
+                  classeValor="voz-valor"
+                  sufixo="×"
+                  aoMudar={setVelocidade}
+                  aoGravar={() => void gravar({ ...ajustes, velocidade: ritmo })}
+                />
 
                 <div className="field">
                   <span className="field-label">{t("voz.autoFalar")}</span>
@@ -388,7 +396,7 @@ export function VozDialog({ estado, medidor, onClose, onRefresh }: Props) {
                   <ModeloRow
                     key={modelo.id}
                     modelo={modelo}
-                    job={jobs[modelo.id]}
+                    job={emCurso(modelo.id)}
                     fault={faults[modelo.id] ?? ""}
                     escolhido={
                       modelo.id === ajustes.modeloFala ||
@@ -421,8 +429,6 @@ interface RowProps {
 function ModeloRow({ modelo, job, fault, escolhido, onBaixar, onCancelar, onApagar }: RowProps) {
   const t = useT();
   const { id: idioma } = useIdioma();
-  const percent =
-    job !== undefined && job.total > 0 ? Math.min(100, (job.done / job.total) * 100) : 0;
 
   return (
     <div className={escolhido ? "model-variant loaded" : "model-variant"}>
@@ -443,29 +449,17 @@ function ModeloRow({ modelo, job, fault, escolhido, onBaixar, onCancelar, onApag
       </div>
 
       {job !== undefined ? (
-        <div className="model-job">
-          <span className="model-job-phase">{t(`voz.${job.fase}`)}</span>
-          {/* Na extração não há byte de rede a contar: a barra fica vazia. */}
-          <span className="model-bar">
-            {job.fase === "baixando" && (
-              <span className="model-bar-fill" style={{ width: `${percent}%` }} />
-            )}
-          </span>
-          <span className="model-job-read">
-            {job.fase === "baixando" && job.total > 0
-              ? `${numero(percent, idioma, 1)}%`
-              : "—"}
-            {job.speed > 0 && ` · ${bytes(job.speed, idioma)}/s`}
-          </span>
-          <button
-            type="button"
-            className="icon-only"
-            onClick={onCancelar}
-            aria-label={t("voz.cancelar", { nome: modelo.nome })}
-          >
-            <Icon name="cross" />
-          </button>
-        </div>
+        <BarraDeTrabalho
+          fase={t(`voz.${job.fase}`)}
+          feito={job.done}
+          total={job.total}
+          velocidade={job.speed}
+          // Na extração do pacote não há byte de rede a contar: a barra fica
+          // vazia e a ponta mostra o traço, em vez do último percentual.
+          contavel={job.fase === "baixando"}
+          aoCancelar={onCancelar}
+          rotuloCancelar={t("voz.cancelar", { nome: modelo.nome })}
+        />
       ) : (
         <div className="model-actions">
           {!modelo.baixado && (

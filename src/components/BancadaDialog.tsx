@@ -1,82 +1,25 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, message, onBancadaEvent } from "../lib/api";
 import { useT } from "../lib/i18n";
-import type { BancadaEvento, BancadaResultado } from "../lib/types";
+import type { BancadaRodada } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 interface Props {
+  casos: string[];
+  rodada: BancadaRodada;
+  erro: string | null;
+  onRodar: () => void;
+  onParar: () => void;
   onClose: () => void;
 }
 
 /// Cada linha é uma conta medida nesta máquina, contra o modelo que está em
 /// memória. Não há caso sem número: o veredito é o que a rodada devolveu.
-export function BancadaDialog({ onClose }: Props) {
+/// A folha só desenha: quem segura a medição é o aplicativo, porque o núcleo
+/// continua mandando resultado mesmo quando ninguém está olhando.
+export function BancadaDialog({ casos, rodada, erro, onRodar, onParar, onClose }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
-  const [casos, setCasos] = useState<string[]>([]);
-  const [resultados, setResultados] = useState<Record<string, BancadaResultado>>(
-    {},
-  );
-  const [andando, setAndando] = useState(false);
-  const [atual, setAtual] = useState<string | null>(null);
-  const [modelo, setModelo] = useState<string | null>(null);
-  const [erro, setErro] = useState<string | null>(null);
-
-  useEffect(() => {
-    void api
-      .bancadaCasos()
-      .then(setCasos)
-      .catch((cause) => setErro(message(cause)));
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    const handle = (event: BancadaEvento) => {
-      switch (event.type) {
-        case "iniciou":
-          setResultados({});
-          setAndando(true);
-          setModelo(event.modelo);
-          setErro(null);
-          break;
-        case "caso":
-          setAtual(event.id);
-          break;
-        case "resultado":
-          setResultados((current) => ({ ...current, [event.id]: event }));
-          setAtual(null);
-          break;
-      }
-    };
-    void onBancadaEvent(handle).then((un) => {
-      if (cancelled) un();
-      else unlisten = un;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
-
-  const rodar = useCallback(async () => {
-    setErro(null);
-    try {
-      await api.bancadaRodar();
-    } catch (cause) {
-      setErro(message(cause));
-    } finally {
-      setAndando(false);
-      setAtual(null);
-    }
-  }, []);
-
-  const parar = useCallback(async () => {
-    try {
-      await api.bancadaParar();
-    } catch (cause) {
-      setErro(message(cause));
-    }
-  }, []);
+  const { resultados, andando, atual, modelo } = rodada;
 
   const feitos = Object.values(resultados);
   const reprovados = feitos.filter((r) => r.estado === "reprovado").length;
@@ -101,13 +44,13 @@ export function BancadaDialog({ onClose }: Props) {
             type="button"
             className="primary"
             disabled={andando}
-            onClick={() => void rodar()}
+            onClick={onRodar}
           >
             <Icon name="play" />
             {t("bancada.rodar")}
           </button>
           {andando && (
-            <button type="button" className="danger" onClick={() => void parar()}>
+            <button type="button" className="danger" onClick={onParar}>
               <Icon name="stop" />
               {t("bancada.cancelar")}
             </button>

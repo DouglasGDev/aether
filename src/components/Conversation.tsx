@@ -25,6 +25,11 @@ export interface ToolRun {
 
 export interface Turn {
   role: "user" | "assistant";
+  /// Identificador do desenho, não do conteúdo. O índice do array não serve de
+  /// chave: os turnos crescem durante o streaming, somem quando a conversa é
+  /// trocada e são recortados quando a compactação entra — e com chave de índice
+  /// o React empresta o `<details>` já aberto de um turno para o outro.
+  chave: string;
   text: string;
   thinking: string;
   tools: ToolRun[];
@@ -37,14 +42,21 @@ export interface Turn {
   /// É o mesmo cartão da ferramenta: muda a origem, não o dado.
   memoria: Extract<Vista, { type: "memoria" }> | null;
   /// O resumo que este turno escreveu no lugar das mensagens que saíram do
-  /// prompt, e quantas elas eram. O cartão é a prova de que ele leu o começo da
-  /// conversa condensado — e do que pôs no lugar.
-  resumo: { texto: string; mensagens: number } | null;
+  /// prompt. O cartão é a prova de que ele leu o começo da conversa condensado
+  /// — e do que pôs no lugar. `descartadas` são as que saíram sem ser lidas:
+  /// couberam no corte, não coube na régua do resumo.
+  resumo: { texto: string; mensagens: number; descartadas: number } | null;
 }
 
+/// A fileira dos turnos desenhados. Só precisa não repetir: cada um nasce com
+/// a sua e a leva enquanto existir.
+let turnosDesenhados = 0;
+
 export function emptyTurn(role: Turn["role"]): Turn {
+  turnosDesenhados += 1;
   return {
     role,
+    chave: `t${turnosDesenhados}`,
     text: "",
     thinking: "",
     tools: [],
@@ -90,13 +102,13 @@ export function Conversation({ turns, aguardando }: Props) {
 
   return (
     <div className="talk">
-      {turns.map((turn, index) =>
+      {turns.map((turn) =>
         turn.role === "user" ? (
-          <div className="talk-user" key={index}>
+          <div className="talk-user" key={turn.chave}>
             {turn.text}
           </div>
         ) : (
-          <div className="talk-agent" key={index}>
+          <div className="talk-agent" key={turn.chave}>
             {turn.choice !== null && (
               <div className="talk-model">
                 <Icon name="spark" />
@@ -141,6 +153,13 @@ export function Conversation({ turns, aguardando }: Props) {
                       n: inteiro(turn.resumo.mensagens, idioma),
                     })}
                   </span>
+                  {turn.resumo.descartadas > 0 && (
+                    <span className="contagem aviso">
+                      {t("conversa.resumoDescartadas", {
+                        n: inteiro(turn.resumo.descartadas, idioma),
+                      })}
+                    </span>
+                  )}
                 </summary>
                 <p>{turn.resumo.texto}</p>
               </details>

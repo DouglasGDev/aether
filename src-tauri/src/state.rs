@@ -9,7 +9,40 @@ use crate::permissions::PermissionGate;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{
+    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+};
+
+/// Trava de um dado de estado puro: um `Option`, um `Vec`, um `HashMap` ou um
+/// struct que só muda por operação inteira. Um panic segurando uma destas travas
+/// não deixa o valor pela metade — `push`, `insert` e uma atribuição de campo ou
+/// acontecem inteiros ou não acontecem, e o que faz a alocação falhar no meio
+/// aborta o processo em vez de fazer unwind. `into_inner` devolve, portanto, o
+/// estado de verdade.
+///
+/// A outra opção era panicar, e ela cai na thread errada: `ai_status`,
+/// `chat_history` e `adaptadores_estado` são comandos **síncronos**, que correm
+/// na thread da janela e não têm `Result` na assinatura. Um panic neles não
+/// devolve um motivo à tela — fecha a aplicação inteira no meio de um clique,
+/// com a conversa intacta escrita no disco ao lado. Recuperação silenciosa não
+/// é: o que se perde aqui é a marca de que um panic aconteceu, e o que se
+/// preserva é o que o usuário tinha.
+pub(crate) fn trava_estado<T>(memo: &Mutex<T>) -> MutexGuard<'_, T> {
+    memo.lock().unwrap_or_else(|envenenado| envenenado.into_inner())
+}
+
+/// Leitura de um dado de estado puro atrás de `RwLock` — a mesma política e a
+/// mesma razão de `trava_estado`.
+pub(crate) fn trava_leitura<T>(memo: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    memo.read()
+        .unwrap_or_else(|envenenado| envenenado.into_inner())
+}
+
+/// Escrita de um dado de estado puro atrás de `RwLock`.
+pub(crate) fn trava_escrita<T>(memo: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    memo.write()
+        .unwrap_or_else(|envenenado| envenenado.into_inner())
+}
 
 pub struct AppState {
     pub manager: Arc<McpManager>,
@@ -125,6 +158,19 @@ pub struct AiRuntime {
     downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
+/// O lugar do turno reservado. O `Drop` devolve o flag: sem isso, um panic no
+/// corpo da troca — ou uma recusa no meio dela — deixaria `busy` preso e
+/// travaria todos os turnos seguintes até reiniciar o aplicativo. É um flag
+/// atômico, não um lock: não cria aresta de ordenação com o motor, e é por isso
+/// que ele segura o turno sem esperar o motor.
+pub struct Reserva<'a>(&'a AiRuntime);
+
+impl Drop for Reserva<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 impl AiRuntime {
     pub fn new(
         models_root: PathBuf,
@@ -158,7 +204,7 @@ impl AiRuntime {
     /// Registra um download. Devolve None se este modelo já está baixando: duas
     /// tarefas escreveriam no mesmo `.part`.
     pub fn begin_download(&self, id: &str) -> Option<Arc<AtomicBool>> {
-        let mut jobs = self.downloads.lock().expect("downloads envenenados");
+        let mut jobs = trava_estado(&self.downloads);
         if jobs.contains_key(id) {
             return None;
         }
@@ -168,11 +214,11 @@ impl AiRuntime {
     }
 
     pub fn end_download(&self, id: &str) {
-        self.downloads.lock().expect("downloads envenenados").remove(id);
+        trava_estado(&self.downloads).remove(id);
     }
 
     pub fn cancel_download(&self, id: &str) -> bool {
-        match self.downloads.lock().expect("downloads envenenados").get(id) {
+        match trava_estado(&self.downloads).get(id) {
             Some(cancel) => {
                 cancel.store(true, Ordering::Relaxed);
                 true
@@ -182,10 +228,7 @@ impl AiRuntime {
     }
 
     pub fn downloading(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .downloads
-            .lock()
-            .expect("downloads envenenados")
+        let mut ids: Vec<String> = trava_estado(&self.downloads)
             .keys()
             .cloned()
             .collect();
@@ -194,33 +237,36 @@ impl AiRuntime {
     }
 
     pub fn loaded_id(&self) -> Option<String> {
-        self.loaded_id.lock().expect("modelo envenenado").clone()
+        trava_estado(&self.loaded_id).clone()
     }
 
     /// Onde o modelo carregado está rodando. `None` enquanto não há modelo.
     pub fn acelerador(&self) -> Option<crate::ai::Acelerador> {
-        self.acelerador.lock().expect("acelerador envenenado").clone()
+        trava_estado(&self.acelerador).clone()
     }
 
     pub fn ajustes(&self) -> geracao::Ajustes {
-        self.geracao.lock().expect("geração envenenada").clone()
+        trava_estado(&self.geracao).clone()
     }
 
     /// Grava as escalas e devolve o que valeu depois da faixa. Mudar a janela de
     /// contexto muda o modelo que está em memória, porque o KV cache é reservado
     /// no carregamento: solta o motor quando não há turno em curso, para o
     /// próximo já reservar a janela nova.
+    ///
+    /// O motor é solto **antes** de qualquer gravação, e a ordem é a mesma da
+    /// troca de conversa: se ele estiver nas mãos de uma carga em curso, a recusa
+    /// sai limpa — `geracao.json` continua dizendo o que está rodando. Esperar
+    /// por ele aqui era prender a thread da janela, porque `ai_ajustar` é comando
+    /// síncrono.
     pub fn ajustar(&self, novos: geracao::Ajustes) -> anyhow::Result<geracao::Ajustes> {
         let novos = novos.aprovar();
         let antes = self.ajustes();
-        novos.salvar(&self.geracao_path)?;
-        *self.geracao.lock().expect("geração envenenada") = novos.clone();
-        if novos.janela_mudou(&antes) && !self.is_busy() {
-            let id = self.loaded_id();
-            if let Some(id) = id {
-                self.unload(&id)?;
-            }
+        if novos.janela_mudou(&antes) {
+            self.liberar_motor_para_janela()?;
         }
+        novos.salvar(&self.geracao_path)?;
+        *trava_estado(&self.geracao) = novos.clone();
         Ok(novos)
     }
 
@@ -232,12 +278,12 @@ impl AiRuntime {
 
     /// A escolha gravada em `adaptadores.json`.
     pub fn adaptadores(&self) -> adaptadores::Ajustes {
-        self.adaptadores.lock().expect("adaptadores envenenados").clone()
+        trava_estado(&self.adaptadores).clone()
     }
 
     /// O que o motor respondeu da última aplicação. Sem motor, vazio.
     pub fn aplicados(&self) -> Vec<crate::ai::ggml::Aplicado> {
-        self.aplicados.lock().expect("aplicados envenenados").clone()
+        trava_estado(&self.aplicados).clone()
     }
 
     /// A tela de ajuste inteiro numa leitura: os arquivos da pasta, a escolha do
@@ -259,16 +305,21 @@ impl AiRuntime {
     /// Põe a escolha gravada sobre o modelo em memória. Sem modelo carregado não
     /// há pesos para somar: devolve vazio e a escolha fica esperando o
     /// carregamento, que a aplica em `acquire`.
-    pub fn aplicar_adaptadores(&self) -> Vec<crate::ai::ggml::Aplicado> {
+    ///
+    /// Espera a trava do motor, e pode: os três chamadores correm em
+    /// `spawn_blocking` e recusam antes quando há turno em curso. O que devolve
+    /// erro é a trava envenenada — o motor aí é suspeito, e somar um adaptador
+    /// sobre pesos pela metade é a tela jurar "aplicado" sobre nada.
+    pub fn aplicar_adaptadores(&self) -> anyhow::Result<Vec<crate::ai::ggml::Aplicado>> {
         let pedidos = self.adaptadores().pedidos();
-        let mut guard = self.loaded.lock().expect("motor envenenado");
+        let mut guard = self.trava_motor()?;
         let Some(carregado) = guard.as_mut() else {
-            *self.aplicados.lock().expect("aplicados envenenados") = Vec::new();
-            return Vec::new();
+            *trava_estado(&self.aplicados) = Vec::new();
+            return Ok(Vec::new());
         };
         let aplicados = carregado.engine.usar_adaptadores(&pedidos);
-        *self.aplicados.lock().expect("aplicados envenenados") = aplicados.clone();
-        aplicados
+        *trava_estado(&self.aplicados) = aplicados.clone();
+        Ok(aplicados)
     }
 
     /// Grava a escolha e a aplica. Recusa enquanto há turno em curso: os pesos
@@ -283,8 +334,8 @@ impl AiRuntime {
         }
         let novos = novos.aprovar();
         novos.salvar(&self.adaptadores_path)?;
-        *self.adaptadores.lock().expect("adaptadores envenenados") = novos;
-        self.aplicar_adaptadores();
+        *trava_estado(&self.adaptadores) = novos;
+        self.aplicar_adaptadores()?;
         Ok(self.estado_adaptadores())
     }
 
@@ -302,9 +353,9 @@ impl AiRuntime {
             .push(adaptadores::Pino { caminho: ficha.caminho.clone(), forca: 1.0, ativo: true });
         let novos = novos.aprovar();
         novos.salvar(&self.adaptadores_path)?;
-        *self.adaptadores.lock().expect("adaptadores envenenados") = novos;
+        *trava_estado(&self.adaptadores) = novos;
         // Um arquivo novo no disco não está nos pesos ainda; só a aplicação diz.
-        self.aplicar_adaptadores();
+        self.aplicar_adaptadores()?;
         Ok(self.estado_adaptadores())
     }
 
@@ -319,8 +370,8 @@ impl AiRuntime {
         let novos = self.adaptadores().sem_pino(caminho);
         let novos = novos.aprovar();
         novos.salvar(&self.adaptadores_path)?;
-        *self.adaptadores.lock().expect("adaptadores envenenados") = novos;
-        self.aplicar_adaptadores();
+        *trava_estado(&self.adaptadores) = novos;
+        self.aplicar_adaptadores()?;
         Ok(self.estado_adaptadores())
     }
 
@@ -328,7 +379,7 @@ impl AiRuntime {
     /// pedida. `None` sem modelo em memória. É a cópia gravada no carregamento,
     /// não uma leitura do motor: o turno prende o motor a geração inteira.
     pub fn janela(&self) -> Option<usize> {
-        *self.janela.lock().expect("janela envenenada")
+        *trava_estado(&self.janela)
     }
 
     pub fn is_busy(&self) -> bool {
@@ -352,6 +403,14 @@ impl AiRuntime {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Reserva atômica do lugar do turno com o mesmo CAS que `chat_send` usa
+    /// para começar. `None` quando já há turno em curso — ou outra troca
+    /// reservada. É um flag, não um lock: não cria aresta de ordenação com o
+    /// motor, e é isso que permite segurar o turno sem esperar o motor.
+    pub fn reservar(&self) -> Option<Reserva<'_>> {
+        self.begin().then(|| Reserva(self))
+    }
+
     /// Executa uma troca de conversa com o lugar do turno reservado. O `begin`
     /// é o mesmo CAS que `chat_send` usa para começar um turno: ou a troca
     /// acontece inteira antes de qualquer turno poder começar, ou o turno já
@@ -365,17 +424,67 @@ impl AiRuntime {
         &self,
         troca: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        if !self.begin() {
-            anyhow::bail!(crate::idiomas::tr("erros.turnoEmAndamento", &[]));
+        let _reserva = self.reservar().ok_or_else(|| {
+            anyhow::anyhow!(crate::idiomas::tr("erros.turnoEmAndamento", &[]))
+        })?;
+        troca()
+    }
+
+    /// O que fazer com a trava do motor quando ela volta envenenada: o
+    /// `LoadedModel` de dentro **não** é recuperável, e é por isso que aqui não
+    /// há `into_inner` de estado puro. A trava é segurada por código que monta os
+    /// pesos delta a delta (`Engine::load`, `usar_adaptadores`) e por uma
+    /// geração inteira (`session::run_turn`, `bancada::rodar`): um panic ali
+    /// deixa ou um modelo pela metade ou um modelo com metade de um adaptador
+    /// somado, e continuar falando com ele seria cobrar do usuário a resposta de
+    /// um modelo que não existe em lugar nenhum. Descarta-se o payload — e com
+    /// ele os caches de placa, janela, nome e aplicados, para a tela não dizer
+    /// nada do motor que sumiu — e devolve-se o motivo real. A trava em si volta
+    /// a ser utilizável: envenenamento permanente travaria todo turno seguinte
+    /// até reiniciar o aplicativo, que é o panic fazendo pior que o defeito.
+    fn descarta_motor_envenenado(
+        &self,
+        mut guard: MutexGuard<'_, Option<LoadedModel>>,
+    ) -> anyhow::Error {
+        // Com a trava já na mão, na ordem de sempre: motor → caches.
+        *guard = None;
+        *trava_estado(&self.acelerador) = None;
+        *trava_estado(&self.janela) = None;
+        *trava_estado(&self.loaded_id) = None;
+        *trava_estado(&self.aplicados) = Vec::new();
+        // O payload foi descartado inteiro, então a marca de envenenamento não
+        // representa mais nada: sem isto a trava ficaria suspeita para sempre e
+        // todo turno seguinte recusaria até o aplicativo reiniciar.
+        self.loaded.clear_poison();
+        anyhow::anyhow!(crate::idiomas::tr("erros.motorEnvenenado", &[]))
+    }
+
+    /// Trava do motor **esperada**. Só para caminho que não corre na thread da
+    /// janela: o `acquire` do turno, o `preload` e a aplicação de adaptadores,
+    /// todos atrás de um `spawn_blocking`. Esperar aqui é legítimo — esperar é o
+    /// que serializa dois carregamentos no mesmo modelo.
+    fn trava_motor(&self) -> anyhow::Result<MutexGuard<'_, Option<LoadedModel>>> {
+        match self.loaded.lock() {
+            Ok(guard) => Ok(guard),
+            Err(envenenado) => Err(self.descarta_motor_envenenado(envenenado.into_inner())),
         }
-        struct Reserva<'a>(&'a AiRuntime);
-        impl Drop for Reserva<'_> {
-            fn drop(&mut self) {
-                self.0.end();
+    }
+
+    /// Trava do motor **tentada**, nunca esperada: para os caminhos que um
+    /// comando síncrono da janela pode alcançar (`esquecer`, `unload`, a liberação
+    /// que a troca de janela faz). Quem segura o motor agora é uma geração ou uma
+    /// carga, e as duas duram o tempo que a pessoa não pode esperar de um clique.
+    /// A recusa sai com o motivo real, e nada foi mutado antes dela.
+    fn trava_motor_sem_esperar(&self) -> anyhow::Result<MutexGuard<'_, Option<LoadedModel>>> {
+        match self.loaded.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => {
+                Err(anyhow::anyhow!(crate::idiomas::tr("erros.motorOcupado", &[])))
+            }
+            Err(TryLockError::Poisoned(envenenado)) => {
+                Err(self.descarta_motor_envenenado(envenenado.into_inner()))
             }
         }
-        let _reserva = Reserva(self);
-        troca()
     }
 
     /// Manda o motor em memória esquecer o KV. Quem troca de conversa carrega
@@ -390,13 +499,7 @@ impl AiRuntime {
     /// `troca_exclusiva`, o único ocupante possível é uma carga/aplicação, não um
     /// turno: o turno já teria derrotado a reserva.
     pub fn esquecer(&self) -> anyhow::Result<()> {
-        let mut guard = match self.loaded.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                anyhow::bail!(crate::idiomas::tr("erros.motorOcupado", &[]))
-            }
-            Err(std::sync::TryLockError::Poisoned(erro)) => panic!("motor envenenado: {erro}"),
-        };
+        let mut guard = self.trava_motor_sem_esperar()?;
         if let Some(carregado) = guard.as_mut() {
             carregado.engine.reset();
         }
@@ -408,7 +511,7 @@ impl AiRuntime {
     /// decidiria pela RAM do sistema — que é exatamente o que não decide a
     /// velocidade quando existe uma placa.
     pub fn candidatos(&self, available: &[&'static ModelSpec]) -> Vec<crate::ai::router::Candidato> {
-        let mut cache = self.fichas.lock().expect("fichas envenenadas");
+        let mut cache = trava_estado(&self.fichas);
         available
             .iter()
             .map(|spec| {
@@ -428,7 +531,24 @@ impl AiRuntime {
     }
 
     /// Carrega o modelo pedido se ainda não é ele, e devolve o guard do turno.
-    /// O guard é segurado durante a geração inteira.
+    ///
+    /// **O guard é segurado durante a geração inteira, e é assim por design**
+    /// (CONC2; a regra de `CONTRIBUTING.md` descreve isto desde então). Um turno
+    /// escreve no KV cache do modelo em memória célula a célula; dois turnos sobre
+    /// o mesmo motor não são dois turnos mais rápidos, são o prefixo de tokens de
+    /// um pedido misturado com o de outro. O que serializa isso é esta trava,
+    /// tomada por `run_chat_turn` antes do primeiro token e largada depois do
+    /// último — inclusive sobre a espera do gate de aprovação, que é o turno
+    /// pedindo licença no meio da geração.
+    ///
+    /// O que nunca espera esta trava é comando síncrono da thread da janela: a
+    /// tela lê os caches gravados aqui embaixo (`acelerador`, `janela`,
+    /// `loaded_id`, `aplicados`) e as recusas rápidas de `esquecer` e `unload`.
+    /// Quem precisa do motor de verdade — turno, `preload`, bancada, adaptadores
+    /// — roda em `spawn_blocking`, onde esperar não prende quem desenha.
+    ///
+    /// Ordem fixa: `geracao`/`adaptadores` lidos **antes** de tomar o motor, e os
+    /// caches sempre **depois** dele. Duas ordens opostas são o deadlock clássico.
     pub fn acquire(
         &self,
         spec: &'static ModelSpec,
@@ -439,7 +559,7 @@ impl AiRuntime {
         // O mesmo para os adaptadores: a escolha é lida aqui, fora do lock do
         // motor, que é segurado a geração inteira.
         let pedidos = self.adaptadores().pedidos();
-        let mut guard = self.loaded.lock().expect("motor envenenado");
+        let mut guard = self.trava_motor()?;
         let stale = guard.as_ref().map(|m| m.spec.id != spec.id).unwrap_or(true);
         if stale {
             let dir = catalog::model_dir(&self.models_root, spec);
@@ -454,7 +574,7 @@ impl AiRuntime {
             // `ajustar`, é o que faz a escolha do dono valer para o modelo que ele
             // acabou de ligar — com o relatório do motor no lugar de uma suposição.
             let aplicados = engine.usar_adaptadores(&pedidos);
-            *self.aplicados.lock().expect("aplicados envenenados") = aplicados;
+            *trava_estado(&self.aplicados) = aplicados;
             // O template é o que os pesos carregados declaram. Um GGUF traz o
             // seu, e é ele que o modelo viu no treino; o arquivo do repositório
             // de origem pode ser outra versão — e versão diferente é gramática
@@ -463,15 +583,14 @@ impl AiRuntime {
                 Some(fonte) => ChatTemplate::from_string(fonte, spec.weights_file)?,
                 None => ChatTemplate::from_file(&dir.join("chat_template.jinja"))?,
             };
-            *self.acelerador.lock().expect("acelerador envenenado") =
-                Some(engine.acelerador().clone());
+            *trava_estado(&self.acelerador) = Some(engine.acelerador().clone());
             // A janela real é a que a biblioteca aceitou, e ela é gravada aqui,
             // ainda com o motor na mão: depois de soltá-lo não há como lê-la sem
             // prender a thread da janela no meio do turno.
-            *self.janela.lock().expect("janela envenenada") = Some(engine.context());
+            *trava_estado(&self.janela) = Some(engine.context());
             *guard = Some(LoadedModel { engine, template, spec });
         }
-        *self.loaded_id.lock().expect("modelo envenenado") = Some(spec.id.to_string());
+        *trava_estado(&self.loaded_id) = Some(spec.id.to_string());
         Ok(guard)
     }
 
@@ -487,17 +606,50 @@ impl AiRuntime {
         if self.is_busy() {
             anyhow::bail!(crate::idiomas::tr("erros.turnoEmAndamentoRemover", &[]));
         }
-        let mut guard = self.loaded.lock().expect("motor envenenado");
+        // O portão acima não fecha o vão entre olhar o flag e travar: um turno
+        // que comece nesse vão segura o motor a geração inteira, e esperar por
+        // ele aqui é exatamente o congelamento que este arquivo existe para não
+        // ter. Recusa na hora, com o motivo real, sem ter tocado em nada.
+        self.solta_motor(id)?;
+        Ok(())
+    }
+
+    /// Corpo de `unload` sem o portão de turno, para quem já reservou o lugar do
+    /// turno e precisa soltar o motor sem esperar por ele. Devolve `true` só
+    /// quando o motor em memória era mesmo este modelo: dizer que soltou o que
+    /// não estava na placa seria a mesma mentira do contrário.
+    fn solta_motor(&self, id: &str) -> anyhow::Result<bool> {
+        let mut guard = self.trava_motor_sem_esperar()?;
         if guard.as_ref().map(|m| m.spec.id == id).unwrap_or(false) {
             *guard = None;
-            *self.acelerador.lock().expect("acelerador envenenado") = None;
-            *self.janela.lock().expect("janela envenenada") = None;
-            *self.loaded_id.lock().expect("modelo envenenado") = None;
+            *trava_estado(&self.acelerador) = None;
+            *trava_estado(&self.janela) = None;
+            *trava_estado(&self.loaded_id) = None;
             // Sem motor não há pesos, e dizer que algo está aplicado sobre nada
             // seria a tela mentir depois de um "descarregar".
-            *self.aplicados.lock().expect("aplicados envenenados") = Vec::new();
+            *trava_estado(&self.aplicados) = Vec::new();
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// Solta o motor para a janela nova, com o lugar do turno reservado. As três
+    /// saídas dizem coisas diferentes, e a reserva é o que as separa: `Ok(false)`
+    /// — não havia motor para soltar (ou há turno em curso, e a janela nova entra
+    /// em vigor no próximo carregamento; a tela mostra `janela`, a que o backend
+    /// aceitou, não a pedida); `Ok(true)` — o motor estava parado e caiu; `Err` —
+    /// o motor está nas mãos de uma carga ou de uma troca de modelo, com o motivo
+    /// real, e nada foi gravado ainda. Sem a reserva, um turno começando no vão
+    /// entre o `is_busy` e a trava apareceria como "carga em curso", que é outra
+    /// resposta — e é ela que a tela mostraria.
+    fn liberar_motor_para_janela(&self) -> anyhow::Result<bool> {
+        let Some(_reserva) = self.reservar() else {
+            return Ok(false);
+        };
+        let Some(id) = self.loaded_id() else {
+            return Ok(false);
+        };
+        self.solta_motor(&id)
     }
 }
 
@@ -580,6 +732,111 @@ mod tests {
             "com o motor ocupado o esquecer devia recusar com o motivo real, não bloquear"
         );
         drop(guard);
+    }
+
+    /// Vermelho-primeiro (CONC2, opção 2): `ai_ajustar` é comando síncrono, e
+    /// `ajustar` chamava `unload`, que fazia `loaded.lock()` **bloqueante**. Com
+    /// um turno em curso — ou uma carga em curso, que é o `preload` segurando a
+    /// mesma trava por segundos — a thread da janela esperava ali, exatamente o
+    /// congelamento que a regra de `CONTRIBUTING.md` proíbe. O guard preso abaixo
+    /// é a geração em curso; a troca de janela tem de recusar na hora, com o
+    /// motivo real, sem ter gravado nada.
+    #[test]
+    fn a_troca_de_janela_nao_espera_o_motor_na_thread_da_janela() {
+        let ai = runtime_de_teste("janela");
+        // Sem modelo em memória não há o que soltar, e o caminho nem tenta o
+        // motor: é ele que precisa estar aberto para a barreira fazer sentido.
+        *ai.loaded_id.lock().expect("modelo envenenado") =
+            Some("granite-4.2-3b-Q4_K_M".to_string());
+        let antes = ai.ajustes();
+        let novos = geracao::Ajustes { contexto: antes.contexto + 4096, ..antes.clone() };
+
+        let guard = ai.loaded.lock().expect("motor envenenado");
+        let outro = Arc::clone(&ai);
+        let (tx, rx) = mpsc::channel();
+        // `thread::scope` travaria a suíte aqui: no estado vermelho o thread
+        // chamado fica preso no `lock()`, e o join do scope espera esse mesmo
+        // lock. Um thread comum devolve o controle e morre quando o
+        // `guard` abaixo é solto.
+        std::thread::spawn(move || {
+            let _ = tx.send(outro.ajustar(novos));
+        });
+
+        // A barreira de 500 ms é a da casa (`o_estado_nao_espera_o_motor_da_varredura`).
+        let chegou = rx.recv_timeout(Duration::from_millis(500));
+        drop(guard);
+
+        let resultado = chegou.expect(
+            "ajustar esperou o motor: um comando síncrono prendeu a thread da janela a geração inteira",
+        );
+        let erro = resultado.expect_err("com o motor nas mãos de outra tarefa a troca de janela tinha de recusar");
+        let motivo = erro.to_string();
+        assert!(
+            motivo.contains("motor"),
+            "esperava o motivo real de motor ocupado, veio: {motivo}"
+        );
+        // Recusa limpa, sem efeito pela metade: nada foi gravado, nada mudou em
+        // memória, e a reserva do turno foi devolvida.
+        assert_eq!(ai.ajustes().contexto, antes.contexto, "a janela foi trocada apesar da recusa");
+        assert!(!ai.is_busy(), "a reserva do turno ficou presa na recusa");
+    }
+
+    /// Vermelho-primeiro (A8): o `expect` na trava do motor derrubava a thread.
+    /// Ela é segurada por código que pode panicar no meio — a carga dos pesos, a
+    /// aplicação delta a delta dos adaptadores, uma geração — e nesses casos o
+    /// `LoadedModel` dentro da trava **não** é um estado válido: seria continuar
+    /// a conversa com pesos meio-aplicados, que não são modelo publicado nenhum.
+    /// A resposta certa é o erro real, com o motor descartado, não um panic e
+    /// também não uma recuperação silenciosa.
+    #[test]
+    fn o_motor_envenenado_devolve_o_motivo_real_e_descarta_o_motor() {
+        let ai = runtime_de_teste("motor-envenenado");
+        let dentro = Arc::clone(&ai);
+        let envenenador = std::thread::spawn(move || {
+            let _guard = dentro.loaded.lock().expect("motor envenenado");
+            panic!("um panic segurando a trava do motor");
+        });
+        let _ = envenenador.join();
+        assert!(ai.loaded.is_poisoned(), "o teste não envenenou a trava do motor");
+
+        let spec = catalog::find("granite-4.2-3b-Q4_K_M").expect("modelo do catálogo");
+        // `MutexGuard<Option<LoadedModel>>` não é `Debug`, e um motor em memória
+        // não tem como ser impresso: é `err()`, não `expect_err()`.
+        let adquirido = ai.acquire(spec);
+        assert!(
+            adquirido.is_err(),
+            "com a trava envenenada o acquire tinha de devolver o motivo real, não panicar"
+        );
+        let erro = adquirido.err().expect("o acquire devolveu o motor");
+        assert!(
+            erro.to_string().contains("motor"),
+            "esperava o motivo real do motor, veio: {erro}"
+        );
+        // Descartado, não reaproveitado: a trava volta a ser utilizável e o
+        // próximo carregamento vem dos pesos em disco, não do payload suspeito.
+        assert!(!ai.loaded.is_poisoned(), "a trava do motor continuou envenenada");
+        assert!(ai.loaded.lock().expect("motor envenenado").is_none());
+        assert_eq!(ai.loaded_id(), None, "o cache de modelo dizia haver motor");
+    }
+
+    /// Vermelho-primeiro (A8): o `esquecer` panicava na trava envenenada, e ele
+    /// é chamado por comando síncrono da janela — panicar ali fecha a aplicação
+    /// inteira no meio de um clique. A política do motor é uma só: motivo real.
+    #[test]
+    fn o_esquecer_devolve_o_motivo_real_quando_a_trava_do_motor_esta_envenenada() {
+        let ai = runtime_de_teste("esquecer-envenenado");
+        let dentro = Arc::clone(&ai);
+        let envenenador = std::thread::spawn(move || {
+            let _guard = dentro.loaded.lock().expect("motor envenenado");
+            panic!("um panic segurando a trava do motor");
+        });
+        let _ = envenenador.join();
+
+        let erro = ai
+            .esquecer()
+            .expect_err("com a trava envenenada o esquecer tinha de devolver o motivo real");
+        assert!(erro.to_string().contains("motor"), "veio: {erro}");
+        assert!(!ai.loaded.is_poisoned(), "a trava continuou envenenada");
     }
 
     /// A atomicidade que fecha o TOCTOU: enquanto a troca de conversa está dentro

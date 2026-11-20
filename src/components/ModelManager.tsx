@@ -3,7 +3,9 @@ import { api, message, onModelEvent } from "../lib/api";
 import { bytes, inteiro, numero } from "../lib/display";
 import { useIdioma, useT, type Traduzir } from "../lib/i18n";
 import type { Acelerador, Alojado, ModelEvent, ModelStatus } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
+import { BarraDeTrabalho } from "./BarraDeTrabalho";
 
 interface Props {
   onClose: () => void;
@@ -11,7 +13,9 @@ interface Props {
 }
 
 interface Job {
-  fase: "preparando" | "pesos" | "apoio";
+  /// `null` é "há um trabalho registrado no núcleo, mas esta janela não viu o
+  /// evento que dizia em que fase ele estava". A barra não chuta fase.
+  fase: "preparando" | "pesos" | "apoio" | null;
   arquivo?: string;
   done: number;
   total: number;
@@ -49,6 +53,7 @@ function alojamento(
 }
 
 export function ModelManager({ onClose, onLoaded }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
   const [models, setModels] = useState<ModelStatus[]>([]);
@@ -56,12 +61,17 @@ export function ModelManager({ onClose, onLoaded }: Props) {
   const [fixado, setFixado] = useState("");
   const [acelerador, setAcelerador] = useState<Acelerador | null>(null);
   const [jobs, setJobs] = useState<Record<string, Job>>({});
+  /// Os downloads que o núcleo tem registrados agora (`ai_status.downloading`).
+  const [emCurso, setEmCurso] = useState<string[]>([]);
   const [faults, setFaults] = useState<Record<string, string>>({});
   const [tab, setTab] = useState<"descobrir" | "meus">("descobrir");
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [acting, setActing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /// A primeira leitura do estado terminou. Sem isto, a lista vazia de um
+  /// `ai_status` que ainda não respondeu é exibida como "nada encontrado".
+  const [lido, setLido] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -70,6 +80,8 @@ export function ModelManager({ onClose, onLoaded }: Props) {
       setLoaded(status.loaded);
       setFixado(status.ajustes.modelo);
       setAcelerador(status.acelerador);
+      setEmCurso(status.downloading);
+      setLido(true);
     } catch (cause) {
       setError(message(cause));
     }
@@ -224,11 +236,21 @@ export function ModelManager({ onClose, onLoaded }: Props) {
     }
   }
 
+  /// O trabalho de uma linha é o que os eventos contaram para ela ou o que o
+  /// núcleo registra como em curso: reabrir a janela no meio de um download
+  /// deixava a linha oferecendo "Baixar", e o núcleo recusava o segundo pedido
+  /// com "este modelo já está baixando" (`commands.rs`). Sem os bytes lidos
+  /// ainda — eles só chegam por evento — a barra fica vazia e a ponta mostra o
+  /// traço; a fase desconhecida não é inventada.
+  const trabalho = (id: string): Job | undefined =>
+    jobs[id] ??
+    (emCurso.includes(id) ? { fase: null, done: 0, total: 0, speed: 0 } : undefined);
+
   const row = (model: ModelStatus) => (
     <VariantRow
       key={model.id}
       model={model}
-      job={jobs[model.id]}
+      job={trabalho(model.id)}
       fault={faults[model.id] ?? ""}
       loaded={loaded === model.id}
       acting={acting === model.id}
@@ -359,7 +381,10 @@ export function ModelManager({ onClose, onLoaded }: Props) {
                         })}{" "}
                         ·{" "}
                         {t("modelos.contexto", {
-                          n: `${Math.round(head.contextLimit / 1000)}k`,
+                          // O número é o que o cabeçalho GGUF declarou, como no
+                          // chip de janela da geração: arredondar para "33k"
+                          // punha na tela um limite que ninguém leu.
+                          n: numero(head.contextLimit, idioma, 0),
                         })}{" "}
                         · {head.license}
                       </span>
@@ -387,7 +412,10 @@ export function ModelManager({ onClose, onLoaded }: Props) {
                   </section>
                 );
               })}
-              {families.length === 0 && (
+              {!lido && error === null && (
+                <p className="sheet-note">{t("geral.carregando")}</p>
+              )}
+              {lido && families.length === 0 && (
                 <p className="sheet-note">{t("modelos.nadaEncontrado")}</p>
               )}
             </div>
@@ -395,7 +423,10 @@ export function ModelManager({ onClose, onLoaded }: Props) {
         ) : (
           <div className="model-variants">
             {mine.map(row)}
-            {mine.length === 0 && (
+            {!lido && error === null && (
+              <p className="sheet-note">{t("geral.carregando")}</p>
+            )}
+            {lido && mine.length === 0 && (
               <p className="sheet-note">{t("modelos.nenhumDisco")}</p>
             )}
           </div>
@@ -432,10 +463,6 @@ function VariantRow({
   const { id: idioma } = useIdioma();
   const onDisk = model.downloadedBytes;
   const interrupted = model.partialBytes > 0 && !model.complete;
-  const percent =
-    job !== undefined && job.total > 0
-      ? Math.min(100, (job.done / job.total) * 100)
-      : 0;
 
   return (
     <div className={loaded ? "model-variant loaded" : "model-variant"}>
@@ -460,26 +487,24 @@ function VariantRow({
       </div>
 
       {job !== undefined ? (
-        <div className="model-job">
-          <span className="model-job-phase">
-            {job.fase === "apoio" ? job.arquivo ?? "" : t(`modelos.${job.fase}`)}
-          </span>
-          <span className="model-bar">
-            <span className="model-bar-fill" style={{ width: `${percent}%` }} />
-          </span>
-          <span className="model-job-read">
-            {job.total > 0 ? `${numero(percent, idioma, 1)}%` : "—"}
-            {job.speed > 0 && ` · ${bytes(job.speed, idioma)}/s`}
-          </span>
-          <button
-            type="button"
-            className="icon-only"
-            onClick={onCancel}
-            aria-label={t("modelos.cancelar", { nome: model.display })}
-          >
-            <Icon name="cross" />
-          </button>
-        </div>
+        <BarraDeTrabalho
+          fase={
+            job.fase === null
+              ? ""
+              : job.fase === "apoio"
+                ? job.arquivo ?? ""
+                : t(`modelos.${job.fase}`)
+          }
+          feito={job.done}
+          total={job.total}
+          velocidade={job.speed}
+          // Os arquivos de apoio são cópias locais: não há byte de rede a
+          // contar, então o percentual do peso fica para trás em vez de virar
+          // andamento da fase.
+          contavel={job.fase !== "apoio"}
+          aoCancelar={onCancel}
+          rotuloCancelar={t("modelos.cancelar", { nome: model.display })}
+        />
       ) : (
         <div className="model-actions">
           {model.complete && (

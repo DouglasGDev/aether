@@ -200,21 +200,55 @@ o derrotam:
 
 ## Recomendações documentadas (fora deste lote, com evidência)
 
-- **TLS por conexão** (`bancos/motor/mssql.rs:204` trust_cert, `postgres.rs:151`
-  NoTls): flag opt-in de verify/encrypt por conexão + UI; padrão verify quebraria
-  dev local com cert auto-assinado. Não mudar padrão às cegas.
-- **A8** recovery de mutex envenenado (`session.rs:276,559`, `ggml/ffi.rs:269-271`):
-  `into_inner` ou erro real em vez de `expect` em produção.
-- **A9** dead code `Motor::versao`/`Ggml::versao` (`ggml/mod.rs:412`, `ffi.rs:356`):
-  remover ou ligar a diagnóstico.
-- **M8** integridade do download só por tamanho (`download.rs:375-382,398-411`,
-  antes do `rename` de 411): verificar sha256 (HF publica), não só a contagem.
+- ~~**TLS por conexão**~~ (`bancos/motor/mssql.rs:209` `confianca_da`,
+  `postgres.rs:160` `ficha_de`) — **fechado na terceira passagem** (`BANCOS.md`): a flag opt-in existe
+  desde a segunda leva, mas não tinha caminho até a tela; agora `ConexaoView`
+  devolve `tlsVerificado` e o `BancosDialog` tem o toggle. O padrão continua
+  desligado, e o mysql — único motor que a ignorava em silêncio — passou a
+  recusar a ligação em vez de falar em claro.
+- **TLS do postgres** (`Cargo.toml:59`, `tokio-postgres` só com
+  `with-serde_json-1`): com a marca ligada, `SslMode::Require` sobre `NoTls`
+  **impede** a conexão em vez de cifrá-la. Honestamente, mas o dono ligou o
+  interruptor esperando o contrário. Fechar pede feature de TLS em Rust puro
+  (`tokio-postgres-rustls` + `MakeTlsConnect` próprio) e só tem verificação real
+  com um Postgres na rede. Fica fora deste lote por isso.
+- **MySQL TLS** (`Cargo.toml:60`, `mysql_async` com `features = ["minimal"]`, que
+  não traz TLS): hoje recusa com motivo. Ligaria de verdade com a feature `rustls`
+  do crate — mesma decisão pendente do postgres, e o mesmo motivo para esperar:
+  sem servidor, nada é medido.
+- **A8** recovery de mutex envenenado — **andamento medido na quarta passagem,
+  não nos números antigos**: o `expect` do histórico e do resumo saiu do
+  produção (`session.rs:293` `trava_historico` e `:299` `trava_resumo` fazem
+  `into_inner`), e o `ffi.rs` não tem nenhum. O que resta é conta lida do crate
+  inteiro: **100** ocorrências de `expect("… envenenad…")` em 14 arquivos —
+  `memoria.rs` 46, `voz/escuta.rs` 8, `conversas.rs` 8, `state.rs` 7 (essas
+  dentro do bloco de testes, que envenena a trava de propósito), `voz/mod.rs` 6,
+  `mcp/servidor.rs` 5, `mcp/instalador.rs` 4, `voz/fala.rs` 3, `mcp/execucao.rs`
+  3, `idiomas.rs` 3, `config.rs` 3, `session.rs` 2 (comentário + teste),
+  `mcp/manager.rs` 1, `lib.rs` 1. Fechar por arquivo, não em varredura: cada um
+  precisa dizer se o dado é recuperável (`into_inner`) ou se o motivo vira erro.
+- **A9** dead code `Motor::versao`/`Ggml::versao` — **fechado na segunda leva**
+  (`FFI.md`): `grep -rn "fn versao" src/ai/` não devolve nada hoje, e a opção de
+  ligar a diagnóstico ficou registrada como follow-up no doc deles (o lugar seria
+  (`engine.rs:260`) + `InfoMotor`).
+- ~~**M8** integridade do download só por tamanho~~ — **fechado na segunda leva**
+  (`M8.md`): `download.rs:149` mede o sha256 do arquivo inteiro e o confere com o
+  `lfs.oid` publicado antes do `rename`.
 - **#34 DoRA**: detectado mas NÃO aplicado (`adaptadores.rs:61-66` admite que o
   loader rejeita `.mag`); task #38 "completed" exagera. LoRA mount é real
-  (`ffi.rs:335-337`, `state.rs:269,456`). Sem treino, por design.
-- **#39 embedder**: hardcode `-1` (`ggml/mod.rs:515`); veredito de alojamento já
-  dirige o `n_gpu_layers` do LLM (`engine.rs:386-393`), falta o embedder.
-- **Chunk JS >500 kB**: code-splitting por rota/dialog (dynamic import) no Vite.
+  (`ffi.rs:335-337`, `state.rs:269,456`). Sem treino, por design. Conferido na
+  quarta passagem: a detecção existe e é testada (`dora` preenchido em
+  `adaptadores.rs:224`, assertions em `:547` e `:568`), mas **nada fora de
+  `adaptadores.rs` lê o campo** — procurar por `dora` no crate inteiro devolve
+  só este arquivo. Então a ficha diz a verdade sobre o arquivo, e o que falta é
+  a tela consumir o número (recusar com motivo antes de montar), não o motor.
+- ~~**#39 embedder**: hardcode `-1` (`ggml/mod.rs:515`)~~ — **fechado na segunda
+  leva** (`FFI.md`): `despachar_codificador` (`ggml/mod.rs:482`) decide pelo
+  veredito de alojamento, e o `-1` só aparece no ramo em que o cabeçalho não
+  fechou — com o motivo real na mão, não em silêncio.
+- ~~**Chunk JS >500 kB**~~ — **fechado na segunda leva** (`FRONT2.md`, FU7): onze
+  dialogs e o grafo entram por `lazy()` (`App.tsx:36-75`) e o build não imprime
+  mais aviso nenhum; o maior bloco é `react` a 210,53 kB.
 - **F16**: maquinaria de Job/progresso e slider duplicada em 4 dialogs; extrair
   componente compartilhado DEPOIS das correções individuais (sequenciado).
 
@@ -262,3 +296,179 @@ seções FEITO de cada doc são os da árvore depois da correção.
 Pendências de próximo lote: nenhuma das quatro frentes do lote tem item aberto.
 As recomendações fora de lote (TLS por conexão, A8/A9, M8, DoRA,
 embedder, code-splitting, F16) seguem na seção acima.
+
+## Passagem do maintainer sobre a segunda leva (medido 2026-11-20)
+
+Os cinco agentes da segunda leva (#93 FFI, #94 CONC2, #95/#96/#97 FRONT) pararam
+no limite de turnos e deixaram a árvore em pedaços: `ai/ggml/mod.rs` não
+compilava, e os arquivos deles ficaram como estavam. O maintainer refez a árvore
+e passou o gate — **544 passaram, 0 falharam, 11 ignored, finished in 4.82 s** na
+reparação, **548** depois dos quatro testes novos de `MCP.md`. Depois fechou,
+cada um com o vermelho-primeiro medido antes do verde, o que estava ao alcance
+sem abrir o aplicativo:
+
+- `MCP.md` — **M1** o `npm` que despeja stderr prendia o instalador (leitura do
+  cano ao lado do laço de stdout; 10,01 s pendurado → 0,06 s);
+  **M2** o recorte do grafo não valia na placa publicada: o servidor anunciava as
+  21 ferramentas com o `computador` recortado para 2, e um `FullAccess` do cliente
+  bastava para rodar a escrita desligada. O `Arc<RwLock<Registry>>` agora é
+  dividido com a `Execucao`, e `catalogo_publicado` / `ferramentas_anunciadas` /
+  `Estado.ferramentas` leem o mesmo recorte que o laço de conversa;
+  **M3** duas escritas concorrentes caíam no mesmo `aether-tmp` e uma publicava o
+  corpo da outra.
+- `VOZ.md` — **V1** a barra de progresso da voz contava bytes que não vieram da
+  rede (começava em 12.937.772 de 90.672.131) e o clamp a prendia nos 100 % com o
+  download no meio; **V2** o medidor do microfone continuava congelado no último
+  nível depois de a escuta fechar. V2 é **raciocinado, não medido**: exige
+  microfone real, e a suíte não captura áudio.
+- `I18N.md` — a verificação que estava pendente por causa da árvore quebrada foi
+  rodado e registrada: **11 passaram** em `idiomas`, com as duas chaves que o
+  guard achou (`erros.motorEnvenenado`, `erros.corpoTrocado`) já nos dois idiomas.
+
+Registros dos agentes, como ficaram: `FFI.md` (#39, A9, A8 — com a ressalva
+deles mesmos de que a carga real do codificador não rodou, porque abrir o
+aplicativo estava proibido), `CONC2.md` (#94, posse do motor), `M8.md` (#92,
+integridade do download), `FRONT2.md` e `FRONT3` (casca e dialogs). O gate acima
+é a evidência de que os arquivos deles estão na árvore e verdes; o que cada um
+alega além disso está nos próprios docs, com MEDIDO e ALEGADO separados.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **548 passaram, 0
+falharam, 11 ignored, finished in 4.60 s**; `npm run build` → **OK, sem aviso**
+(grep por `warn|error|500` na saída não imprime nada: o aviso de chunk > 500 kB
+que a linha de base tinha acabou com o code-splitting — maior bloco hoje é
+`react` a 210,53 kB).
+
+## Passagem do maintainer sobre a terceira leva (medido 2026-11-20)
+
+Auditoria do que restava ao alcance, sem abrir o aplicativo. Fechou a frente que
+o agente #95 deixou pela metade — não os erros de compilação que a tarefa citava
+(a árvore já estava verde), e sim o buraco que a leitura do código mostrou:
+
+- `BANCOS.md` — **o TLS por conexão existia só no disco**. A flag é lida por
+  quatro motores e round-tripada pelo cadastro, mas `ConexaoView` não a
+  devolvia e `ConexaoRegistro` não a levava: nenhum controle na tela e nenhuma
+  chave de idioma. (O `bancos_listar` que o model chama continua sem a marca —
+  é o cartão de política da conexão, e a postura do canal não muda o que ele
+  pode pedir.) Vermelho medido
+  com o JSON inteiro da vista impresso (`left: Null`, a chave ausente). Agora o
+  toggle está no `BancosDialog`, com chip na linha da conexão e limpo quando o
+  tipo troca.
+  No mesmo caminho, dois buracos de honestidade: **mysql** ligava a flag e
+  descia mesmo assim para o aperto de mão em texto puro (o vermelho mostrou
+  `os error 10061` do soquete, não uma recusa — o driver deste build não tem
+  TLS nenhum), agora recusado antes de tocar a rede; e **oracle** tinha a flag
+  lida sem um único teste no arquivo, o que deixava a promessa do `tcps://`
+  como alegado. Os dois testes novos do oracle passaram na primeira medição,
+  então a promessa era verdadeira — só não era conferida.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **553 passaram, 0
+falharam, 11 ignored, finished in 4.91 s** (548 + 1 em `commands`, +2 em
+`mysql`, +2 em `oracle`); `npm run build` → **`✓ built in 193 ms`**, sem aviso de
+TypeScript e sem aviso de chunk, com `BancosDialog` no lazy chunk dele
+(8,58 kB │ gzip 2,33 kB).
+
+## Passagem do maintainer sobre a quarta leva (medido 2026-11-20)
+
+Sem delegação: nada do que restava precisava de outro dono, e o critério foi o
+mesmo das passagens anteriores — fechar o que dá de conferir sem abrir o
+aplicativo. Quatro buracos de honestidade no Rust e quatro correções na casca.
+
+### Casca (front), conferida na árvore nesta passagem
+
+- **Chave dos turnos** (`Conversation.tsx:26-32`, contador em `:53-59`): a lista
+  era desenhada com o índice do array por chave. Como o turno cresce durante o
+  streaming e é recortado quando a compactação entra, o React emprestava o
+  `<details>` já aberto de um turno para o outro — o resumo de um aparecia
+  desenrolado dentro do de outro. Cada desenho nasce com a sua e a leva enquanto
+  existir.
+- **Títulos reais** (`RichText.tsx:144-149`): `h1`…`h6` saíam todos com o mesmo
+  visual. Agora cada nível tem a sua classe (`rich-titulo-1`…`rich-titulo-6`), e
+  o que o modelo escreve como cabeçalho aparece como cabeçalho.
+- **Menu acessível** (`AppMenu.tsx:117`, `:142`): os botões de ícone só ganharam
+  `aria-label` — sem ele, leitor de tela anuncia botão vazio num menu que é a
+  porta de onze telas de ajuste.
+- **Bancada sem estado próprio** (`BancadaDialog.tsx:6-13`): a folha era dona da
+  medição e se inscrevia no evento por conta própria; fechar a tela perdia a
+  rodada em curso. O estado subiu para o `App` (`BancadaRodada` vive em
+  `src/lib/types.ts`, para o arquivo não fechar ciclo de import), porque o núcleo
+  continua mandando resultado mesmo quando ninguém está olhando.
+
+### Núcleo: o número que a tela mostra passou a ser o número que aconteceu
+
+- **COMPACTAÇÃO** — `dobrar()` cortava a ponta mais antiga do trecho em silêncio
+  e o turno dizia que tinha dobrado `ate - desde` mensagens: o aplicativo
+  garantia uma memória que o modelo não leu. Vermelho medido, com a implementação
+  ainda parada no corpo inteiro:
+  `o_que_nao_cabe_fica_de_fora_e_o_numero_diz_o_que_foi_lido` →
+  **`assertion left == right failed; left: 5, right: 3`** (cinco mensagens de 100
+  tokens, régua de 300 → três foram lidas). `apara_ate_caber`
+  (`compactacao.rs:98`) tokeniza, mede e solta a ponta mais antiga até caber, e
+  devolve quantas sobraram; `dobrar` repassa o número (`compactacao.rs:123`,
+  agora `(String, Generation, usize)`). A medição entra por callback, então a
+  régua se confere sem placa (`medir_por_corpo`, nos testes de `:246`/`:256`/`:269`).
+  Na tela: `Resumo` ganhou `descartadas` (`session.rs:90`, calculada em `:617`
+  como `(ate - desde) - lidas`) e o cartão do turno mostra
+  `conversa.resumoDescartadas` em aviso quando é maior que zero. O `ate` ficou
+  como está, de propósito: recostá-lo no prefixo lido faria o `encaixe` girar
+  pedindo o resumo de um corpo vazio.
+- **MCP** — um servidor que nasce mudo (o script certo esperando uma entrada que
+  nunca chega) pendurava `conectar` para sempre: a tela girava sem devolver erro
+  nenhum. `PRAZO_CONEXAO` de 45 s (`manager.rs:721`) e `dentro_do_prazo`
+  (`manager.rs:731`) cobrem o aperto de mão e a descoberta (`:354`, `:361`), e o
+  erro diz **qual** servidor ficou calado. Vermelho medido antes do helper:
+  **5,02 s** de espera contra a régua do teste (50 ms); depois, **0,06 s**.
+  Cortar pelo meio é seguro nos dois transportes, e isso foi lido no fonte
+  instalado, não presumido: a futura stdio carrega o `TokioChildProcess`, cujo
+  `Drop` (`ChildWithCleanup`, `rmcp 3.10.0 transport/child_process.rs`) mata o
+  filho; no HTTP não há processo. **A nota de reconhecimento que dizia que uma
+  conexão fracassada vazava um `node.exe` vivo é falsa** — o defeito real era a
+  falta de prazo, e fica registrada assim para ninguém caçar o fantasma. Na
+  mesma passagem, `desligar` (`manager.rs:633`) derruba o servidor publicado e os
+  conectores, e entra no gancho de saída (`lib.rs:241-244`) com 5 s de teto
+  (`:252`) para um teimoso não segurar a janela fechada. Que o gancho dispara
+  antes do `cleanup_before_exit()` (`tauri 2.12.5 src/app.rs:1449`) e que o
+  runtime do `async_runtime` é do processo (daí o `block_on` na saída ser seguro)
+  é lido do fonte das crates.
+- **SONDAS** — `engine_probe` usava `unwrap_or` para ter número onde o motor não
+  devolveu medida: a VRAM "cedida" saía de um palpite e a régua de recorte do KV
+  idem. Agora `cedido` é `Option` (`bin/engine_probe.rs:311`, `src/bin/`, não
+  `bin/`) e imprime `não medida`, e a rodada 3 **recusa** em vez de medir quando o
+  motor não declara o cache ocupado (`:1424`). Uma régua inventada aceita o que
+  não deveria.
+- **VOZ** — o último aviso de `dead code` do crate era o `prefixo` que `remessas`
+  calculava e somava por fora. Fechado na causa (`voz/baixar.rs:110`):
+  `total += remessa.a_receber()` — o mesmo método que os testes já conferem — em
+  vez de `#[allow(...)]`.
+
+### Guards que trabalharam
+
+O `cargo test --lib idiomas` pegou uma tradução que eu escrevi num bloco de
+ferramenta malformado e que nunca chegou ao disco: **`en-US não traduz:
+["conversa.resumoDescartadas"]`**, com **555 passaram / 1 falhou**; aplicado o
+`en-US.json` de verdade, **556 / 0**. Ou seja: o guard do próprio repositório
+provou a edição que eu achava ter feito — e é ele que tem de continuar verde.
+
+### Gates desta passagem
+
+`cd src-tauri && cargo test --lib` → **558 passaram, 0 falharam, 11 ignored,
+finished in 4.98 s** (553 + 3 de compactação + 2 de prazo MCP, menos o reuso
+dos contados antes). `npm run build` → **`✓ built in 220 ms`**, sem erro de
+TypeScript e sem aviso de chunk (`BancadaDialog` no lazy chunk dele, 2,34 kB │
+gzip 0,86 kB). `cargo check --all-targets` → **zero avisos**.
+
+**ALEGADO, não medido nesta passagem**: o gancho de saída e o prazo de 45 s
+contra um servidor realmente mudo só se provam fechando a janela do aplicativo,
+o que estava proibido; os dois testes novos medem o helper com prazos curtos de
+teste, não o `conectar` vivo. As sondas exigem placa e editor fechado. Os 11
+`ignored` continuam os do aperto de mão TLS, que pedem servidor na rede.
+
+### Recomendações novas (fora de lote, com evidência)
+
+- **`call_tool` sem prazo é escolha, não buraco**: o prazo de uma chamada é o
+  prazo do comando (`terminal` roda minutos por design). O que falta é
+  cancelamento visível na tela, não um `timeout` que mataria o trabalho do
+  usuário.
+- **`mcp/servidor.rs` `aceitar`** cria uma tarefa por soquete sem dono nenhum:
+  `fechar()` cancela o token e espera a tarefa do listener, mas as conexões em
+  curso não estão registradas. Fechar pede `JoinSet` + dreno com limite — e é a
+  única pendência que sobra na frente MCP.

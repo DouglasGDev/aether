@@ -17,6 +17,7 @@
 
 pub mod ffi;
 
+use super::alojamento;
 use crate::idiomas::tr;
 use anyhow::{Result, bail};
 use ffi::{Ggml, InfoDevice, Token};
@@ -409,10 +410,6 @@ impl Motor {
         self.n_vocab
     }
 
-    pub fn versao(&self) -> String {
-        self.ggml.versao()
-    }
-
     /// As placas visíveis nesta máquina, para a medição e para o diagnóstico.
     pub fn placas(dlls: &[PathBuf]) -> Result<Vec<Placa>> {
         Ok(candidatas(&registro(dlls)?))
@@ -444,6 +441,77 @@ fn device_de_embutir(dispositivos: &[InfoDevice]) -> Option<(usize, String, bool
         .iter()
         .find(|d| d.tipo == TIPO_CPU)
         .map(|d| (d.indice, d.nome.clone(), false))
+}
+
+/// O despacho do codificador: o número entregue à biblioteca e a prova de onde
+/// ele saiu. Separado do `Alojamento` porque o chamador precisa das três coisas
+/// de uma vez — quantas camadas subir, o veredito que as contou e, quando não
+/// houve conta, o motivo real dela não ter acontecido. É o espelho do
+/// `Acelerador` do caminho de conversa (`engine.rs`): número medido e motivo
+/// retido, nunca um `-1` sem procedência.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Despacho {
+    /// O `n_gpu_layers` que vai para `llama_model_default_params`.
+    pub camadas_gpu: c_int,
+    /// O veredito lido, com os bytes que ele somou. `None` é "não houve conta".
+    pub previsto: Option<alojamento::Alojamento>,
+    /// Por que a conta não pôde ser feita: o erro real de `fichar`, já traduzido
+    /// pelas chaves do próprio parser. `None` quando houve veredito.
+    pub motivo: Option<String>,
+}
+
+/// Quantas camadas do codificador vão para a placa, contado no cabeçalho do
+/// arquivo dele e na VRAM livre que esta máquina respondeu agora — a mesma
+/// função (`alojamento::alojar` + `despacho`) que comanda o LLM, com a janela da
+/// peça em vez da janela da conversa, porque é ela que reserva o KV cache aqui.
+///
+/// O `-1` deixa de ser uma prescrição deste arquivo e passa a ser a resposta do
+/// veredito: ele volta quando os pesos + o KV + a folga do grafo cabem no livre
+/// medido, e um número volta quando não cabem. Um codificador de centenas de
+/// megabytes numa placa de 16 GiB costuma ouvir `-1` — e é isso que tem de estar
+/// escrito no log, não no código.
+///
+/// As duas saídas que não são conta, e o que cada uma devolve:
+/// - sem placa: `0`, o mesmo `despacho` que o caminho de conversa devolve para
+///   `SoSistema`. Não é derrota — o device escolhido é o de CPU, e não há placa
+///   para receber camada nenhuma. O estado aparece como `na_placa: false`.
+/// - sem cabeçalho lido: o sentinela, com o motivo na mão. Recusar a carga
+///   porque o parser não fechou deixaria a máquina sem memória nenhuma, e é a
+///   mesma razão que `engine.rs:386` dá para o LLM. O que não pode é calar: o
+///   `motivo` leva o erro real, e a tela diz que este offload total é tentativa.
+fn despachar_codificador(
+    ficha: Option<&alojamento::Ficha>,
+    capacidade: Option<&alojamento::Capacidade>,
+    erro_da_ficha: Option<String>,
+    janela: u32,
+) -> Despacho {
+    match (ficha, capacidade) {
+        // Sem placa não há o que dividir: o device escolhido é o de CPU e este
+        // número não move byte nenhum. O veredito devolvido é o `SoSistema` que
+        // `despacho` traduz em zero, contado com os bytes do arquivo quando ele
+        // foi lido — e o motivo da ficha ilegível continua retido, porque a
+        // ausência de placa não apaga a falha da leitura.
+        (_, None) => Despacho {
+            camadas_gpu: 0,
+            previsto: ficha.map(|f| alojamento::alojar(f, None, janela as usize)),
+            motivo: if ficha.is_some() { None } else { erro_da_ficha },
+        },
+        // Placa medida, cabeçalho que não fechou: placa primeiro, com o motivo
+        // na mão.
+        (None, Some(_)) => Despacho {
+            camadas_gpu: ffi::CAMADAS_NA_GPU,
+            previsto: None,
+            motivo: erro_da_ficha,
+        },
+        (Some(ficha), Some(capacidade)) => {
+            let previsto = alojamento::alojar(ficha, Some(capacidade), janela as usize);
+            Despacho {
+                camadas_gpu: alojamento::despacho(&previsto),
+                previsto: Some(previsto),
+                motivo: None,
+            }
+        }
+    }
 }
 
 /// O agrupamento como a interface o mostra. O número é o que a biblioteca
@@ -487,6 +555,11 @@ pub struct Embutidor {
     pub dispositivo: String,
     /// `true` quando foi a placa que rodou — é o que a interface mostra.
     pub na_placa: bool,
+    /// O que autorizou esta carga: o número de camadas entregue à biblioteca com
+    /// o veredito que o contou e, quando o veredito não pôde ser contado, o
+    /// motivo real. Existe para a tela não ter de adivinhar se o codificador foi
+    /// inteiro para a placa porque coube ou porque ninguém mediu.
+    pub despacho: Despacho,
     pub agrupamento: &'static str,
     buf: Vec<Token>,
 }
@@ -508,10 +581,28 @@ impl Embutidor {
             bail!(tr("erros.motorSemDispositivo", &[]));
         };
         let mut selecionados = [dispositivos[indice].bruto, std::ptr::null_mut()];
-        // O embutidor vai inteiro para a placa: são dezenas de megabytes, e a
-        // conta de dividir é do LLM, não dele.
+        // O cabeçalho deste GGUF e a VRAM livre que a placa respondeu agora
+        // decidem quantas camadas sobem. A leitura é só do cabeçalho e das
+        // fichas de tensor — nenhum peso é movido aqui, e nada toca a placa.
+        let (ficha, erro_da_ficha) = match alojamento::fichar(pesos) {
+            Ok(f) => (Some(f), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        // A placa do veredito é a mesma que o `escolher` de acima escolheu para
+        // o device: uma conta e uma carga, nunca duas opiniões sobre a mesma
+        // memória.
+        let capacidade = escolher(&dispositivos).map(|escolhida| {
+            let info = &dispositivos[escolhida.indice];
+            alojamento::Capacidade {
+                placa: info.nome.clone(),
+                livre: info.livre as u64,
+                total: info.total as u64,
+            }
+        });
+        let despacho =
+            despachar_codificador(ficha.as_ref(), capacidade.as_ref(), erro_da_ficha, janela);
         let modelo = unsafe {
-            ggml.carregar(pesos, ggml.params_modelo(ffi::CAMADAS_NA_GPU), &mut selecionados)
+            ggml.carregar(pesos, ggml.params_modelo(despacho.camadas_gpu), &mut selecionados)
         }
         .map_err(anyhow::Error::msg)?;
 
@@ -543,6 +634,7 @@ impl Embutidor {
             janela: janela_real,
             dispositivo: nome,
             na_placa,
+            despacho,
             agrupamento: nome_do_agrupamento(agrupamento),
             ggml,
             modelo,
@@ -722,5 +814,193 @@ mod tests {
         assert_eq!(prefixo_comum(&[1, 2, 3, 4, 5], &[1, 2]), 1);
         assert_eq!(prefixo_comum(&[1, 2, 3], &[7]), 0);
         assert_eq!(prefixo_comum(&[1, 2, 3], &[]), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #39 — o despacho do codificador sai do número preso e entra na conta.
+    // -----------------------------------------------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Geometria de teste: o que se verifica aqui é o que a decisão faz com uma
+    /// ficha e um livre, não o que um arquivo específico declara. Os números do
+    /// arquivo real estão em
+    /// `o_arquivo_real_do_codificador_sobe_inteiro_por_conta`, que lê o GGUF com
+    /// o mesmo parser da carga.
+    fn ficha_codificador(camadas: usize, pesos_mib: u64, cabecas_kv: u64, dimensao: u64) -> alojamento::Ficha {
+        let passo = (pesos_mib * MIB) / camadas as u64;
+        alojamento::Ficha {
+            arquivo: "codificador-de-teste.gguf".to_string(),
+            arquitetura: "qwen2".to_string(),
+            camadas,
+            pesos_total: pesos_mib * MIB,
+            camada: vec![passo; camadas],
+            fixo: 0,
+            // A mesma conta que `fichar` usa: 2 (K e V) × camadas × cabeças de
+            // KV × dimensão da cabeça × 2 bytes do f16 do flash attention.
+            kv_por_token: 2 * camadas as u64 * cabecas_kv * dimensao * 2,
+            janela_maxima: 32_768,
+            template: None,
+            eos: Vec::new(),
+            paradas: Vec::new(),
+        }
+    }
+
+    /// A placa como o veredito a vê: `livre` é o que ela cede agora, e o
+    /// `total` é o da máquina de referência destes testes.
+    fn placa(livre: u64) -> Option<alojamento::Capacidade> {
+        Some(alojamento::Capacidade {
+            placa: "AMD Radeon RX 9060 XT".to_string(),
+            livre,
+            total: 16 * 1024 * MIB,
+        })
+    }
+
+    /// O defeito que este item corrigiu: o `-1` estava escrito no carregamento
+    /// do codificador, então ele acontecia mesmo num arquivo que a placa não
+    /// segura. Aqui o mesmo `-1` volta — e tem de voltar acompanhado: se a
+    /// conta diz `Inteira`, não há motivo a dizer.
+    #[test]
+    fn o_inteiro_do_codificador_e_veredito_lido_nao_numero_preso() {
+        let ficha = ficha_codificador(28, 608, 8, 64);
+        let d = despachar_codificador(Some(&ficha), placa(15 * 1024 * MIB).as_ref(), None, 512);
+        assert_eq!(d.camadas_gpu, ffi::CAMADAS_NA_GPU);
+        assert!(
+            matches!(d.previsto, Some(alojamento::Alojamento::Inteira { .. })),
+            "o sentinela só vale vindo de um veredito inteiro, veio {:?}",
+            d.previsto
+        );
+        assert_eq!(d.motivo, None, "conta feita não tem motivo a reclamar");
+    }
+
+    /// O caso que o número preso não sabia responder: um codificador maior que
+    /// a placa. Aqui ele recebe a contagem do veredito, o mesmo trato que o LLM
+    /// já tinha, e não um pedido de tudo que a placa ia recusar.
+    #[test]
+    fn o_codificador_que_nao_cabe_recebe_a_contagem_da_placa() {
+        let ficha = ficha_codificador(48, 4096, 8, 128);
+        let d = despachar_codificador(Some(&ficha), placa(1024 * MIB).as_ref(), None, 512);
+        assert_ne!(
+            d.camadas_gpu,
+            ffi::CAMADAS_NA_GPU,
+            "não coube e mesmo assim foi pedido o inteiro: {:?}",
+            d.previsto
+        );
+        match d.previsto {
+            Some(alojamento::Alojamento::Dividida { camadas, total, .. }) => {
+                assert_eq!(total, 48);
+                assert!(camadas < total, "a placa apertada não leva todas");
+                assert_eq!(d.camadas_gpu, camadas as i32, "o número da carga não é o do veredito");
+            }
+            other => panic!("esperava dividida, veio {other:?}"),
+        }
+        assert_eq!(d.motivo, None, "a conta aconteceu; o que ela disse está em `previsto`");
+    }
+
+    /// Sem cabeçalho lido não há conta — e é aqui que o `-1` ainda é o sentinela
+    /// do llama.cpp, exatamente como no caminho do LLM. O que não pode é ele
+    /// chegar sozinho à tela: o erro real do parser vai no `motivo`.
+    #[test]
+    fn sem_cabecalho_lido_o_motivo_real_vai_junto_com_o_sentinela() {
+        let d = despachar_codificador(
+            None,
+            placa(15 * 1024 * MIB).as_ref(),
+            Some("o arquivo não declara block_count; não dá para contar as camadas".to_string()),
+            512,
+        );
+        assert_eq!(d.camadas_gpu, ffi::CAMADAS_NA_GPU);
+        assert_eq!(d.previsto, None, "sem ficha não houve veredito para guardar");
+        assert!(
+            d.motivo.as_deref().is_some_and(|m| m.contains("block_count")),
+            "o motivo da conta que não aconteceu foi descartado: {:?}",
+            d.motivo
+        );
+    }
+
+    /// Máquina sem placa: o device escolhido é o de CPU e nenhum byte vai para
+    /// GPU nenhuma. Dizer `-1` aqui seria afirmar que a placa leva tudo quando
+    /// ela não existe — é o mesmo `SoSistema → 0` que `despacho` já devolve para
+    /// o modelo de conversa.
+    #[test]
+    fn sem_placa_o_codificador_nao_afirma_camada_na_gpu() {
+        let ficha = ficha_codificador(28, 608, 8, 64);
+        let d = despachar_codificador(Some(&ficha), None, None, 512);
+        assert_eq!(d.camadas_gpu, 0);
+        assert!(matches!(d.previsto, Some(alojamento::Alojamento::SoSistema { .. })));
+
+        // Sem placa e sem ficha: o zero continua, e o motivo da leitura é retido
+        // do mesmo jeito — a ausência da placa não apaga a falha do parser.
+        let cego = despachar_codificador(None, None, Some("cabeçalho ilegível".to_string()), 512);
+        assert_eq!(cego.camadas_gpu, 0);
+        assert_eq!(cego.motivo.as_deref(), Some("cabeçalho ilegível"));
+    }
+
+    /// O GGUF do catálogo que está em disco nesta máquina, se estiver. Ler o
+    /// cabeçalho não é carregar pesos: o parser pára nas fichas dos tensores,
+    /// nenhuma camada é movida e a placa não é tocada.
+    fn gguf_de_embeddings_em_disco() -> Option<PathBuf> {
+        let local = std::env::var("LOCALAPPDATA").ok()?;
+        let raiz = PathBuf::from(local).join("ai.aether.core").join("models");
+        let spec = super::super::catalog::find_embeddings("qwen3-embedding-0.6b-q8_0")?;
+        let caminho = super::super::catalog::model_dir(&raiz, spec).join(spec.weights_file);
+        caminho.is_file().then_some(caminho)
+    }
+
+    /// A prova de que o veredito lido decide este carregamento, com o arquivo
+    /// real do catálogo: o menor livre que ainda diz "inteira" é procurado na
+    /// conta (ela é monotônica no livre), não escrito aqui. Uma byte abaixo o
+    /// veredito divide e o número entregue à biblioteca deixa de ser o
+    /// sentinela — é exatamente o comportamento que o `-1` fixo não tinha.
+    #[test]
+    fn o_arquivo_real_do_codificador_sobe_inteiro_por_conta() {
+        let Some(caminho) = gguf_de_embeddings_em_disco() else {
+            eprintln!("sem GGUF de embeddings em disco: nada a conferir");
+            return;
+        };
+        let ficha = alojamento::fichar(&caminho).expect("cabeçalho do catálogo legível");
+        // A janela da peça, não a que o arquivo declara: é ela que reserva o KV.
+        let janela: u32 = 512;
+        let inteira_em = |livre: u64| {
+            matches!(
+                alojamento::alojar(&ficha, placa(livre).as_ref(), janela as usize),
+                alojamento::Alojamento::Inteira { .. }
+            )
+        };
+        let teto = ficha.pesos_total.saturating_mul(2).saturating_add(4 * 1024 * MIB);
+        assert!(!inteira_em(0) && inteira_em(teto), "a busca precisa dos dois lados");
+        let mut baixo = 0u64;
+        let mut alto = teto;
+        while baixo < alto {
+            let meio = baixo + (alto - baixo) / 2;
+            if inteira_em(meio) {
+                alto = meio;
+            } else {
+                baixo = meio + 1;
+            }
+        }
+        let minimo = baixo;
+        eprintln!(
+            "{}: {} camadas, pesos {} MiB, kv/token {} bytes, mínimo inteira {} MiB",
+            caminho.display(),
+            ficha.camadas,
+            ficha.pesos_total / MIB,
+            ficha.kv_por_token,
+            minimo / MIB
+        );
+
+        let caberia = despachar_codificador(Some(&ficha), placa(minimo).as_ref(), None, janela);
+        assert_eq!(caberia.camadas_gpu, ffi::CAMADAS_NA_GPU, "no livre que ancora a conta o veredito é inteiro");
+        assert!(matches!(caberia.previsto, Some(alojamento::Alojamento::Inteira { .. })));
+
+        // Um byte abaixo do ancorado na conta, a placa já não leva tudo — e o
+        // número preso continuaria pedindo tudo.
+        let apertado = despachar_codificador(Some(&ficha), placa(minimo - 1).as_ref(), None, janela);
+        assert_ne!(
+            apertado.camadas_gpu,
+            ffi::CAMADAS_NA_GPU,
+            "um byte abaixo do mínimo e o despacho ainda pede o inteiro: {:?}",
+            apertado.previsto
+        );
+        assert!(matches!(apertado.previsto, Some(alojamento::Alojamento::Dividida { .. })));
     }
 }

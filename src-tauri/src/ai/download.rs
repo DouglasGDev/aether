@@ -1,14 +1,17 @@
 //! Download real dos pesos e dos arquivos de apoio.
 //!
 //! Nada aqui é simulado: os bytes vêm do HuggingFace, o progresso conta o que foi
-//! escrito em disco, e o tamanho final é conferido contra o catálogo antes de o
-//! arquivo ganhar o nome definitivo.
+//! escrito em disco, e o arquivo só ganha o nome definitivo depois de conferido
+//! contra o catálogo — pelo tamanho sempre e, onde o repositório publica a soma
+//! (`lfs.oid` de `tree/main`, ver `catalog.rs`), pelo sha256 do conteúdo inteiro.
+//! Tamanho sozinho não prova nada: um corpo trocado chega com o tamanho certo.
 
 use super::catalog::{self, ModelSpec};
 use crate::idiomas::tr;
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,7 +61,7 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-fn part_path(target: &Path) -> PathBuf {
+pub(crate) fn part_path(target: &Path) -> PathBuf {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -101,6 +104,105 @@ impl std::fmt::Display for Transitorio {
 }
 
 impl std::error::Error for Transitorio {}
+
+/// O corpo veio com o tamanho publicado e não é o arquivo publicado. É outra
+/// coisa que uma rede caindo, e por isso não é `Transitorio`: retomar do ponto
+/// onde parou traria exatamente os mesmos bytes, e o único caminho que faz
+/// sentido é deitar o `.part` fora e pedir o corpo inteiro de novo — poucas
+/// vezes, porque um CDN servindo outro corpo de forma constante não se conserta
+/// insistindo gigabytes por vez. Quando a fila cansa, o que volta é o par
+/// medido/publicado, lido lado a lado, e nada é publicado.
+#[derive(Debug)]
+pub struct CorpoTroocado {
+    /// O nome do arquivo como ele deveria ficar em disco.
+    pub arquivo: String,
+    /// O sha256 dos bytes que chegaram, medido aqui.
+    pub medido: String,
+    /// O sha256 que o repositório publica para este arquivo.
+    pub esperado: String,
+    /// Quantas vezes o corpo inteiro foi pedido de novo antes desta resposta.
+    pub recomecos: u32,
+}
+
+impl std::fmt::Display for CorpoTroocado {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A frase vem do locale; os dois hashes vêm atrás, em código, porque são
+        // a medição e não texto: sem eles a resposta seria um "arquivo errado"
+        // sem nada que o usuário ou o maintenedor possa conferir.
+        let frase = tr(
+            "erros.corpoTrocado",
+            &[("arquivo", &self.arquivo), ("recomecos", &self.recomecos.to_string())],
+        );
+        write!(f, "{frase}: {} != {}", self.medido, self.esperado)
+    }
+}
+
+impl std::error::Error for CorpoTroocado {}
+
+/// O sha256 do arquivo inteiro, lido do disco. É a mesma maquinaria do
+/// instalador de runtime (`runtime.rs` soma cada DLL contra o
+/// `SHA256SUMS.txt`): `Sha256` alimentado por `std::io::copy` e formatado em hex
+/// minúsculo, o formato do `lfs.oid` publicado e do `sha256sum -c` do README
+/// vendorizado. Pendência registrada em `docs/melhorias/M8.md`: as duas cópias
+/// têm de virar uma função só, e promover a de `runtime.rs` para `pub(crate)` é
+/// edição num arquivo que esta frente não toca.
+fn sha256_de_arquivo(caminho: &Path) -> anyhow::Result<String> {
+    let mut arquivo = std::fs::File::open(caminho).map_err(|e| {
+        anyhow::anyhow!(tr(
+            "erros.falhaAbrir",
+            &[("caminho", &caminho.display().to_string()), ("detalhe", &e.to_string())]
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut arquivo, &mut hasher).map_err(|e| {
+        anyhow::anyhow!(tr(
+            "erros.falhaLer",
+            &[("caminho", &caminho.display().to_string()), ("detalhe", &e.to_string())]
+        ))
+    })?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Descarta o `.part` e devolve o motivo. Um corpo que não é o arquivo não é
+/// trabalho feito: o que está em disco ali é lixo de outra remessa, e retomar
+/// dele produziria um GGUF montado metade de um corpo e metade de outro.
+fn descartar_parcial(part: &Path) -> anyhow::Result<()> {
+    std::fs::remove_file(part).map_err(|e| {
+        anyhow::anyhow!(tr(
+            "erros.falhaDescartarParcial",
+            &[("caminho", &part.display().to_string()), ("detalhe", &e.to_string())]
+        ))
+    })
+}
+
+/// Confere o `.part` completo contra a soma publicada antes de qualquer
+/// `rename`. Sem soma publicada (`None`) não há o que conferir, e isto é
+/// declarado: o arquivo git comum do Granite, por exemplo, só tem SHA-1 do blob,
+/// não SHA-256 do conteúdo — inventar uma expectativa a partir dos bytes que
+/// chegaram seria fotografar o download e chamar de verificação.
+fn conferir_sha256(part: &Path, alvo: &Path, esperado: Option<&str>) -> anyhow::Result<()> {
+    let Some(esperado) = esperado else {
+        return Ok(());
+    };
+    let medido = sha256_de_arquivo(part)?;
+    if medido == esperado {
+        return Ok(());
+    }
+    descartar_parcial(part)?;
+    Err(CorpoTroocado {
+        arquivo: alvo.display().to_string(),
+        medido,
+        esperado: esperado.to_string(),
+        recomecos: 0,
+    }
+    .into())
+}
+
+/// Quantas vezes o corpo inteiro é pedido de novo quando o hash não bate. Duas é
+/// o preço de um CDN que devolveu um corpo errado uma vez e um espelho no meio
+/// de uma sincronia: a cada recomeço a fila de `TENTATIVAS` pedidas roda inteira,
+/// então o pior caso já são 12 conexões antes da resposta honesta chegar.
+const REINICIOS_POR_INTEGRIDADE: u32 = 2;
 
 /// As quatro pedidas de antes cobrem o apagão de rota de um Wi-Fi que troca de
 /// ponto e um 503 de poucos segundos do espelho; mais que isso é o usuário
@@ -162,9 +264,10 @@ async fn vigiar_cancelamento(cancel: &AtomicBool) {
 /// rede na pedida que completou o arquivo — menos que o tamanho dele quando a
 /// retomada funcionou.
 ///
-/// Também é o que baixa os modelos de voz e o pacote do runtime: mesma retomada,
-/// mesma conferência de tamanho, mesmo `.part` abandonado em disco para a
-/// próxima tentativa.
+/// Esta é a porta sem soma: é o que baixa os modelos de voz e o pacote do
+/// runtime, que conferem o conteúdo arquivo por arquivo depois, em `runtime.rs`
+/// e no extrator. Conferir só o tamanho aqui é o que o M8 descreve; quem baixa
+/// pesos e apoio do catálogo passa por [`stream_to_file_confirmando`].
 pub(crate) async fn stream_to_file(
     http: &reqwest::Client,
     url: &str,
@@ -173,20 +276,99 @@ pub(crate) async fn stream_to_file(
     cancel: &AtomicBool,
     on_progress: impl FnMut(u64, u64, u64),
 ) -> anyhow::Result<u64> {
-    stream_desde_o_ponto(http, url, target, expected, cancel, on_progress, ESPERA_BASE).await
+    stream_to_file_confirmando(http, url, target, expected, None, cancel, on_progress).await
 }
 
+/// Como `stream_to_file`, mas confere o sha256 publicado antes de o `.part`
+/// virar o arquivo definitivo. `esperado_sha256` é `None` onde o repositório
+/// não publica soma — e nesse caso o que se confere é o tamanho, nada mais,
+/// como está registrado em `docs/melhorias/M8.md`.
+pub(crate) async fn stream_to_file_confirmando(
+    http: &reqwest::Client,
+    url: &str,
+    target: &Path,
+    expected: Option<u64>,
+    esperado_sha256: Option<&str>,
+    cancel: &AtomicBool,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> anyhow::Result<u64> {
+    stream_desde_o_ponto(
+        http,
+        url,
+        target,
+        expected,
+        esperado_sha256,
+        cancel,
+        on_progress,
+        ESPERA_BASE,
+    )
+    .await
+}
+
+/// A fila de pedidas da rede, com o recomeço do zero por cima: um corpo trocado
+/// deita o `.part` fora e pede o arquivo inteiro outra vez, porque retomar do
+/// ponto onde ele parou só traria os mesmos bytes errados. Tudo que não é
+/// `CorpoTroocado` devolve como veio — inclusive o `Transitorio` que estourou as
+/// tentativas, que já vem com o número de pedidas na mensagem.
 async fn stream_desde_o_ponto(
     http: &reqwest::Client,
     url: &str,
     target: &Path,
     expected: Option<u64>,
+    esperado_sha256: Option<&str>,
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(u64, u64, u64),
     espera_base: Duration,
 ) -> anyhow::Result<u64> {
+    let mut recomecos = 0u32;
+    loop {
+        match fila_de_tentativas(
+            http,
+            url,
+            target,
+            expected,
+            esperado_sha256,
+            cancel,
+            &mut on_progress,
+            espera_base,
+        )
+        .await
+        {
+            Ok(recebidos) => return Ok(recebidos),
+            Err(erro) => match erro.downcast::<CorpoTroocado>() {
+                Err(erro) => return Err(erro),
+                Ok(trocado) => {
+                    if recomecos >= REINICIOS_POR_INTEGRIDADE {
+                        // A resposta é o par medido/publicado, não um "erro de
+                        // download": é com os dois hashes lado a lado que o
+                        // usuário ou o maintenedor decide se o catálogo está
+                        // errado ou se foi o servidor quem trocou o corpo.
+                        return Err(CorpoTroocado { recomecos, ..trocado }.into());
+                    }
+                    recomecos += 1;
+                    esperar(espera_base * (1u32 << recomecos), cancel).await?;
+                }
+            },
+        }
+    }
+}
+
+/// As tentativas de uma mesma remessa: cai a conexão, volta do `.part`; cai a
+/// rede inteira quatro vezes seguidas, devolve o motivo com o número de pedidas.
+async fn fila_de_tentativas(
+    http: &reqwest::Client,
+    url: &str,
+    target: &Path,
+    expected: Option<u64>,
+    esperado_sha256: Option<&str>,
+    cancel: &AtomicBool,
+    on_progress: &mut impl FnMut(u64, u64, u64),
+    espera_base: Duration,
+) -> anyhow::Result<u64> {
     for tentativa in 1..=TENTATIVAS {
-        match tentativa_de_escrever(http, url, target, expected, cancel, &mut on_progress).await {
+        match tentativa_de_escrever(http, url, target, expected, esperado_sha256, cancel, on_progress)
+            .await
+        {
             Ok(recebidos) => return Ok(recebidos),
             Err(erro) => {
                 if !eh_transitorio(&erro) {
@@ -217,6 +399,7 @@ async fn tentativa_de_escrever(
     url: &str,
     target: &Path,
     expected: Option<u64>,
+    esperado_sha256: Option<&str>,
     cancel: &AtomicBool,
     on_progress: &mut impl FnMut(u64, u64, u64),
 ) -> anyhow::Result<u64> {
@@ -243,6 +426,10 @@ async fn tentativa_de_escrever(
             resumed = 0;
         }
         if resumed == expected {
+            // Um `.part` do tamanho exato também não é prova de ser o arquivo:
+            // é por aqui que um download retomado depois de uma remessa errada
+            // publicaria o mesmo corpo trocado sem tocar a rede nenhuma vez.
+            conferir_sha256(&part, target, esperado_sha256)?;
             std::fs::rename(&part, target)
                 .map_err(|e| {
                     anyhow::anyhow!(tr(
@@ -408,6 +595,12 @@ async fn tentativa_de_escrever(
     }
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     on_progress(done, total, ((done - resumed) as f64 / elapsed) as u64);
+    // O tamanho vem primeiro e o hash depois, e a ordem é deliberada: um corpo
+    // curto é uma conexão cortada, tem o `.part` inteiro que existe e retoma do
+    // ponto. Um corpo do tamanho certo com outro sha256 é outra coisa — aí o
+    // `.part` é apagado e a resposta é `CorpoTroocado`, que a fila acima trata
+    // como recomeço do zero e nunca como retomada.
+    conferir_sha256(&part, target, esperado_sha256)?;
     std::fs::rename(&part, target)
         .map_err(|e| {
             anyhow::anyhow!(tr(
@@ -449,11 +642,12 @@ pub async fn fetch(
             continue;
         }
         emit(DownloadEvent::Support { id: id.clone(), file: file.to_string() });
-        stream_to_file(
+        stream_to_file_confirmando(
             &http,
             &catalog::support_url(spec, file),
             &target,
             None,
+            catalog::apoio_sha256(spec, file),
             cancel,
             |_, _, _| {},
         )
@@ -464,11 +658,12 @@ pub async fn fetch(
     let progress = emit.clone();
     let weights_id = id.clone();
     let total = spec.weights_bytes;
-    stream_to_file(
+    stream_to_file_confirmando(
         &http,
         &catalog::weights_url(spec),
         &dir.join(spec.weights_file),
         Some(spec.weights_bytes),
+        catalog::pesos_sha256(spec),
         cancel,
         move |done, _, speed| {
             progress(DownloadEvent::Progress {
@@ -729,6 +924,15 @@ mod tests {
             (0..TOTAL).map(|i| (i % 251) as u8).collect()
         }
 
+        /// O corpo publicado com um byte trocado no meio: mesmo tamanho, outro
+        /// arquivo. É o que uma remessa errada de CDN deixa, e é o que nenhum
+        /// contador de bytes vê — por isso a soma existe.
+        pub(super) fn corpo_errado() -> Vec<u8> {
+            let mut v = corpo();
+            v[TOTAL / 2] ^= 0xAA;
+            v
+        }
+
         #[derive(Clone, Copy)]
         pub(super) enum Pedida {
             /// Anuncia o corpo inteiro e entrega só `bytes` antes de fechar. É
@@ -741,6 +945,10 @@ mod tests {
             Silenciar { bytes: usize },
             /// Entrega tudo, honrando o Range quando ele vem.
             Inteira,
+            /// Entrega o tamanho exato do arquivo publicado com os bytes errados.
+            /// Sem rede, sem gigabytes: é o corpo trocado que a conferência por
+            /// tamanho é cega, e é contra isto que o M8 existe.
+            CorpoTroocado,
             /// Status sem corpo: 404 para a falha definitiva, 416 para o
             /// servidor que não reconhece o ponto onde paramos.
             Status(u16),
@@ -772,12 +980,15 @@ mod tests {
         }
 
         fn atender(listener: TcpListener, script: Vec<Pedida>, conexoes: Arc<AtomicUsize>) {
-            let corpo = corpo();
+            let bom = corpo();
+            let trocado = corpo_errado();
             for pedida in script {
                 let Ok((mut socket, _)) = listener.accept() else { return };
                 conexoes.fetch_add(1, Ordering::Relaxed);
                 let inicio = ler_inicio(&mut socket);
-                let (resposta, silencia) = resposta(pedida, &corpo, inicio);
+                let conteudo =
+                    if matches!(pedida, Pedida::CorpoTroocado) { &trocado } else { &bom };
+                let (resposta, silencia) = resposta(pedida, conteudo, &bom, inicio);
                 let _ = socket.write_all(&resposta);
                 let _ = socket.flush();
                 if silencia {
@@ -828,9 +1039,16 @@ mod tests {
         }
 
         /// A resposta crua e se a conexão deve ficar aberta e muda depois dela.
-        fn resposta(pedida: Pedida, corpo: &[u8], inicio: u64) -> (Vec<u8>, bool) {
-            let inicio = (inicio as usize).min(corpo.len());
-            let restante = corpo.len() - inicio;
+        /// `conteudo` é o que sai pelo socket — o corpo publicado ou o trocado,
+        /// que têm o mesmo tamanho — e `publicado` é o que o cabeçalho anuncia.
+        fn resposta(
+            pedida: Pedida,
+            conteudo: &[u8],
+            publicado: &[u8],
+            inicio: u64,
+        ) -> (Vec<u8>, bool) {
+            let inicio = (inicio as usize).min(publicado.len());
+            let restante = publicado.len() - inicio;
             if let Pedida::Status(codigo) = pedida {
                 return (
                     format!(
@@ -841,7 +1059,7 @@ mod tests {
                 );
             }
             let entregue = match pedida {
-                Pedida::Inteira => restante,
+                Pedida::Inteira | Pedida::CorpoTroocado => restante,
                 Pedida::Cortar { bytes } | Pedida::Silenciar { bytes } => bytes.min(restante),
                 Pedida::Status(_) => unreachable!(),
             };
@@ -851,8 +1069,8 @@ mod tests {
                     format!(
                         "Content-Range: bytes {}-{}/{}\r\n",
                         inicio,
-                        corpo.len() - 1,
-                        corpo.len()
+                        publicado.len() - 1,
+                        publicado.len()
                     ),
                 )
             } else {
@@ -862,12 +1080,12 @@ mod tests {
                 "HTTP/1.1 {codigo}\r\nContent-Length: {restante}\r\n{faixa}Connection: close\r\n\r\n"
             )
             .into_bytes();
-            bytes.extend_from_slice(&corpo[inicio..inicio + entregue]);
+            bytes.extend_from_slice(&conteudo[inicio..inicio + entregue]);
             (bytes, matches!(pedida, Pedida::Silenciar { .. }))
         }
     }
 
-    use servidor::{corpo, Pedida, Servidor, TOTAL};
+    use servidor::{corpo, corpo_errado, Pedida, Servidor, TOTAL};
 
     /// O proxy do sistema não pode levar uma pedida local para fora: o servidor
     /// do teste nunca veria a conexão e o teste passaria provando nada.
@@ -893,16 +1111,47 @@ mod tests {
         esperado: Option<u64>,
         cancel: &AtomicBool,
     ) -> anyhow::Result<u64> {
+        baixar_conferindo(servidor, dir, esperado, None, cancel).await
+    }
+
+    /// O mesmo caminho, com a soma publicada na mão. É a porta que `fetch` usa
+    /// para pesos e apoio.
+    async fn baixar_conferindo(
+        servidor: &Servidor,
+        dir: &Path,
+        esperado: Option<u64>,
+        sha: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<u64> {
         stream_desde_o_ponto(
             &cliente_local(),
             &servidor.url,
             &dir.join("arquivo.gguf"),
             esperado,
+            sha,
             cancel,
             |_, _, _| {},
             Duration::from_millis(5),
         )
         .await
+    }
+
+    /// A soma do corpo que o servidor *deveria* servir, calculada do fixture.
+    /// Este é o ponto: a expectativa nasce do que o catálogo declara, nunca dos
+    /// bytes que chegaram — somar o download e chamar o resultado de verificação
+    /// é fotografia, não conferência.
+    fn sha256_de(dados: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(dados);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn hash_do_corpo() -> String {
+        sha256_de(&corpo())
+    }
+
+    fn hash_do_corpo_errado() -> String {
+        sha256_de(&corpo_errado())
     }
 
     /// O defeito que a retentativa paga: uma conexão que some no meio de um
@@ -1079,6 +1328,7 @@ mod tests {
                 &servidor.url,
                 &dir.join("arquivo.gguf"),
                 Some(TOTAL as u64),
+                None,
                 &cancel,
                 |_, _, _| {},
                 Duration::from_millis(5),
@@ -1095,6 +1345,180 @@ mod tests {
         assert!(texto.contains(&TENTATIVAS.to_string()), "{texto}");
         assert_eq!(servidor.atendidas(), TENTATIVAS as usize, "cada silêncio tinha de virar uma pedida");
         assert!(!dir.join("arquivo.gguf").exists(), "nada é publicado pela metade");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O defeito M8, medido sem rede e sem gigabyte: um corpo que chega com o
+    /// tamanho publicado e um byte trocado no meio é outro arquivo, e o
+    /// contador de bytes não tem como saber. Aqui isso tinha de virar o
+    /// `arquivo.gguf` definitivo e o motor abriria um GGUF que ninguém publicou.
+    /// O recomeço é pequeno e declarado — `REINICIOS_POR_INTEGRIDADE` — e no
+    /// fim a resposta é o par medido/publicado, nunca um "falhou".
+    #[tokio::test]
+    async fn um_corpo_do_tamanho_certo_com_bytes_errados_nao_e_publicado() {
+        let servidor =
+            Servidor::novo(vec![Pedida::CorpoTroocado; REINICIOS_POR_INTEGRIDADE as usize + 1]);
+        let dir = pasta_de_teste("corpo-trocado");
+        let alvo = dir.join("arquivo.gguf");
+        let cancel = AtomicBool::new(false);
+
+        let erro = baixar_conferindo(
+            &servidor,
+            &dir,
+            Some(TOTAL as u64),
+            Some(&hash_do_corpo()),
+            &cancel,
+        )
+        .await
+        .expect_err("um corpo com outro sha256 não pode parecer download perfeito");
+
+        let trocado = erro
+            .downcast_ref::<CorpoTroocado>()
+            .unwrap_or_else(|| panic!("corpo trocado não é a resposta: {erro:#}"));
+        assert!(
+            !eh_transitorio(&erro),
+            "um corpo trocado não é falha de rede, e retomar do ponto seria a mesma remessa: {erro:#}"
+        );
+        assert_eq!(trocado.medido, hash_do_corpo_errado(), "o hash medido não é o dos bytes que chegaram");
+        assert_eq!(trocado.esperado, hash_do_corpo(), "a expectativa não é a soma do corpo publicado");
+        assert_eq!(trocado.recomecos, REINICIOS_POR_INTEGRIDADE, "{trocado:?}");
+        let texto = format!("{erro:#}");
+        assert!(texto.contains(&trocado.medido) && texto.contains(&trocado.esperado), "{texto}");
+        assert!(!alvo.exists(), "nada é publicado com o corpo errado");
+        assert!(
+            !part_path(&alvo).exists(),
+            "um .part de corpo trocado é lixo de outra remessa, não trabalho para retomar"
+        );
+        assert_eq!(
+            servidor.atendidas(),
+            REINICIOS_POR_INTEGRIDADE as usize + 1,
+            "cada recomeço pede o corpo inteiro uma vez"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A consequência que a escolha abre, pelo lado bom: um CDN que devolveu uma
+    /// remessa errada uma vez é consertado pelo recomeço do zero, e o arquivo
+    /// publicado é o corpo que bate com a soma — não o `.part` antigo.
+    #[tokio::test]
+    async fn o_reinicio_do_zero_publica_a_remessa_que_bate_com_a_soma() {
+        let servidor = Servidor::novo(vec![Pedida::CorpoTroocado, Pedida::Inteira]);
+        let dir = pasta_de_teste("reinicio-integridade");
+        let alvo = dir.join("arquivo.gguf");
+        let cancel = AtomicBool::new(false);
+
+        let recebidos = baixar_conferindo(
+            &servidor,
+            &dir,
+            Some(TOTAL as u64),
+            Some(&hash_do_corpo()),
+            &cancel,
+        )
+        .await
+        .expect("a segunda remessa é o arquivo publicado");
+
+        assert_eq!(
+            sha256_de(&std::fs::read(&alvo).unwrap()),
+            hash_do_corpo(),
+            "publicou a remessa errada"
+        );
+        assert_eq!(recebidos, TOTAL as u64, "recomeçar do zero é pedir o corpo inteiro outra vez");
+        assert_eq!(servidor.atendidas(), 2, "um recomeço, não a fila de rede inteira");
+        assert!(!part_path(&alvo).exists(), "o .part descartado não volta");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O caminho que a retomada abre e que a conferência por tamanho deixava
+    /// escancarado: um `.part` já do tamanho exato era publicado sem tocar a
+    /// rede nenhuma vez. Se ele veio de uma remessa errada, tem de virar lixo e
+    /// o corpo tem de ser pedido de novo.
+    #[tokio::test]
+    async fn um_parcial_do_tamanho_exato_so_vira_arquivo_com_a_soma_certa() {
+        let servidor = Servidor::novo(vec![Pedida::Inteira]);
+        let dir = pasta_de_teste("parcial-pronto");
+        let alvo = dir.join("arquivo.gguf");
+        std::fs::write(part_path(&alvo), corpo_errado()).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let recebidos = baixar_conferindo(
+            &servidor,
+            &dir,
+            Some(TOTAL as u64),
+            Some(&hash_do_corpo()),
+            &cancel,
+        )
+        .await
+        .expect("deveria descartar o parcial errado e pedir o corpo publicado");
+
+        assert_eq!(
+            sha256_de(&std::fs::read(&alvo).unwrap()),
+            hash_do_corpo(),
+            "o parcial com o corpo errado foi publicado"
+        );
+        assert_eq!(recebidos, TOTAL as u64, "um parcial que não bate não é trabalho feito");
+        assert_eq!(servidor.atendidas(), 1, "uma pedida para cada remessa pedida");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O limite do que foi medido, declarado em teste: onde o repositório não
+    /// publica soma — o `tokenizer.json` do Granite, que é blob git comum e só
+    /// tem SHA-1 do blob — não há expectativa a conferir, e o mesmo corpo
+    /// trocado passa. Um hash calculado dos bytes que acabaram de chegar não
+    /// entraria aqui por nada: seria uma fotografia do download.
+    #[tokio::test]
+    async fn sem_hash_publicado_a_conferencia_e_so_de_tamanho() {
+        let servidor = Servidor::novo(vec![Pedida::CorpoTroocado]);
+        let dir = pasta_de_teste("sem-hash");
+        let alvo = dir.join("arquivo.gguf");
+        let cancel = AtomicBool::new(false);
+
+        let recebidos = baixar_conferindo(&servidor, &dir, Some(TOTAL as u64), None, &cancel)
+            .await
+            .expect("sem soma publicada o que se confere é o tamanho, e ele bate");
+
+        assert_eq!(recebidos, TOTAL as u64);
+        assert_eq!(
+            sha256_de(&std::fs::read(&alvo).unwrap()),
+            hash_do_corpo_errado(),
+            "sem expectativa não há recusa: o que publica é o tamanho"
+        );
+        assert!(!part_path(&alvo).exists());
+        assert_eq!(servidor.atendidas(), 1, "nenhum recomeço é disparado sem soma");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rede real. O arquivo LFS mais barato do catálogo que tem soma publicada:
+    /// os 11.423.705 bytes do `tokenizer.json` da Qwen, cujo `lfs.oid` foi lido
+    /// de `tree/main` e está em `catalog.rs`. Este teste é a prova de que o
+    /// campo que o catálogo lê é o sha256 dos bytes servidos — o veredito do
+    /// M8, porém, vem dos testes locais acima, não daqui.
+    #[tokio::test]
+    #[ignore = "baixa do HuggingFace de verdade"]
+    async fn a_soma_publicada_de_um_arquivo_lfs_real_bate() {
+        let spec = catalog::find("qwen3-embedding-0.6b-q8_0").unwrap();
+        let esperado = catalog::apoio_sha256(spec, "tokenizer.json")
+            .expect("o tokenizador LFS da Qwen tem soma publicada");
+        assert_eq!(esperado, "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a");
+
+        let dir = std::env::temp_dir().join(format!("aether-sha-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("tokenizer.json");
+        let cancel = AtomicBool::new(false);
+
+        stream_to_file_confirmando(
+            &client().unwrap(),
+            &catalog::support_url(spec, "tokenizer.json"),
+            &target,
+            None,
+            Some(esperado),
+            &cancel,
+            |_, _, _| {},
+        )
+        .await
+        .expect("os bytes publicados têm de bater com a soma publicada");
+
+        assert_eq!(sha256_de_arquivo(&target).unwrap(), esperado);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

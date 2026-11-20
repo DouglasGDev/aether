@@ -155,7 +155,12 @@ movido se um hash divergir. Veja
   as pastas concedidas de verdade. O servidor anuncia o catálogo inteiro — as 12
   ferramentas locais e as 9 de banco de dados; `criar_mcp_local` não é anunciada
   por ele, porque publicar de dentro de uma publicação seria outra porta para a
-  mesma sala.
+  mesma sala. Aperto de mão e descoberta de ferramentas têm 45 s de prazo
+  (`PRAZO_CONEXAO`): um servidor que inicia mas não fala devolve o erro com o id
+  dele em vez de deixar a tela girando, e cair no meio é seguro nos dois
+  transportes — no stdio o `Drop` da futura mata o filho. Fechar a janela
+  derruba o servidor publicado e cada conector, com 5 s de teto para um servidor
+  teimoso não segurar a saída.
 - **Gate e o que um servidor de terceiros alega** — o efeito de uma ferramenta de
   fora é decidido pelo núcleo, não pela anotação dela. Um servidor que declara
   `read_only_hint=true` recebe o teto `Altera`: a alegação não dá para verificar,
@@ -268,8 +273,11 @@ movido se um hash divergir. Veja
   que já saiu de lá responde com a lista dos que estão, como o nome errado de uma
   ferramenta responde com a lista dos nomes reais.
 - **Medidas visíveis** — tokens de entrada e saída, quantos deles vieram do cache,
-  tokens/s de prefill e decode, tempo no motor, motivo de parada e quantas
-  mensagens entraram no resumo daquela resposta.
+  tokens/s de prefill e decode, tempo no motor, motivo de parada, quantas
+  mensagens entraram no resumo daquela resposta e quantas ficaram de fora dele
+  (couberam no corte, não coube na régua do resumo — o número aparece em aviso
+  quando é maior que zero, porque dizer que dobrou dez e ter lido três seria o
+  aplicativo garantindo uma memória que o modelo não teve).
 - **Runtime nativo** — as DLLs de que o motor e a voz dependem não são um passo
   manual: o aplicativo baixa o pacote oficial (llama.cpp b12387 Vulkan, 38.119.681
   bytes; sherpa-onnx 1.13.8, 8.032.957 bytes), confere arquivo por arquivo contra

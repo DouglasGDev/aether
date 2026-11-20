@@ -53,7 +53,7 @@ pub fn save_connector(state: State<'_, AppState>, connector: Connector) -> Resul
     if connector.id == local::CONECTOR || connector.id == servidor::CONECTOR {
         return Err(tr("erros.conectorReservado", &[("id", &connector.id)]));
     }
-    let mut config = state.config.lock().expect("config lock poisoned");
+    let mut config = crate::state::trava_estado(&state.config);
     config.upsert(connector);
     let registry = config.registry().map_err(|e| e.to_string())?;
     config.save(&state.config_path).map_err(report)?;
@@ -74,7 +74,7 @@ pub async fn remove_connector(state: State<'_, AppState>, id: String) -> Result<
     if state.manager.connected_ids().contains(&id) {
         state.manager.disconnect(&id).await.map_err(report)?;
     }
-    let mut config = state.config.lock().expect("config lock poisoned");
+    let mut config = crate::state::trava_estado(&state.config);
     config.remove(&id);
     let registry = config.registry().map_err(|e| e.to_string())?;
     config.save(&state.config_path).map_err(report)?;
@@ -230,7 +230,7 @@ fn vista_pastas(pastas: &Pastas) -> Vec<PastaView> {
 
 #[tauri::command]
 pub fn granted_folders(state: State<'_, AppState>) -> Vec<PastaView> {
-    vista_pastas(&state.pastas.read().expect("pastas envenenadas"))
+    vista_pastas(&crate::state::trava_leitura(&state.pastas))
 }
 
 /// Conceder uma pasta é a única forma de o Aether enxergar arquivos. O caminho é
@@ -242,12 +242,12 @@ pub async fn grant_folder(
     caminho: String,
 ) -> Result<Vec<PastaView>, String> {
     {
-        let mut pastas = state.pastas.write().expect("pastas envenenadas");
+        let mut pastas = crate::state::trava_escrita(&state.pastas);
         pastas.conceder(&caminho).map_err(report)?;
         pastas.salvar(&state.pastas_path).map_err(report)?;
     }
     reacoplar_pastas(&app, &Arc::clone(&state.manager)).await;
-    Ok(vista_pastas(&state.pastas.read().expect("pastas envenenadas")))
+    Ok(vista_pastas(&crate::state::trava_leitura(&state.pastas)))
 }
 
 #[tauri::command]
@@ -257,7 +257,7 @@ pub async fn revoke_folder(
     caminho: String,
 ) -> Result<Vec<PastaView>, String> {
     {
-        let mut pastas = state.pastas.write().expect("pastas envenenadas");
+        let mut pastas = crate::state::trava_escrita(&state.pastas);
         if !pastas.revogar(&caminho) {
             return Err(tr("erros.pastaNaoConcedida", &[("caminho", &caminho)]));
         }
@@ -268,7 +268,7 @@ pub async fn revoke_folder(
     // índice — se a regravação falhar, a próxima varredura re-apaga.
     let _ = state.memoria.revogar();
     reacoplar_pastas(&app, &Arc::clone(&state.manager)).await;
-    Ok(vista_pastas(&state.pastas.read().expect("pastas envenenadas")))
+    Ok(vista_pastas(&crate::state::trava_leitura(&state.pastas)))
 }
 
 /// Um servidor de arquivos instalado roda com as pastas na linha de comando,
@@ -366,7 +366,7 @@ pub async fn mcp_install(
     // Só cadastramos o que provou estar em disco.
     let conector = instalador::conector(pronto, &raiz).map_err(report)?;
     {
-        let mut config = state.config.lock().expect("config lock poisoned");
+        let mut config = crate::state::trava_estado(&state.config);
         config.upsert(conector);
         let registry = config.registry().map_err(|e| e.to_string())?;
         config.save(&state.config_path).map_err(report)?;
@@ -426,7 +426,7 @@ pub async fn mcp_uninstall(
         return Err(erro);
     }
 
-    let mut config = state.config.lock().expect("config lock poisoned");
+    let mut config = crate::state::trava_estado(&state.config);
     config.remove(&id);
     let registry = config.registry().map_err(|e| e.to_string())?;
     config.save(&state.config_path).map_err(report)?;
@@ -484,6 +484,9 @@ pub struct ConexaoView {
     pub tem_senha: bool,
     pub limite_linhas: u32,
     pub sql_livre: bool,
+    /// Se o canal desta conexão é conferido. A tela mostra o estado porque o
+    /// motor obedece a ele — sem este campo o interruptor não existiria.
+    pub tls_verificado: bool,
     pub fontes: BTreeMap<String, crate::bancos::config::Fonte>,
 }
 
@@ -503,6 +506,7 @@ fn vista_conexoes(config: &crate::bancos::config::Config) -> Vec<ConexaoView> {
             tem_senha: c.senha_cifrada.as_ref().is_some_and(|s| !s.is_empty()),
             limite_linhas: c.limite_linhas,
             sql_livre: c.sql_livre,
+            tls_verificado: c.tls_verificado,
             fontes: c.fontes.clone(),
         })
         .collect()
@@ -583,13 +587,13 @@ pub fn set_locale(state: State<'_, AppState>, id: String) -> Result<String, Stri
         return Err(tr("erros.idiomaDesconhecido", &[("id", &id)]));
     }
     let registry = {
-        let config = state.config.lock().expect("config lock poisoned");
+        let config = crate::state::trava_estado(&state.config);
         config.registry().map_err(|e| e.to_string())?
     };
     state.manager.replace_registry(registry);
     state.manager.recarregar_embutido();
 
-    let mut history = state.ai.history.lock().expect("histórico envenenado");
+    let mut history = session::trava_historico(&state.ai.history);
     if let Some(primeira) = history.first_mut() && primeira.role == "system" {
         primeira.content = session::system_prompt();
     }
@@ -627,7 +631,7 @@ pub fn ai_status(state: State<'_, AppState>) -> AiStatus {
         ajustes: ai.ajustes(),
         janela: ai.janela(),
         busy: ai.is_busy(),
-        turns: ai.history.lock().expect("histórico envenenado").len(),
+        turns: session::trava_historico(&ai.history).len(),
         downloading: ai.downloading(),
         runtime: runtime::estado(&ai.dlls),
     }
@@ -771,14 +775,14 @@ pub fn model_solto(state: State<'_, AppState>) -> Result<geracao::Ajustes, Strin
 
 #[tauri::command]
 pub fn chat_history(state: State<'_, AppState>) -> Vec<ChatMessage> {
-    state.ai.history.lock().expect("histórico envenenado").clone()
+    session::trava_historico(&state.ai.history).clone()
 }
 
 #[tauri::command]
 pub fn chat_reset(state: State<'_, AppState>) -> Result<(), String> {
     state.ai.request_cancel();
-    state.ai.history.lock().expect("histórico envenenado").clear();
-    *state.ai.resumo.lock().expect("resumo envenenado") = None;
+    session::trava_historico(&state.ai.history).clear();
+    *session::trava_resumo(&state.ai.resumo) = None;
     // O arquivo tem de dizer o mesmo que o buffer vivo: uma conversa limpa na
     // tela e cheia no disco voltaria cheia no próximo arranque.
     if let Some(id) = state.conversas.estado().ativa {
@@ -822,8 +826,8 @@ pub fn conversa_nova(state: State<'_, AppState>) -> Result<conversas::Estado, St
             if !vazia {
                 state.conversas.criar()?;
             }
-            state.ai.history.lock().expect("histórico envenenado").clear();
-            *state.ai.resumo.lock().expect("resumo envenenado") = None;
+            session::trava_historico(&state.ai.history).clear();
+            *session::trava_resumo(&state.ai.resumo) = None;
             Ok(state.conversas.estado())
         })
         .map_err(report)
@@ -841,8 +845,8 @@ pub fn conversa_abrir(state: State<'_, AppState>, id: String) -> Result<Vec<Chat
         .troca_exclusiva(|| {
             state.ai.esquecer()?;
             let aberta = state.conversas.abrir(&id)?;
-            *state.ai.history.lock().expect("histórico envenenado") = aberta.mensagens.clone();
-            *state.ai.resumo.lock().expect("resumo envenenado") = aberta.resumo.clone();
+            *session::trava_historico(&state.ai.history) = aberta.mensagens.clone();
+            *session::trava_resumo(&state.ai.resumo) = aberta.resumo.clone();
             Ok(aberta.mensagens)
         })
         .map_err(report)
@@ -870,7 +874,7 @@ pub fn conversa_apagar(state: State<'_, AppState>, id: String) -> Result<convers
             }
             state.conversas.apagar(&id)?;
             if era_ativa {
-                state.ai.history.lock().expect("histórico envenenado").clear();
+                session::trava_historico(&state.ai.history).clear();
             }
             Ok(state.conversas.estado())
         })
@@ -935,8 +939,8 @@ pub async fn chat_send(
         // Grava mesmo quando o turno falhou: o que o modelo já disse e as
         // ferramentas que já rodaram aconteceram, e a conversa é o registro
         // disso. O lock do histórico é tomado e largado antes do das conversas.
-        let mensagens = ai.history.lock().expect("histórico envenenado").clone();
-        let resumo = ai.resumo.lock().expect("resumo envenenado").clone();
+        let mensagens = session::trava_historico(&ai.history).clone();
+        let resumo = session::trava_resumo(&ai.resumo).clone();
         match (resultado, conversas.gravar(&id, &mensagens, resumo.as_ref())) {
             (Ok(desfecho), Ok(_)) => Ok(desfecho),
             // A causa do turno vem primeiro: ela é o que a pessoa precisa ver.
@@ -1017,9 +1021,7 @@ fn run_chat_turn(
     // pessoa vê o assistente esbarrar três vezes na mesma parede — medido no app
     // real. É estado do pedido, não memória: entra na renderização e nunca no
     // histórico, então revogar uma pasta muda o prompt no turno seguinte.
-    let raizes: Vec<String> = pastas
-        .read()
-        .expect("pastas envenenadas")
+    let raizes: Vec<String> = crate::state::trava_leitura(pastas)
         .raizes
         .iter()
         .map(|r| r.display().to_string())
@@ -1119,6 +1121,15 @@ fn run_chat_turn(
     };
 
     emit(SessionEvent::Loading { model: spec.display.to_string() });
+    // O guard abaixo é segurado até o fim desta função — geração, rodadas de
+    // ferramenta e a espera do gate incluídas — e é ele que serializa um turno por
+    // vez sobre o KV cache do modelo em memória. Não é descuido: dois turnos no
+    // mesmo motor não são dois turnos mais rápidos, são os tokens de um pedido
+    // misturados com os do outro. Quem não pode esperar por ele é a thread da
+    // janela, e é por isso que `ai_status` lê os caches do `state.rs`, que a
+    // `esquecer`/`unload`/esta liberação de janela tentam a trava em vez de
+    // bloquear, e que `chat_send` responde `erros.turnoEmAndamento` no CAS de
+    // `begin` antes de chegar aqui. Ver `CONTRIBUTING.md` e `docs/melhorias/CONC2.md`.
     let mut guard = ai.acquire(spec).map_err(report)?;
     let loaded = guard.as_mut().expect("acquire acabou de carregar");
 
@@ -1145,7 +1156,7 @@ fn run_chat_turn(
         });
     }
     let params = ajustes.amostragem();
-    let resumo = ai.resumo.lock().expect("resumo envenenado").clone();
+    let resumo = session::trava_resumo(&ai.resumo).clone();
     let config = TurnConfig {
         tools: &specs,
         params: &params,
@@ -1161,7 +1172,7 @@ fn run_chat_turn(
     };
 
     {
-        let mut history = ai.history.lock().expect("histórico envenenado");
+        let mut history = session::trava_historico(&ai.history);
         if history.is_empty() {
             history.push(ChatMessage::new("system", session::system_prompt()));
         }
@@ -1191,7 +1202,7 @@ fn run_chat_turn(
         // O resumo que o turno escreveu é do buffer vivo, como o histórico: sem
         // isto o próximo pedido dobraria de novo os mesmos turnos, na placa, para
         // chegar ao mesmo texto.
-        *ai.resumo.lock().expect("resumo envenenado") = desfecho.resumo.clone();
+        *session::trava_resumo(&ai.resumo) = desfecho.resumo.clone();
     }
     if turno.is_err() {
         // O turno acima pôs o pedido no histórico antes de medir a janela, e
@@ -1199,7 +1210,7 @@ fn run_chat_turn(
         // tentativa malsucedida soma uma linha igual e empurra a janela para
         // frente. Só desfaz enquanto a última linha for o pedido — depois que o
         // modelo falou (ou uma ferramenta rodou), aquilo aconteceu e fica.
-        let mut history = ai.history.lock().expect("histórico envenenado");
+        let mut history = session::trava_historico(&ai.history);
         if history.last().map(|m| m.role.as_str()) == Some("user") {
             history.pop();
         }
@@ -1253,7 +1264,7 @@ fn estado_ligacoes(state: &AppState) -> EstadoLigacoes {
         .collect();
     EstadoLigacoes {
         nos,
-        pastas: vista_pastas(&state.pastas.read().expect("pastas envenenadas")),
+        pastas: vista_pastas(&crate::state::trava_leitura(&state.pastas)),
         posicoes: ligacoes::Layout::de(&state.ligacoes_path).posicoes,
     }
 }
@@ -1286,7 +1297,7 @@ pub async fn ligacoes_aplicar(
     };
 
     if !compilado.is_empty() {
-        let mut config = state.config.lock().expect("config lock poisoned");
+        let mut config = crate::state::trava_estado(&state.config);
         for (id, ferramentas) in &compilado {
             // O conector embutido é o próprio aplicativo e costuma não estar no
             // arquivo: para guardar a allowlist dele, ele entra primeiro.
@@ -1314,7 +1325,7 @@ pub async fn ligacoes_aplicar(
         for caminho in &plano.pastas {
             novas.conceder(caminho).map_err(report)?;
         }
-        let mut pastas = state.pastas.write().expect("pastas envenenadas");
+        let mut pastas = crate::state::trava_escrita(&state.pastas);
         let mudou = novas.raizes != pastas.raizes;
         if mudou {
             *pastas = novas;
@@ -1665,7 +1676,7 @@ pub async fn runtime_instalar(
     ids: Vec<String>,
 ) -> Result<(), String> {
     let cancel = {
-        let mut job = state.runtime_job.lock().expect("runtime envenenado");
+        let mut job = crate::state::trava_estado(&state.runtime_job);
         if job.is_some() {
             return Err(tr("erros.runtimeEmCurso", &[]));
         }
@@ -1685,14 +1696,14 @@ pub async fn runtime_instalar(
         // O slot tem de ser devolvido mesmo quando a instalação falha: sem isto
         // a segunda tentativa diria "já em curso" para sempre.
         let estado = app.state::<AppState>();
-        *estado.runtime_job.lock().expect("runtime envenenado") = None;
+        *crate::state::trava_estado(&estado.runtime_job) = None;
     });
     Ok(())
 }
 
 #[tauri::command]
 pub fn runtime_cancelar(state: State<'_, AppState>) -> Result<(), String> {
-    let job = state.runtime_job.lock().expect("runtime envenenado");
+    let job = crate::state::trava_estado(&state.runtime_job);
     match job.as_ref() {
         Some(cancel) => {
             cancel.store(true, Ordering::Relaxed);
@@ -1775,4 +1786,28 @@ pub fn bancada_cancelar(state: State<'_, AppState>) -> Result<(), String> {
     }
     state.ai.request_cancel();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bancos::config::{conexao_de_teste, Config, Tipo};
+
+    /// O que a tela pode marcar tem de ser o que a lista devolve. Uma flag que
+    /// existe no cadastro e não aparece na vista é um interruptor que ninguém
+    /// encosta: o motor obedece, o dono não sabe que ele existe.
+    #[test]
+    fn a_vista_carrega_o_canal_que_o_cadastro_marcou() {
+        let mut config = Config::default();
+        let mut conferida = conexao_de_teste(Tipo::Postgres);
+        conferida.tls_verificado = true;
+        config.conexoes.push(conferida);
+
+        let vista = serde_json::to_value(vista_conexoes(&config)).expect("serializa a vista");
+        assert_eq!(
+            vista[0]["tlsVerificado"],
+            serde_json::Value::Bool(true),
+            "a vista conta à tela o canal que o cadastro guarda: {vista}"
+        );
+    }
 }

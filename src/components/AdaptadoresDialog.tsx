@@ -7,6 +7,7 @@ import type {
   EstadoAdaptadores,
   ItemAdaptador,
 } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -48,6 +49,7 @@ function marcar(
 }
 
 export function AdaptadoresDialog({ onClose, onChange }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
   const [estado, setEstado] = useState<EstadoAdaptadores | null>(null);
@@ -72,6 +74,10 @@ export function AdaptadoresDialog({ onClose, onChange }: Props) {
 
   const gravar = useCallback(
     async (novo: EstadoAdaptadores) => {
+      // O mesmo clique que liga um adaptador dispara `onChange` e `onBlur` em
+      // sequência: sem esta trava a segunda chamada posta o estado outra vez e
+      // as duas respostas voltam fora de ordem.
+      if (ocupada) return;
       setOcupada(true);
       try {
         setEstado(await api.adaptadoresAjustar(ajustesDe(novo)));
@@ -83,7 +89,7 @@ export function AdaptadoresDialog({ onClose, onChange }: Props) {
         setOcupada(false);
       }
     },
-    [onChange],
+    [onChange, ocupada],
   );
 
   async function importar(event: React.FormEvent) {

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { api, message } from "../lib/api";
 import { useT } from "../lib/i18n";
 import type { GrantedFolder } from "../lib/types";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -13,6 +14,7 @@ interface Props {
 /// A única porta de entrada do Aether aos arquivos: enquanto o usuário não
 /// conceder uma pasta, nenhuma ferramenta de arquivo enxerga o disco.
 export function PastasDialog({ pastas, onChange, onClose }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const [caminho, setCaminho] = useState("");
   const [erro, setErro] = useState<string | null>(null);

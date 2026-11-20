@@ -227,9 +227,29 @@ pub fn run() {
             commands::bancada_rodar,
             commands::bancada_cancelar,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Aether");
+        .build(tauri::generate_context!())
+        .expect("failed to run Aether")
+        .run(|app, event| {
+            // Fechar a janela era o fim do arquivo para os servidores MCP: o
+            // processo filho morre no `Drop` do transporte, e o transporte mora
+            // no gerenciador — que nada segurava. Resto de `node.exe` escutando
+            // uma porta com um token que ninguém mais conhece não é um detalhe
+            // de encerramento, é um servidor vivo fora do app.
+            //
+            // O prazo é a despedida com teto: um servidor teimoso que não
+            // responde ao `shutdown` não pode segurar a saída da janela.
+            if let tauri::RunEvent::Exit = event {
+                let manager = app.state::<AppState>().manager.clone();
+                tauri::async_runtime::block_on(async {
+                    let _ = tokio::time::timeout(PRAZO_DESLIGAR, manager.desligar()).await;
+                });
+            }
+        });
 }
+
+/// Quanto o aplicativo espera a despedida dos servidores MCP antes de sair do
+/// jeito bruto. Cinco segundos é o teto visível para quem fecha a janela.
+const PRAZO_DESLIGAR: Duration = Duration::from_secs(5);
 
 /// Onde o carregador pode achar as DLLs nativas — `sherpa-onnx-c-api.dll` para a
 /// voz e `llama.dll`/`ggml*.dll` para a inferência. É ao lado do executável que

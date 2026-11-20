@@ -8,6 +8,7 @@ import type {
   ServidorMcpEstado,
 } from "../lib/types";
 import { ConnectorForm } from "./ConnectorForm";
+import { useFecharComEscape } from "../lib/teclado";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -24,6 +25,7 @@ interface Obra {
 }
 
 export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) {
+  useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
   const [catalogo, setCatalogo] = useState<ServidorCatalogo[]>([]);
@@ -196,7 +198,6 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
         </header>
 
         <p className="sheet-sep">{t("servidores.catalogo")}</p>
-        <p className="sheet-hint">{t("servidores.catalogoNota")}</p>
         <ul className="server-rows">
           {catalogo.map((servidor) => {
             const obra = obras[servidor.id];
