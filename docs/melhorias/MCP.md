@@ -137,7 +137,9 @@ entra no gancho de `RunEvent::Exit` com teto próprio de 5 s (`lib.rs:241-252`)
 para um servidor teimoso não segurar a janela aberta.
 
 Que o gancho é chamado antes do `cleanup_before_exit()` é lido do fonte do
-tauri 2.12.5 (`src/app.rs:1449`), e o `async_runtime` guarda o runtime do processo
+tauri 2.12.5 (no registro do cargo: `tauri-2.12.5/src/app.rs:1449-1452` — o
+`RunEvent::Exit` dispara o callback em `:1451` e só então chama o cleanup em
+`:1452`), e o `async_runtime` guarda o runtime do processo
 numa `OnceLock` — por isso o `block_on` na saída é seguro, não um acaso.
 
 **Medido.** Vermelho, com o helper ainda parado num `Ok(()) { sleep(5s) }`:
@@ -182,12 +184,12 @@ gerente inteiro (`lib.rs:252`) e o servidor MCP é uma das coisas que ele derrub
   porque uma soquete pendurada no meio de um pedido não é razão para o fecho não
   acontecer;
 - as que terminam saem do conjunto enquanto o laço ainda aceita
-  (`servidor.rs:433`), senão a lista só cresceria até o `fechar`;
-- `drenar` (`servidor.rs:497`) espera o que está em curso com teto
-  (`PRAZO_DRENO`, 2 s em `servidor.rs:411`) e, estourado, corta o resto com
-  `conexoes.shutdown()` (`servidor.rs:503`) — o `fechar` do aplicativo não fica
+  (`servidor.rs:430`), senão a lista só cresceria até o `fechar`;
+- `drenar` (`servidor.rs:494`) espera o que está em curso com teto
+  (`PRAZO_DRENO`, 2 s em `servidor.rs:408`) e, estourado, corta o resto com
+  `conexoes.shutdown()` (`servidor.rs:500`) — o `fechar` do aplicativo não fica
   refém de um cliente mudo do outro lado da loopback. Os dois segundos cabem nos
-  cinco de `lib.rs:252` com folga, e é por isso que o valor é 2.
+  cinco de `lib.rs:253` com folga, e é por isso que o valor é 2.
 
 **Medido.** Vermelho, com o teste da árvore contra o comportamento de antes (spawn
 solto, sem `parada` e sem dreno):

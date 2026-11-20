@@ -5,6 +5,11 @@ Frente FRONT. Arquivos exclusivos tocados: `src/App.tsx`, `src/components/Chats.
 `src/components/VozDialog.tsx`, `src/components/ServerDialog.tsx`. Nenhum locale,
 nenhum `.rs`, nenhum outro componente foi editado.
 
+As linhas abaixo foram re-derivadas na passagem de 2026-11-20, depois das frentes
+FRONT2/FRONT3 e da leva de contratos, que mexeram o `App.tsx` e os dialogs por
+dentro. Cada âncora é lida no arquivo de hoje (`grep -n` do símbolo citado), não
+copiada desta página.
+
 ## Verificação
 
 - **Sem test runner no projeto.** `package.json` só tem `dev`/`build`/`preview`/`tauri`
@@ -21,27 +26,27 @@ nenhum `.rs`, nenhum outro componente foi editado.
 
 ### F1 [HIGH] Troca de conversa no meio do turno corrompe história alheia
 - `src/components/Chats.tsx:138` — botão `chats-abrir` ganha `disabled={ocupado}`,
-  igual ao padrão já existente em `:82` (nova), `:193` (apagar) e `:212` (limpar).
+  igual ao padrão já existente em `:82` (nova), `:193` (apagar) e `:213` (limpar).
   Honra o contrato do próprio arquivo (`:9-11`: "a tela não oferece um botão que ele
   não vai honrar").
-- `src/App.tsx:493` — `abrirConversa` recusa com `if (talking) return;` antes de
+- `src/App.tsx:643` — `abrirConversa` recusa com `if (talking) return;` antes de
   qualquer efeito. Cobre quem chamar o handler direto (a guarda não depende só do
   botão). `talking` é lido do closure do render; `onAbrir` é recriado a cada render
-  (`App.tsx:705`), então não há closure velho.
-- **Por quê:** o handler de chat-event (`App.tsx:276-349`) anexa cada delta ao
+  (`App.tsx:865`), então não há closure velho.
+- **Por quê:** o handler de chat-event (`App.tsx:335-442`) anexa cada delta ao
   "último turno assistant" do buffer vivo. `abrirConversa` substitui `turns`
-  (`App.tsx:496`); trocar no meio do turno faria o handler escrever na história de
+  (`App.tsx:646`); trocar no meio do turno faria o handler escrever na história de
   OUTRA conversa. O núcleo já recusa a troca com o motor ocupado.
-- **Verificação:** leitura do fluxo `ocupado={talking || calling}` (`App.tsx:703`) →
-  Chats; `talking` ligado em `submitQuery` (`App.tsx:420`) e desligado no `finally`
-  (`App.tsx:452`). A guarda usa `talking` (não `calling`): só o turno de chat emite
+- **Verificação:** leitura do fluxo `ocupado={talking || calling}` (`App.tsx:863`) →
+  Chats; `talking` ligado em `submitQuery` (`App.tsx:570`) e desligado no `finally`
+  (`App.tsx:602`). A guarda usa `talking` (não `calling`): só o turno de chat emite
   deltas para `turns`; uma chamada direta de ferramenta (`calling`) não anexa ao
   histórico, então a troca nesse caso é honrada pelo núcleo. tsc OK.
 
 ### F2 [MED] Edição otimista da política corre contra a resposta do núcleo
 - `src/components/GrafoNeural.tsx:419` — novo `const pedido = useRef(0)`, contador
   monotônico compartilhado por `carregar` e `gravar`.
-- `carregar` (`:421-435`) e `gravar` (`:464-481`) recebem `const token = ++pedido.current`
+- `carregar` (`:421-435`) e `gravar` (`:463-481`) recebem `const token = ++pedido.current`
   no início (síncrono, antes do primeiro await) e só escrevem `base`/`erro` se
   `token === pedido.current` depois do await — tanto no sucesso quanto no catch.
 - **Por quê:** `alternar`/`todos` fazem `setBase(novo)` otimista e depois `gravar`;
@@ -57,18 +62,18 @@ nenhum `.rs`, nenhum outro componente foi editado.
   estável. tsc OK.
 
 ### F3 [MED] `refresh()` sem guarda de ordem atropela estado mais novo
-- `src/App.tsx:112` — novo `const refreshPedido = useRef(0)`.
-- `refresh` (`:114-161`) recebe `const token = ++refreshPedido.current`; depois do
-  `Promise.all` (`:141`) e no catch (`:158`) só aplica o snapshot se o token ainda é
+- `src/App.tsx:182` — novo `const refreshPedido = useRef(0)`.
+- `refresh` (`:184-249`) recebe `const token = ++refreshPedido.current`; depois do
+  `Promise.all` (`:198`) e no catch (`:246`) só aplica o snapshot se o token ainda é
   o último.
-- **Por quê:** todo evento MCP (`App.tsx:376`), todo lagged (`:382`) e todo fim de
-  turno (`:453`) dispara `refresh()` concorrente. Um `Promise.all` mais antigo e mais
+- **Por quê:** todo evento MCP (`App.tsx:526`), todo lagged (`:532`) e todo fim de
+  turno (`:603`) dispara `refresh()` concorrente. Um `Promise.all` mais antigo e mais
   lento podia sobrescrever `pending`/`connected`/`chats`/`capabilities` mais novos.
   A guarda no catch evita que a falha de um pedido já superado acenda a faixa de erro
   quando um refresh mais novo teve sucesso.
 - **Verificação:** leitura de todos os chamadores (`void refresh()` e `await refresh()`,
-  inclusive `RuntimeDialog onChange={refresh}`). Todos passam pela mesma função guardada.
-  `useCallback([])` inalterado; ref estável. tsc OK.
+  inclusive `RuntimeDialog onChange={refresh}` — `App.tsx:1095`). Todos passam pela
+  mesma função guardada. `useCallback([])` inalterado (`App.tsx:249`); ref estável. tsc OK.
 
 ### F4 [MED] `message()` mostrava `"{}"` para um `Error`
 - `src/lib/api.ts:210-216` — trata `string`, depois `Error` (`error.message`), depois
@@ -80,21 +85,23 @@ nenhum `.rs`, nenhum outro componente foi editado.
   tsc OK.
 
 ### F5 [MED] Rejeições de invoke engolidas nos dialogs
-- `src/components/MemoriaDialog.tsx:341` — `onCancelar` agora
-  `void agir(() => api.modelDownloadCancel(modelo.id))`, igual a `onBaixar`/`onUsar`/`onExcluir`.
-- `src/components/MemoriaDialog.tsx:429` — parar varredura agora
-  `void agir(() => api.ragIndexarCancelar())`.
-- `src/components/VozDialog.tsx:129-138` — nova `async function parar()` com
+- `src/components/MemoriaDialog.tsx:350` — `onCancelar` agora
+  `void agir(() => api.modelDownloadCancel(modelo.id))`, igual a `onBaixar`/`onUsar`/`onExcluir`
+  (`:349`, `:351`, `:352`).
+- `src/components/MemoriaDialog.tsx:418` — parar varredura agora
+  `aoCancelar={() => void agir(() => api.ragIndexarCancelar())}`, no `BarraDeTrabalho`
+  que a frente FRONT3 extraiu; o `void agir` é o mesmo de antes da extração.
+- `src/components/VozDialog.tsx:111-118` — nova `async function parar()` com
   `setErro(null)` + try/catch `setErro(message(cause))`, espelhando `prever`/`baixar`/
-  `cancela`/`apagar`; botão em `:184` passa a `onClick={() => void parar()}`.
+  `cancela`/`apagar`; botão em `:177` passa a `onClick={() => void parar()}`.
 - **Por quê:** `void api.…()` sem catch gerava unhandled rejection e nenhum estado de
   erro. `agir` (MemoriaDialog) já faz `setOcupada`/try-catch/`ler`/`onChange`; VozDialog
   usa o padrão try-catch por ação. Uma falha agora aparece na faixa de erro existente.
-- **Verificação:** leitura de `agir` (`MemoriaDialog:220-232`) e das funções irmãs de
+- **Verificação:** leitura de `agir` (`MemoriaDialog:215-227`) e das funções irmãs de
   VozDialog. Nenhuma string nova; o caminho de erro já existe. tsc OK.
 
 ### F6 [MED] Cancelar instalação mapeava falha real para "nada para cancelar"
-- `src/components/ServerDialog.tsx:145-156` — `cancelar` troca
+- `src/components/ServerDialog.tsx:147-158` — `cancelar` troca
   `await api.mcpInstallCancel(...).catch(() => false)` por try/catch: `false` legítimo
   do núcleo → `t("servidores.nadaParaCancelar", { nome })`; rejeição →
   `setErro(message(cause))`.
@@ -108,29 +115,45 @@ nenhum `.rs`, nenhum outro componente foi editado.
 
 **Nenhuma chave nova.** Todas as correções reutilizam o caminho de erro existente
 (`message(cause)` → faixa de erro) e chaves já presentes:
-`servidores.nadaParaCancelar` (`locales/pt-BR.json:190`), `conversas.abrir`,
+`servidores.nadaParaCancelar` (`locales/pt-BR.json:197`), `conversas.abrir`,
 `memoria.parar`, `voz.pararFala`. Nenhum locale foi editado (arquivo compartilhado).
 
-## Follow-ups deixados (fora deste lote, com evidência lida)
+## Follow-ups: o que esta passagem deixou, e onde cada um está hoje (lido 2026-11-20)
 
-- **Prosa na UI (F7):** `ServerDialog.tsx:199` `<p className="sheet-hint">{t("servidores.catalogoNota")}</p>`
-  é texto explicativo, não controle/estado. Avaliar remoção ou conversão em estado.
-  (Os `sheet-note` de estado vazio — ex. `App.tsx:810-813` — são estado legítimo, não prosa.)
-- **Marca hardcoded:** `App.tsx:719-722` `<span className="brand">…Aether</span>` é
-  literal, não vem de locale. O hub do grafo já usa `t("ligacoes.aether")`
-  (`GrafoNeural.tsx:961`); a marca do cabeçalho deveria seguir o mesmo caminho.
-- **Tooltip de 0 ms fabricado:** `GrafoNeural.tsx:937` `${pulso.ms ?? 0} ms` inventa
-  "0 ms" quando `ms` é undefined (sinapse em curso / sem medição). Nada simulado:
-  mostrar só o rótulo quando não há medição real, em vez de um zero fabricado.
-- **ResizeObserver ausente:** o ajuste de lente do grafo (`GrafoNeural.tsx:778-789`)
-  lê `clientWidth/clientHeight` só quando as deps mudam; não há `ResizeObserver` em
-  todo o `src` (grep). Redimensionar a janela não reenquadra o grafo até outro gesto.
-- **Poda do mapa `requests`:** `App.tsx:54,368` acumula uma entrada por
-  `approvalRequested` e nunca remove ao resolver/apagar o pedido — cresce sem poda.
-- **Exports mortos de `api.ts`:** auditar e remover/ligar a diagnóstico os exports sem
-  consumidor (ex. candidatos `toolCatalog`, `resolveIntent`, `chatHistory`,
-  `connectorTools`, `bancosDescobrir`); confirmar uso real antes de remover.
-- **Extração de componente compartilhado (F16):** a maquinaria de Job/progresso e o
-  slider estão duplicados em vários dialogs (MemoriaDialog, VozDialog, ModelManager,
-  RuntimeDialog). Extrair DEPOIS das correções individuais, em lote sequenciado —
-  não feito aqui para manter as mudanças cirúrgicas e um escritor por arquivo.
+- **Prosa na UI (F7) — a prosa saiu, e sobrou o que ela usava.** Nenhuma tela lê
+  `sheet-hint` (`grep -rn "sheet-hint" src` devolve só `src/styles.css`), e
+  `servidores.catalogoNota` não tem consumidor nenhum fora dos dois JSON
+  (`grep -rn catalogoNota src src-tauri/src` → zero linhas). As duas coisas são
+  órfãs hoje: a classe no CSS e a chave nos dois locales. Tirá-las é lote próprio
+  — chave de locale sai dos dois idiomas ao mesmo tempo, porque
+  `idiomas.rs:150 todos_os_idiomas_tem_exatamente_as_mesmas_chaves` confere a
+  paridade. Os `sheet-note` de estado vazio continuam legítimos: `App.tsx:920` é
+  "carregando" e `App.tsx:973-977` escolhe entre `app.semServidor` e
+  `app.semFerramenta` — estado, não explicação.
+- **Marca hardcoded — fechado.** `App.tsx:874-879` renderiza `{t("ligacoes.aether")}`
+  (`:878`), pela mesma chave que o hub do grafo usa (`GrafoNeural.tsx:983`).
+- **Tooltip de 0 ms fabricado — fechado.** `GrafoNeural.tsx:930-932` só monta
+  "N ms" quando `typeof pulso.ms === "number"`; sem medição o rótulo diz o que
+  existe, não um zero inventado.
+- **ResizeObserver ausente — fechado.** `GrafoNeural.tsx:799`
+  (`new ResizeObserver(reenquadrar)`) reenquadra a lente quando a caixa muda; os
+  `clientWidth` de `:790` e `:811` deixaram de ser a única fonte do enquadramento.
+- **Poda do mapa `requests` — fechado.** A declaração é `App.tsx:117` e a poda
+  mora no próprio `refresh` (`App.tsx:223-233`): recorta quem não voltou no
+  snapshot e devolve o objeto atual quando nenhuma chave saiu, para não reacender
+  render. No `refresh` e não no clique porque só ele conhece todas as formas de
+  morrer de um pedido (resolvido, expirado, conector derrubado).
+- **Exports mortos de `api.ts` — auditado, e resta um caso com dono.** O objeto
+  `api` tem 78 métodos e os quatro candidatos desta página saíram: `toolCatalog`,
+  `resolveIntent`, `chatHistory` e `connectorTools` não ocorrem em `src` nem em
+  `src-tauri/src`. `bancosDescobrir` tem consumidor real
+  (`BancosDialog.tsx:160`). Um ficou: `vozFalar` (`api.ts:114`) não é chamado pela
+  interface, e o comando existe do outro lado (`commands.rs:1374`, registrado em
+  `lib.rs:204`). Cortar o wrapper sem cortar o `pub fn` deixa um comando da
+  interface pública sem dono; é frente Rust, com o `commands.rs` sob um único
+  escritor — não uma linha a menos no `api.ts`.
+- **Componente compartilhado (F16) — fechado.** `src/components/BarraDeTrabalho.tsx`
+  traz a barra de Job (`BarraDeTrabalho`, `:43`) e a régua (`Regua`, `:139`, com o
+  único `type="range"` do front em `:170`). Seis dialogs consomem a barra:
+  `AdaptadoresDialog`, `GeracaoDialog`, `MemoriaDialog`, `ModelManager`,
+  `RuntimeDialog`, `VozDialog`.

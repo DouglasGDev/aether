@@ -163,18 +163,18 @@ Nenhuma chave nova (o detector não emite string; o re-prompt usa o fluxo existe
 
 ### Testes vermelho-primeiro (módulo `tests` novo — o arquivo não tinha)
 
-- `filtro_com_operador_embutido_nao_vira_consulta` (`mongo.rs:504`): o teste
+- `filtro_com_operador_embutido_nao_vira_consulta` (`mongo.rs:519`): o teste
   que compila contra o código ANTIGO e falha na assertiva — `filtro_de` +
   `filtro_bson` com `{"campo":{"$ne":null,"x":1}}` e com
   `{"campo":{"op":"igual","valor":{"$ne":null}}}`; assertiva `is_err()`.
   Vermelho antes: `filtro_bson` devolvia `Ok` com o documento de operadores.
 - `chave_de_operador_no_valor_e_recusada_em_qualquer_profundidade`
-  (`mongo.rs:491`): `json_para_bson({"$ne":null})` é `Err` contendo "$ne";
+  (`mongo.rs:506`): `json_para_bson({"$ne":null})` é `Err` contendo "$ne";
   aninhado `{"a":{"b":{"$gt":1}}}` e em array `[{"$exists":true}]` são `Err`;
   `documento_de({"campo":{"$ne":null,"x":1}})` é `Err`. (Contra a assinatura
   antiga este teste nem compila — `unwrap_err` em `Bson`; o vermelho-primeiro
   compilável é o teste acima, do `filtro_bson`.)
-- `objeto_sem_operador_continua_entrando_como_subdocumento` (`mongo.rs:514`):
+- `objeto_sem_operador_continua_entrando_como_subdocumento` (`mongo.rs:529`):
   `{"a":1,"b":{"c":"x"}}` continua `Ok` (Int64 conferido) e filtro com valor
   objeto sem `$` continua `Ok` — a recusa é do `$`, não de valor composto.
 

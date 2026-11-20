@@ -322,8 +322,8 @@ vermelho-primeiro, o que foi medido e o que ficou pendente):
   `erros.motorSemPlaca`, nos dois idiomas.
 - `MEM.md` — M1, M2, M4, M5, M6, M7 e M3 todos na árvore. O agente de MEM parou
   por limite de crédito após M4; o maintainer fechou M1/M2 e depois M6
-  (`conversas.rs:206,242`), M7 (`conversas.rs:311,346`), M5 (`memoria.rs:1568,1814`)
-  e M3 (`download.rs:85,151,352`). Nenhum dos quatro precisou de chave i18n nova.
+  (`conversas.rs:215,251`), M7 (`conversas.rs:320,355`), M5 (`memoria.rs:1579,1826`)
+  e M3 (`download.rs:88,253,539`). Nenhum dos quatro precisou de chave i18n nova.
 
 Os `arquivo:linha` do brief lá em cima são os da árvore antes do lote; os das
 seções FEITO de cada doc são os da árvore depois da correção.
@@ -459,9 +459,10 @@ aplicativo. Quatro buracos de honestidade no Rust e quatro correções na casca.
   conexão fracassada vazava um `node.exe` vivo é falsa** — o defeito real era a
   falta de prazo, e fica registrada assim para ninguém caçar o fantasma. Na
   mesma passagem, `desligar` (`manager.rs:633`) derruba o servidor publicado e os
-  conectores, e entra no gancho de saída (`lib.rs:241-244`) com 5 s de teto
-  (`:252`) para um teimoso não segurar a janela fechada. Que o gancho dispara
-  antes do `cleanup_before_exit()` (`tauri 2.12.5 src/app.rs:1449`) e que o
+  conectores, e entra no gancho de saída (`lib.rs:242-247`) com 5 s de teto
+  (`PRAZO_DESLIGAR`, `:253`) para um teimoso não segurar a janela fechada. Que o
+  gancho dispara antes do `cleanup_before_exit()` (registro do cargo,
+  `tauri-2.12.5/src/app.rs:1449-1452`) e que o
   runtime do `async_runtime` é do processo (daí o `block_on` na saída ser seguro)
   é lido do fonte das crates.
 - **SONDAS** — `engine_probe` usava `unwrap_or` para ter número onde o motor não
