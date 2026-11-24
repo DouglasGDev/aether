@@ -104,7 +104,8 @@ o derrotam:
   invariante `:168-169` ("None nunca deve ser lido como cabe"); modelo não-medido
   passa nos filtros `cabem` e pode vencer um medido que não cabe. **Correção:**
   `(3, false)` e ranquear não-medidos por último.
-- **A4 [MED]** `alojamento.rs:256,303-304`: `kv_por_token` e `kv*janela`,
+- **A4 [MED]** `alojamento.rs:256,303-304` (de antes da correção; hoje a conta é
+  `taxa_kv` em `:338` e `alojar` em `:513`): `kv_por_token` e `kv*janela`,
   `pesos+kv+FOLGA` multiplicam metadado u32 do GGUF sem checagem; header crafted
   estoura u64 → panic em debug / wrap em release → veredito `Inteira` falso e OOM.
   **Correção:** aritmética checked, recusar no overflow.
@@ -320,7 +321,7 @@ vermelho-primeiro, o que foi medido e o que ficou pendente):
 - `FRONT.md` — F1 a F6. Verde.
 - `CORE.md` — A2 a A7 todos na árvore. O agente de CORE parou no meio por
   estouro de limite de crédito (só A2 e A5 ficaram dele); o maintainer fechou
-  A4 (`alojamento.rs:254,317`), A3 (`router.rs:199`), A6 (`session.rs:499,710`)
+  A4 (`alojamento.rs:338,513`), A3 (`router.rs:199`), A6 (`session.rs:499,710`)
   e A7 (`chat.rs:330`), cada um com o vermelho-primeiro rodado antes do verde.
   Chaves i18n novas do lote: `erros.alojamentoEstouro`, `erros.pensamentoTruncado`,
   `erros.motorSemPlaca`, nos dois idiomas.
@@ -728,12 +729,13 @@ de cada arquivo.
   `ornith-ai/Ornith-1.5-9B` — lidos um e outro na mesma passada. É a família
   mesma, conferida por dois caminhos.
 
-Fora do alcance e registrado como tal, em `CATALOGO.md`: alojamento real dos
-pesos novos (o `kv_por_token` de `alojamento.rs:254-269` é teto em arquitetura
-híbrida, e o `gemma4` declara `sliding_window`, `shared_kv_layers` e
-`sliding_window_pattern` que a conta não modela), qualidade de texto e custo por
-rodada, e o que o laço de ferramentas entrega num Gemma 4, cujo template usa
-marcadores próprios e não o XML que o parser lê.
+Fora do alcance e registrado como tal, em `CATALOGO.md`: a carga dos pesos novos
+na placa (a conta de `kv_por_token` fechou na passagem #106 — `camadas_de_cache`
+e `taxa_kv` leem o array de geometria como o b12387; o que continua **teto** são
+as 24 camadas recorrentes do `qwen35`, que pagam como atenção porque o estado
+recorrente não é KV cache), qualidade de texto e custo por rodada, e o que o laço
+de ferramentas entrega num Gemma 4, cujo template usa marcadores próprios e não o
+XML que o parser lê.
 
 Gates desta passagem: `cd src-tauri && cargo test --lib` → **567 passaram, 0
 falharam, 11 ignored, finished in 5,92 s**; `cargo test --lib catalog` → **27

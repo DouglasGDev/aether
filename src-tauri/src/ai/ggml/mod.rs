@@ -852,8 +852,9 @@ mod tests {
             pesos_total: pesos_mib * MIB,
             camada: vec![passo; camadas],
             fixo: 0,
-            // A mesma conta que `fichar` usa: 2 (K e V) × camadas × cabeças de
-            // KV × dimensão da cabeça × 2 bytes do f16 do flash attention.
+            // O caso uniforme, que é o que esta ficha de teste declara: todas as
+            // camadas com as mesmas cabeças e a mesma dimensão, então a soma
+            // camada a camada de `fichar` fecha neste produto.
             kv_por_token: 2 * camadas as u64 * cabecas_kv * dimensao * 2,
             janela_maxima: 32_768,
             template: None,

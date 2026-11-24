@@ -8,12 +8,19 @@
 //!
 //! Nada aqui é chutado, e as duas contas que parecem fórmula têm prova:
 //!
-//! - **KV cache**: `2 (K e V) * camadas * cabeças_kv * dimensao_cabeca * 2
-//!   bytes`. No granite-4.2-3b Q4_K_M com janela de 4096 isso dá 335.544.320
-//!   bytes, e a biblioteca escreveu `llama_kv_cache: size = 320.00 MiB (4096
-//!   cells, 40 layers, 1/1 seqs), K (f16): 160.00 MiB, V (f16): 160.00 MiB` —
-//!   320,00 MiB é exatamente 335.544.320 / 1048576. Os 2 bytes são o f16 que o
-//!   flash attention ligado (`ffi.rs`, `ATENCAO_RAPIDA`) pede para K e V.
+//! - **KV cache**: a soma, camada a camada, de `cabeças_kv * (dimensão_de_k +
+//!   dimensão_de_v) * 2 bytes` — os 2 bytes são o f16 com que a biblioteca escreve
+//!   K e V por padrão (`type_k`/`type_v` em `llama_context_default_params`). O
+//!   que cada camada tem vem do cabeçalho dela, pelas mesmas chaves e os mesmos
+//!   padrões do b12387 vendorizado (`camadas_de_cache` abaixo). No granite-4.2-3b
+//!   Q4_K_M, onde todas as 40 camadas são iguais, isso dá 81.920 bytes por token
+//!   e, com janela de 4096, 335.544.320 bytes — e a biblioteca escreveu
+//!   `llama_kv_cache: size = 320.00 MiB (4096 cells, 40 layers, 1/1 seqs), K
+//!   (f16): 160.00 MiB, V (f16): 160.00 MiB`: 320,00 MiB é exatamente
+//!   335.544.320 / 1048576. O caso que não é uniforme é o gemma-4-12b-it, onde a
+//!   conta antiga nem de perto passava: `gemma4.attention.head_count_kv` é um
+//!   array de 48 inteiros (8 nas camadas de janela deslizante, 1 nas de atenção
+//!   cheia) e as dimensões de cabeça são 256 em umas e 512 nas outras.
 //! - **bytes de tensor**: `elementos / bloco * tamanho_do_bloco` com o dtype e a
 //!   forma que estão no cabeçalho, lidos pelo parser que o projeto já usa para
 //!   carregar os pesos. Somando os tensores do mesmo arquivo dá 2136,65 MiB, e a
@@ -145,12 +152,218 @@ fn vocabulario(
 }
 
 fn numero(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Result<u64> {
-    match metadata.get(chave) {
-        Some(gguf_file::Value::U32(v)) => Ok(*v as u64),
-        Some(gguf_file::Value::U64(v)) => Ok(*v),
-        Some(gguf_file::Value::I32(v)) if *v >= 0 => Ok(*v as u64),
-        _ => bail!(tr("erros.metadadoAusente", &[("chave", chave)])),
+    let valor = metadata
+        .get(chave)
+        .and_then(|v| if matches!(v, gguf_file::Value::Array(_)) { None } else { Some(v) })
+        .and_then(contagem)
+        .ok_or_else(|| anyhow::anyhow!(tr("erros.metadadoAusente", &[("chave", chave)])))?;
+    Ok(valor)
+}
+
+/// Uma linha do cabeçalho lida como contagem: os inteiros que o GGUF escreve
+/// para geometria, e o `Bool` que o array de `sliding_window_pattern` usa.
+fn contagem(valor: &gguf_file::Value) -> Option<u64> {
+    match valor {
+        gguf_file::Value::U8(v) => Some(*v as u64),
+        gguf_file::Value::U16(v) => Some(*v as u64),
+        gguf_file::Value::U32(v) => Some(*v as u64),
+        gguf_file::Value::U64(v) => Some(*v),
+        gguf_file::Value::I8(v) if *v >= 0 => Some(*v as u64),
+        gguf_file::Value::I16(v) if *v >= 0 => Some(*v as u64),
+        gguf_file::Value::I32(v) if *v >= 0 => Some(*v as u64),
+        gguf_file::Value::I64(v) if *v >= 0 => Some(*v as u64),
+        gguf_file::Value::Bool(v) => Some(u64::from(*v)),
+        _ => None,
     }
+}
+
+/// Uma chave de geometria resolvida camada a camada.
+///
+/// É a regra do motor, lida no `get_key_or_arr` do b12387 vendorizado
+/// (`llama-model-loader.cpp:463-501`): um número só vale para todas as camadas,
+/// e um array tem de trazer exatamente uma entrada por camada — comprimento que
+/// não bate é recusa do arquivo, não aproximação. Os GGUFs de 2026 usam a
+/// segunda forma: `gemma4.attention.head_count_kv` são 48 inteiros, 8 nas
+/// camadas de janela deslizante e 1 nas de atenção cheia. `None` é a chave
+/// ausente, que cada chamada trata do jeito que o motor trata.
+fn escalares_por_camada(
+    metadata: &HashMap<String, gguf_file::Value>,
+    chave: &str,
+    camadas: usize,
+) -> Result<Option<Vec<u64>>> {
+    let Some(valor) = metadata.get(chave) else {
+        return Ok(None);
+    };
+    match valor {
+        gguf_file::Value::Array(itens) => {
+            if itens.len() != camadas {
+                return Err(anyhow::anyhow!(tr(
+                    "erros.alojamentoArray",
+                    &[
+                        ("chave", chave),
+                        ("esperado", &camadas.to_string()),
+                        ("recebido", &itens.len().to_string())
+                    ]
+                )));
+            }
+            let lidas: Result<Vec<u64>> = itens
+                .iter()
+                .map(|item| {
+                    contagem(item).ok_or_else(|| {
+                        anyhow::anyhow!(tr("erros.metadadoAusente", &[("chave", chave)]))
+                    })
+                })
+                .collect();
+            Ok(Some(lidas?))
+        }
+        outra => Ok(contagem(outra).map(|v| vec![v; camadas])),
+    }
+}
+
+/// Uma chave de geometria escrita como número só. Um array aqui é a ausência: o
+/// motor também ignora array nessas chaves, porque as lê com `get_key`, e a
+/// dimensão de cabeça do Gemma 4 é a única forma que ele aceita escrita em
+/// escalar (`llama-model.cpp:1621-1648`).
+fn escalar(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Option<u64> {
+    match metadata.get(chave) {
+        Some(valor) if !matches!(valor, gguf_file::Value::Array(_)) => contagem(valor),
+        _ => None,
+    }
+}
+
+/// Quais camadas atendem à janela deslizante declarada no arquivo.
+///
+/// O Gemma 4 escreve um array — `get_arr` copia as entradas e deixa o resto como
+/// estava, e o resto estava zerado, ou seja: atenção cheia
+/// (`llama-model-loader.cpp:365-405`). Sem array, o motor aceita um número, que
+/// é o período do padrão: com `dense_first = false`, é deslizante toda camada
+/// com `il % n < n - 1`, e `n = 0` torna todas deslizantes
+/// (`llama-hparams.cpp:8-18`). Sem nenhuma das duas chaves, nada é deslizante.
+fn padrao_deslizante(
+    metadata: &HashMap<String, gguf_file::Value>,
+    chave: &str,
+    camadas: usize,
+) -> Vec<bool> {
+    if let Some(gguf_file::Value::Array(itens)) = metadata.get(chave) {
+        let mut marcas = vec![false; camadas];
+        for (indice, item) in itens.iter().take(camadas).enumerate() {
+            marcas[indice] = contagem(item).unwrap_or(0) != 0;
+        }
+        return marcas;
+    }
+    match escalar(metadata, chave) {
+        Some(0) => vec![true; camadas],
+        Some(periodo) if periodo > 1 => (0..camadas)
+            .map(|il| (il as u64) % periodo < periodo - 1)
+            .collect(),
+        Some(_) => vec![false; camadas],
+        None => vec![false; camadas],
+    }
+}
+
+/// O que uma camada aloja de cache de atenção, dito pelo cabeçalho dela.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CamadaKv {
+    /// Cabeças de KV da camada. É por elas, e não pelas cabeças de consulta,
+    /// que o cache é dimensionado: é o ganho do GQA.
+    cabecas: u64,
+    /// Elementos por célula, de K e de V. Uma camada de janela deslizante os lê
+    /// de `key_length_swa`/`value_length_swa`, e no Gemma 4 são 256 contra os
+    /// 512 das camadas de atenção cheia.
+    k: u64,
+    v: u64,
+    /// `false` é a camada que não aloja nada: ela lê o cache de outra, que é o
+    /// que `attention.shared_kv_layers` declara para as últimas N camadas
+    /// (`src/models/gemma4.cpp:11-18` do b12387).
+    propria: bool,
+}
+
+/// A geometria de cache de um cabeçalho, camada a camada.
+///
+/// As chaves são as mesmas que o motor lê, com os mesmos padrões quando faltam:
+/// sem `attention.head_count_kv`, as cabeças de KV são as de consulta
+/// (`llama-model.cpp:1573-1576`); sem `attention.key_length`, a dimensão de
+/// cabeça é `embedding_length / head_count`.
+pub(crate) fn camadas_de_cache(
+    metadata: &HashMap<String, gguf_file::Value>,
+    prefixo: &str,
+    camadas: usize,
+) -> Result<Vec<CamadaKv>> {
+    let chave = |s: &str| format!("{prefixo}{s}");
+    let cabecas = escalares_por_camada(metadata, &chave("attention.head_count"), camadas)?.ok_or_else(
+        || anyhow::anyhow!(tr("erros.metadadoAusente", &[("chave", &chave("attention.head_count"))])),
+    )?;
+    let cabecas_kv =
+        escalares_por_camada(metadata, &chave("attention.head_count_kv"), camadas)?
+            .unwrap_or_else(|| cabecas.clone());
+    let comprimento = numero(metadata, &chave("embedding_length"))?;
+    // `n_embd / n_head`, e `n_head` é a cabeça da primeira camada (`hparams.n_head()`
+    // chama `n_head(0)`): por isso o teto é um número só, não um por camada.
+    let primeira = *cabecas.first().unwrap_or(&0);
+    let padrao = if primeira > 0 {
+        comprimento.checked_div(primeira).unwrap_or(0)
+    } else {
+        0
+    };
+    let k_cheia = escalar(metadata, &chave("attention.key_length")).unwrap_or(padrao);
+    let v_cheia = escalar(metadata, &chave("attention.value_length")).unwrap_or(padrao);
+    let k_deslizante = escalar(metadata, &chave("attention.key_length_swa")).unwrap_or(k_cheia);
+    let v_deslizante = escalar(metadata, &chave("attention.value_length_swa")).unwrap_or(v_cheia);
+    let deslizante = padrao_deslizante(metadata, &chave("attention.sliding_window_pattern"), camadas);
+    // As últimas `shared_kv_layers` camadas não abrem cache próprio.
+    let compartilhadas = escalar(metadata, &chave("attention.shared_kv_layers")).unwrap_or(0) as usize;
+    let primeira_de_saida = camadas.saturating_sub(compartilhadas);
+    Ok((0..camadas)
+        .map(|indice| CamadaKv {
+            cabecas: cabecas_kv[indice],
+            k: if deslizante[indice] { k_deslizante } else { k_cheia },
+            v: if deslizante[indice] { v_deslizante } else { v_cheia },
+            propria: indice < primeira_de_saida,
+        })
+        .collect())
+}
+
+/// O custo de KV por token: a soma do que cada camada aloja, vezes os 2 bytes do
+/// f16 com que a biblioteca escreve K e V por padrão (`type_k`/`type_v` em
+/// `llama_context_default_params`, `llama-context.cpp:4415`).
+///
+/// As células entram aqui como uma contagem por token porque o aplicativo deixa
+/// `swa_full` no padrão da biblioteca — `true` — e com ele uma camada de janela
+/// deslizante reserva a janela inteira, como a de atenção cheia. É este o número
+/// que a tela mostra e o veredito obedece; mudar aquele padrão é o que faria a
+/// janela deslizante custar menos, e isso é uma decisão de produto, não de conta.
+///
+/// Cada produto é `checked`: um cabeçalho fabricado que embrulhasse viraria um
+/// KV barato de mentira, e a placa juraria caber o modelo inteiro.
+fn taxa_kv(camadas: &[CamadaKv]) -> Result<u64> {
+    const BYTES_POR_ELEMENTO: u64 = 2;
+    let mut total = 0u64;
+    for camada in camadas.iter().filter(|c| c.propria) {
+        let elementos = camada
+            .k
+            .checked_add(camada.v)
+            .and_then(|dupla| dupla.checked_mul(camada.cabecas))
+            .and_then(|por_celula| por_celula.checked_mul(BYTES_POR_ELEMENTO))
+            .ok_or_else(|| anyhow::anyhow!(tr("erros.alojamentoEstouro", &[])))?;
+        total = checked_or_estouro(total.checked_add(elementos))?;
+    }
+    Ok(total)
+}
+
+fn checked_or_estouro(valor: Option<u64>) -> Result<u64> {
+    valor.ok_or_else(|| anyhow::anyhow!(tr("erros.alojamentoEstouro", &[])))
+}
+
+/// Quantas células a biblioteca reserva para uma janela pedida: ela arredonda o
+/// `n_ctx` para cima, em múltiplos de 256, antes de dimensionar o cache
+/// (`llama-context.cpp:409-415` do b12387). Toda janela que a escala de geração
+/// oferece já é múltipla, então o número só muda para quem pede uma janela
+/// torta — e aí o que se prevê é o que se aloja, não o que se pediu.
+pub fn celulas_da_janela(janela: usize) -> usize {
+    if janela == 0 {
+        return 0;
+    }
+    janela.div_ceil(256) * 256
 }
 
 fn texto(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> String {
@@ -233,16 +446,6 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
     if camadas == 0 {
         bail!(tr("erros.alojamentoSemCamadas", &[]));
     }
-    let cabecas = numero(md, &chave("attention.head_count"))? as u64;
-    let cabecas_kv = numero(md, &chave("attention.head_count_kv"))?;
-    let comprimento = numero(md, &chave("embedding_length"))?;
-    // A dimensão da cabeça vem escrita quando o autor do arquivo a escreveu
-    // (`attention.key_length`, que é como o llama.cpp grava a que não é
-    // comprimento/cabeças); sem ela, a divisão é a própria definição.
-    let dimensao = numero(md, &chave("attention.key_length"))
-        .ok()
-        .filter(|v| *v > 0)
-        .unwrap_or_else(|| comprimento.checked_div(cabecas).unwrap_or(comprimento));
     let (camada, fixo) = por_camada(&cabecalho.tensor_infos, camadas);
     // Somar com `sum` embrulharia num arquivo fabricado; o teto em `u64::MAX` é
     // o valor honesto para "estes bytes não cabem em lugar nenhum".
@@ -251,22 +454,15 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         .fold(0u64, |acum, bytes| acum.saturating_add(*bytes))
         .saturating_add(fixo);
     let (template, eos, paradas) = vocabulario(md);
-    // 2 = K e V; 2 bytes = o f16 do flash attention. Numa arquitetura híbrida
-    // (parte das camadas com estado de espaço de estados em vez de atenção, como
-    // `qwen35` declara com `full_attention_interval`), isto é teto, não conta
-    // exata: as camadas lineares também ocupam cache, só que com outra forma. O
-    // que confere o número é o delta real de VRAM que a carga produz —
-    // `engine-probe alojar:` — e não esta fórmula.
-    //
-    // Os fatores vêm do cabeçalho, então a conta é feita com `checked_mul` e o
-    // arquivo é recusado no estouro: um `kv_por_token` que embrulha viraria um
-    // KV barato de mentira e a placa juraria caber o modelo inteiro.
-    let kv_por_token = 2u64
-        .checked_mul(camadas as u64)
-        .and_then(|n| n.checked_mul(cabecas_kv))
-        .and_then(|n| n.checked_mul(dimensao))
-        .and_then(|n| n.checked_mul(2))
-        .ok_or_else(|| anyhow::anyhow!(tr("erros.alojamentoEstouro", &[])))?;
+    // O KV por token é a soma do que cada camada aloja, camada a camada, com as
+    // chaves e os padrões do motor — `camadas_de_cache` acima. Numa arquitetura
+    // híbrida (parte das camadas com estado recorrente em vez de atenção, como
+    // `qwen35` declara com `full_attention_interval`) o número continua teto, não
+    // conta exata: o estado recorrente dessas camadas existe, é constante por
+    // sequência, e não está aqui; no lugar dele entra o que a camada pagaria se
+    // fosse de atenção. Fica conservador por construção, e o que confere o número
+    // é o delta real de VRAM que a carga produz — `engine-probe alojar:`.
+    let kv_por_token = taxa_kv(&camadas_de_cache(md, &prefixo, camadas)?)?;
     Ok(Ficha {
         arquivo: caminho.display().to_string(),
         arquitetura,
@@ -322,10 +518,10 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
     let Some(cap) = capacidade else {
         return Alojamento::SoSistema {
             pesos: ficha.pesos_total,
-            kv: ficha.kv_por_token.saturating_mul(janela as u64),
+            kv: ficha.kv_por_token.saturating_mul(celulas_da_janela(janela) as u64),
         };
     };
-    let kv = ficha.kv_por_token.saturating_mul(janela as u64);
+    let kv = ficha.kv_por_token.saturating_mul(celulas_da_janela(janela) as u64);
     if ficha.pesos_total.saturating_add(kv).saturating_add(FOLGA_DE_COMPUTACAO) <= cap.livre {
         return Alojamento::Inteira { pesos: ficha.pesos_total, kv, livre: cap.livre };
     }
@@ -848,5 +1044,272 @@ mod testes {
             "a recusa deve nomear o estouro, veio: {erro}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // A geometria de cache camada a camada — o que os arquivos de 2026 escrevem
+    // ---------------------------------------------------------------------
+
+    /// Os tipos que a geometria de um GGUF usa: um número, um texto e o array
+    /// — de inteiros (`head_count_kv`) ou de bools (`sliding_window_pattern`),
+    /// que é como o gemma-4-12b-it escreve as 48 entradas de cada um deles.
+    enum Geometria {
+        Numero(u32),
+        Texto(&'static str),
+        Inteiros(Vec<i32>),
+        Bools(Vec<bool>),
+    }
+
+    fn valor_de(geometria: &Geometria) -> gguf_file::Value {
+        match geometria {
+            Geometria::Numero(v) => gguf_file::Value::U32(*v),
+            Geometria::Texto(s) => gguf_file::Value::String((*s).to_string()),
+            Geometria::Inteiros(itens) => gguf_file::Value::Array(
+                itens.iter().map(|v| gguf_file::Value::I32(*v)).collect(),
+            ),
+            Geometria::Bools(itens) => gguf_file::Value::Array(
+                itens.iter().map(|v| gguf_file::Value::Bool(*v)).collect(),
+            ),
+        }
+    }
+
+    fn mapa_de(pares: &[(&'static str, Geometria)]) -> HashMap<String, gguf_file::Value> {
+        pares
+            .iter()
+            .map(|(chave, valor)| (chave.to_string(), valor_de(valor)))
+            .collect()
+    }
+
+    /// O mesmo cabeçalho escrito como bytes de GGUF v3. Vale o caminho inteiro:
+    /// o parser é o do candle, que é o da carga, então um array que só existisse
+    /// na nossa conta não passaria daqui.
+    fn escreve_gguf(caminho: &Path, pares: &[(&'static str, Geometria)]) {
+        const U32: u32 = 4;
+        const I32: u32 = 5;
+        const BOOL: u32 = 7;
+        const STR: u32 = 8;
+        const ARR: u32 = 9;
+
+        fn texto(s: &str) -> Vec<u8> {
+            let mut v = (s.len() as u64).to_le_bytes().to_vec();
+            v.extend_from_slice(s.as_bytes());
+            v
+        }
+
+        let mut arquivo: Vec<u8> = b"GGUF".to_vec();
+        arquivo.extend_from_slice(&3u32.to_le_bytes());
+        arquivo.extend_from_slice(&0u64.to_le_bytes());
+        arquivo.extend_from_slice(&(pares.len() as u64).to_le_bytes());
+        for (chave, geometria) in pares {
+            arquivo.extend_from_slice(&texto(chave));
+            let (tipo, corpo): (u32, Vec<u8>) = match geometria {
+                Geometria::Numero(v) => (U32, v.to_le_bytes().to_vec()),
+                Geometria::Texto(s) => (STR, texto(s)),
+                Geometria::Inteiros(itens) => {
+                    let mut corpo = I32.to_le_bytes().to_vec();
+                    corpo.extend_from_slice(&(itens.len() as u64).to_le_bytes());
+                    for item in itens {
+                        corpo.extend_from_slice(&item.to_le_bytes());
+                    }
+                    (ARR, corpo)
+                }
+                Geometria::Bools(itens) => {
+                    let mut corpo = BOOL.to_le_bytes().to_vec();
+                    corpo.extend_from_slice(&(itens.len() as u64).to_le_bytes());
+                    for item in itens {
+                        corpo.push(u8::from(*item));
+                    }
+                    (ARR, corpo)
+                }
+            };
+            arquivo.extend_from_slice(&tipo.to_le_bytes());
+            arquivo.extend_from_slice(&corpo);
+        }
+        std::fs::write(caminho, arquivo).unwrap();
+    }
+
+    /// `gemma-4-12b-it-Q4_K_M.gguf` chave por chave, como ele está em disco. As
+    /// duas listas de 48 entradas são a forma que o arquivo usa: `head_count_kv`
+    /// é 8 nas camadas de janela deslizante e 1 nas de atenção cheia, e o padrão
+    /// escreve `1` naquelas e `0` nestas — uma camada cheia a cada seis, ou
+    /// 40 deslizantes e 8 cheias.
+    fn gemma4() -> Vec<(&'static str, Geometria)> {
+        let cabecas_kv = (0..48).map(|il| if il % 6 == 5 { 1 } else { 8 }).collect();
+        let padrao = (0..48).map(|il| il % 6 != 5).collect();
+        vec![
+            ("general.architecture", Geometria::Texto("gemma4")),
+            ("gemma4.block_count", Geometria::Numero(48)),
+            ("gemma4.embedding_length", Geometria::Numero(3840)),
+            ("gemma4.context_length", Geometria::Numero(262_144)),
+            ("gemma4.attention.head_count", Geometria::Numero(16)),
+            ("gemma4.attention.head_count_kv", Geometria::Inteiros(cabecas_kv)),
+            ("gemma4.attention.key_length", Geometria::Numero(512)),
+            ("gemma4.attention.value_length", Geometria::Numero(512)),
+            ("gemma4.attention.key_length_swa", Geometria::Numero(256)),
+            ("gemma4.attention.value_length_swa", Geometria::Numero(256)),
+            ("gemma4.attention.sliding_window", Geometria::Numero(1024)),
+            ("gemma4.attention.sliding_window_pattern", Geometria::Bools(padrao)),
+            ("gemma4.attention.shared_kv_layers", Geometria::Numero(0)),
+        ]
+    }
+
+    /// `granite-4.2-3b-Q4_K_M.gguf`, o caso uniforme: um número por chave, e as
+    /// dimensões de cabeça vindas do padrão `embedding_length / head_count`.
+    fn granite() -> Vec<(&'static str, Geometria)> {
+        vec![
+            ("general.architecture", Geometria::Texto("granite")),
+            ("granite.block_count", Geometria::Numero(40)),
+            ("granite.embedding_length", Geometria::Numero(2560)),
+            ("granite.context_length", Geometria::Numero(131_072)),
+            ("granite.attention.head_count", Geometria::Numero(40)),
+            ("granite.attention.head_count_kv", Geometria::Numero(8)),
+        ]
+    }
+
+    #[test]
+    fn o_gemma4_paga_cada_camada_pelo_que_a_camada_aloja() {
+        let camadas = camadas_de_cache(&mapa_de(&gemma4()), "gemma4.", 48).unwrap();
+        assert_eq!(camadas.len(), 48);
+        // As 40 de janela deslizante com 8 cabeças de 256; as 8 cheias com uma
+        // cabeça de 512. A conta antiga tratava o primeiro número do array como
+        // se valesse para todas as camadas e chegava em 786.432 — 2,28× sobre o
+        // valor real, o bastante para mandar para a RAM camadas que a placa segura.
+        assert_eq!(camadas.iter().filter(|c| c.k == 256).count(), 40);
+        assert_eq!(camadas.iter().filter(|c| c.cabecas == 1).count(), 8);
+        assert_eq!(taxa_kv(&camadas).unwrap(), 344_064);
+        // Com a janela de 4096 que a escala oferece, o teto fechado em MiB é a
+        // prova de que o número é uma conta e não um chute: 344.064 / 256 = 1344.
+        assert_eq!(
+            taxa_kv(&camadas).unwrap() * celulas_da_janela(4096) as u64 / 1048576,
+            1344
+        );
+    }
+
+    #[test]
+    fn o_granite_de_camadas_iguais_chega_nos_mesmos_320_mib_da_biblioteca() {
+        // A outra metade da prova: quando todas as camadas são iguais, a soma
+        // camada a camada tem de dar exatamente o que a biblioteca imprimiu na
+        // carga — `llama_kv_cache: size = 320.00 MiB (4096 cells, 40 layers)`.
+        let camadas = camadas_de_cache(&mapa_de(&granite()), "granite.", 40).unwrap();
+        // Sem `key_length` no arquivo, a dimensão é o padrão do motor:
+        // 2560 / 40 = 64 por cabeça, em K e V.
+        assert!(camadas.iter().all(|c| c.k == 64 && c.v == 64 && c.cabecas == 8));
+        let taxa = taxa_kv(&camadas).unwrap();
+        assert_eq!(taxa, 81_920);
+        assert_eq!(taxa * celulas_da_janela(4096) as u64, 335_544_320);
+        assert_eq!(taxa * 4096 / 1048576, 320);
+    }
+
+    #[test]
+    fn a_ficha_le_os_array_do_gemma4_sem_recusar_o_arquivo() {
+        // O defeito que este teste fecha: `head_count_kv` escrito como array de
+        // 48 era lido como metadado ausente, a ficha falhava, e o veredito de
+        // alojamento caía em "não medido" — o Gemma 4 do catálogo nunca teve
+        // número de placa. Agora o array é a fonte da geometria.
+        let dir = std::env::temp_dir().join(format!("aether-aloj-gemma4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caminho = dir.join("gemma4.gguf");
+        escreve_gguf(&caminho, &gemma4());
+        let ficha = fichar(&caminho)
+            .expect("um GGUF com head_count_kv e sliding_window_pattern em array deve ser medido");
+        assert_eq!(ficha.camadas, 48);
+        assert_eq!(ficha.janela_maxima, 262_144);
+        assert_eq!(ficha.kv_por_token, 344_064);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn um_array_que_nao_bate_com_as_camadas_e_recusado_pelo_nome() {
+        // A mesma regra do `get_key_or_arr` do motor: um array de geometria tem
+        // de trazer uma entrada por camada. Aproximar (usar os primeiros, ou o
+        // primeiro) produziria um KV de mentira com a cara de medido, então o
+        // motivo cita a chave e os dois comprimentos.
+        let mut md = mapa_de(&gemma4());
+        md.insert(
+            "gemma4.attention.head_count_kv".to_string(),
+            gguf_file::Value::Array((0..47).map(|_| gguf_file::Value::I32(8)).collect()),
+        );
+        let erro = camadas_de_cache(&md, "gemma4.", 48)
+            .expect_err("47 entradas para 48 camadas não é uma geometria lida");
+        // Os dois comprimentos estão na mensagem em qualquer idioma, e são eles
+        // que separam esta recusa de um simples "metadado ausente".
+        let motivo = erro.to_string();
+        assert!(
+            motivo.contains("gemma4.attention.head_count_kv")
+                && motivo.contains("47")
+                && motivo.contains("48"),
+            "a recusa deve nomear a chave e os dois comprimentos, veio: {motivo}"
+        );
+    }
+
+    #[test]
+    fn quem_le_o_cache_de_outra_camada_nao_paga_cache() {
+        // `attention.shared_kv_layers` são as últimas N camadas que abrem mão de
+        // cache próprio (`gemma4.cpp:11-18`): a biblioteca não aloca nada para
+        // elas, e cobra-lhes os bytes seria dizer que o modelo precisa de mais
+        // placa do que ele precisa.
+        let mut pares = gemma4();
+        pares[12] = ("gemma4.attention.shared_kv_layers", Geometria::Numero(8));
+        let camadas = camadas_de_cache(&mapa_de(&pares), "gemma4.", 48).unwrap();
+        assert_eq!(camadas.iter().filter(|c| !c.propria).count(), 8);
+        assert!(camadas[..40].iter().all(|c| c.propria));
+        // As oito descartadas são as camadas 40..47: seis deslizantes de 8.192
+        // bytes por token e duas cheias de 2.048, ou 53.248 a menos que o teto
+        // sem compartilhamento — o que a placa deixa de reservar.
+        assert_eq!(taxa_kv(&camadas).unwrap(), 344_064 - 53_248);
+    }
+
+    #[test]
+    fn a_janela_deslizante_lida_do_periodo_quando_o_arquivo_nao_escreve_array() {
+        // A outra forma que o motor aceita: um número, que é o período do padrão.
+        // Com `n = 4` e oito camadas, o que não é o último do grupo é deslizante
+        // (`il % n < n - 1`), então 6 deslizantes e 2 cheias.
+        let pares = [
+            ("x.block_count", Geometria::Numero(8)),
+            ("x.embedding_length", Geometria::Numero(2048)),
+            ("x.attention.head_count", Geometria::Numero(8)),
+            ("x.attention.head_count_kv", Geometria::Numero(4)),
+            ("x.attention.key_length", Geometria::Numero(256)),
+            ("x.attention.value_length", Geometria::Numero(256)),
+            ("x.attention.key_length_swa", Geometria::Numero(128)),
+            ("x.attention.value_length_swa", Geometria::Numero(128)),
+            ("x.attention.sliding_window_pattern", Geometria::Numero(4)),
+        ];
+        let camadas = camadas_de_cache(&mapa_de(&pares), "x.", 8).unwrap();
+        assert_eq!(camadas.iter().filter(|c| c.k == 128).count(), 6);
+        assert_eq!(taxa_kv(&camadas).unwrap(), 6 * 2048 + 2 * 4096);
+    }
+
+    #[test]
+    fn sem_chave_de_padrao_nada_e_de_janela_deslizante() {
+        // Ausência é atenção cheia para todas as camadas — o que o arquivo do
+        // granite declara, e o motivo de `sliding_window_pattern` não poder ter
+        // um padrão inventado aqui: inventar mudaria a conta sem mudar o modelo.
+        let camadas = camadas_de_cache(&mapa_de(&granite()), "granite.", 40).unwrap();
+        assert!(camadas.iter().all(|c| c.k == 64 && c.propria));
+        // Sem `key_length_swa`, a dimensão deslizante é a cheia (a ordem do
+        // motor em `llama-model.cpp:1645-1648`), então o padrão de período 0,
+        // que torna todas deslizantes, não muda um byte.
+        let mut md = mapa_de(&granite());
+        md.insert(
+            "granite.attention.sliding_window_pattern".to_string(),
+            gguf_file::Value::U32(0),
+        );
+        assert_eq!(taxa_kv(&camadas_de_cache(&md, "granite.", 40).unwrap()).unwrap(), 81_920);
+    }
+
+    #[test]
+    fn as_celulas_da_janela_seguem_o_arredondamento_da_biblioteca() {
+        // `n_ctx` é arredondado para cima em múltiplos de 256 antes de o cache
+        // ser dimensionado (`llama-context.cpp:409-415`). Toda janela da escala
+        // já é múltipla; quem pede torta recebe o que seria alojado, não o que
+        // pediu escrito como se fosse medida.
+        assert_eq!(celulas_da_janela(0), 0);
+        assert_eq!(celulas_da_janela(1), 256);
+        assert_eq!(celulas_da_janela(256), 256);
+        assert_eq!(celulas_da_janela(4000), 4096);
+        assert_eq!(celulas_da_janela(4096), 4096);
+        assert_eq!(celulas_da_janela(65_536), 65_536);
     }
 }

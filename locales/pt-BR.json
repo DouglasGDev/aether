@@ -926,6 +926,7 @@
     "alojamentoSemArquitetura": "o arquivo não declara general.architecture; não dá para medir onde ele caberia",
     "alojamentoSemCamadas": "o arquivo não declara block_count; não dá para contar as camadas",
     "alojamentoEstouro": "a geometria declarada no arquivo estoura a conta de bytes do KV; este GGUF não pode ser medido com segurança",
+    "alojamentoArray": "o array GGUF {chave} tem {recebido} entradas e o arquivo declara {esperado} camadas; não dá para medir o cache camada a camada",
     "arquiteturaNaoGranite": "a arquitetura GGUF \"{arquitetura}\" não é granite; este motor não a executa",
     "falhaCarregarTensores": "falha ao carregar os tensores do modelo",
     "falhaAbrirTokenizador": "não abri o tokenizador {caminho}: {detalhe}",

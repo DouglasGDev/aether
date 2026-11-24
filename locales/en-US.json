@@ -926,6 +926,7 @@
     "alojamentoSemArquitetura": "the file doesn't declare general.architecture; there's nothing to measure against",
     "alojamentoSemCamadas": "the file doesn't declare block_count; the layers can't be counted",
     "alojamentoEstouro": "the geometry declared in the file overflows the KV byte count; this GGUF can't be measured safely",
+    "alojamentoArray": "the GGUF array {chave} has {recebido} entries but the file declares {esperado} layers; the cache can't be measured layer by layer",
     "arquiteturaNaoGranite": "the GGUF architecture \"{arquitetura}\" is not granite; this engine cannot run it",
     "falhaCarregarTensores": "failed to load the model tensors",
     "falhaAbrirTokenizador": "could not open the tokenizer {caminho}: {detalhe}",

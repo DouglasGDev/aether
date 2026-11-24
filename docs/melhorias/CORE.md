@@ -62,23 +62,24 @@ somava `pesos + kv + FOLGA` do mesmo jeito. Num build de release o produto
 embrulha em u64, o KV parece pequeno e a placa jura `Inteira` para um modelo que
 nunca caberia — o OOM vem depois, na carga real. Em debug o mesmo caminho panic.
 
-- alojamento.rs:166 `bytes_do_tensor` agora acumula a forma e o tamanho com
+- alojamento.rs:379 `bytes_do_tensor` agora acumula a forma e o tamanho com
   `saturating_mul`/`saturating_div_ceil`: um tensor fabricado satura em vez de
   embrulhar para um número pequeno.
-- alojamento.rs:179 `por_camada` soma cada tensor com `saturating_add`; a
-  `pesos_total` de `fichar` (:238) é um `fold` saturante — o teto honesto para
+- alojamento.rs:400 `por_camada` soma cada tensor com `saturating_add`; a
+  `pesos_total` de `fichar` (:452) é um `fold` saturante — o teto honesto para
   "estes bytes não cabem em lugar nenhum".
-- alojamento.rs:254 `kv_por_token` é uma cadeia `checked_mul` que recusa o
-  arquivo no estouro com `erros.alojamentoEstouro` (motivo real, não zero).
-- alojamento.rs:317 `alojar` é todo saturante (`saturating_mul`/`_add`/`_sub`):
+- alojamento.rs:338 `taxa_kv` é a cadeia `checked_mul` que recusa o arquivo no
+  estouro com `erros.alojamentoEstouro` (motivo real, não zero); `fichar` a chama
+  em :465, depois que a conta passou a ser soma camada a camada.
+- alojamento.rs:513 `alojar` é todo saturante (`saturating_mul`/`_add`/`_sub`):
   mesmo uma `Ficha` armada à mão não arranca um `Inteira` falso.
 
 Vermelho-primeiro (testes em alojamento.rs):
-- um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira (sintoma, linha 323):
+- um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira (sintoma, linha 967):
   ficha com `kv_por_token = 1<<63` e janela 2 → veredito nunca `Inteira`. Com a
   conta original embrulhada, `cargo test` panica em `attempt to multiply with
   overflow` nessa linha (medido).
-- a_ficha_recusa_geometria_que_estoura_a_conta (fronteira, linha 264): um GGUF
+- a_ficha_recusa_geometria_que_estoura_a_conta (fronteira, linha 1032): um GGUF
   mínimo com `attention.head_count_kv = u32::MAX` é recusado por estouro. Com a
   cadeia `kv_por_token` original, o mesmo panic aparece dentro de `fichar`.
 

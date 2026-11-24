@@ -229,7 +229,7 @@ fn mib(bytes: u64) -> String {
 /// bonita; é a comparação que diz se o módulo mede o que a biblioteca faz.
 fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result<()> {
     use aether_lib::ai::alojamento::{
-        Alojamento, alojar, capacidade, despacho, fichar, media_da_camada,
+        Alojamento, alojar, capacidade, celulas_da_janela, despacho, fichar, media_da_camada,
     };
     use aether_lib::ai::ggml;
 
@@ -296,7 +296,7 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
     };
     let veredito = alojar(&ficha, cap.as_ref(), context);
     let camadas = despacho(&veredito);
-    let kv = ficha.kv_por_token * context as u64;
+    let kv = ficha.kv_por_token * celulas_da_janela(context) as u64;
     let na_placa = match veredito {
         Alojamento::Inteira { pesos, .. } => pesos + kv,
         Alojamento::Dividida { na_placa, .. } => na_placa + kv,
