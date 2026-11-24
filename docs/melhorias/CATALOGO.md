@@ -190,15 +190,15 @@ A regra, lida do b12387 antes de virar conta:
 
 O que mudou em código:
 
-- `CamadaKv` ganhou `recorrente` (`alojamento.rs:289`) e `taxa_kv` (`:445`) soma
+- `CamadaKv` ganhou `recorrente` (`alojamento.rs:291`) e `taxa_kv` (`:447`) soma
   só quem é `propria && !recorrente` — as 30 lineares saem do número por token.
-- `memoria_recorrente` (`:325`) lê as chaves `ssm.*` e o padrão das camadas, com
-  cada produto `checked`; `estado_recorrente` (`:370`) multiplica pelo número de
+- `memoria_recorrente` (`:327`) lê as chaves `ssm.*` e o padrão das camadas, com
+  cada produto `checked`; `estado_recorrente` (`:372`) multiplica pelo número de
   camadas recorrentes. Um cabeçalho sem as quatro chaves do gated delta net não
   é híbrido e continua cobrando cache de tudo — a regra vem do arquivo, não de
   uma lista de arquiteturas.
-- `Ficha.estado_recorrente` (`:93`) é preenchido por `fichar` e entra no veredito:
-  `Alojamento` leva `estado` nos três casos (`:598-620`), `alojar` (`:626`)
+- `Ficha.estado_recorrente` (`:95`) é preenchido por `fichar` e entra no veredito:
+  `Alojamento` leva `estado` nos três casos (`:569-592`), `alojar` (`:597`)
   desconta o estado do orçamento da placa antes de empilhar camadas, e o roteador
   soma o estado na conta de RAM do caso sem placa (`router.rs:209`).
 - O fio ganhou `estado` nas três formas, pinado byte a byte em
@@ -213,7 +213,7 @@ O que mudou em código:
   agora diz os dois números, a mesma conta que `roteador.noSistema` sempre escreveu.
 - `engine_probe alojar:` passou a imprimir os dois juntos
   (`bin/engine_probe.rs:249-253`) e a contar o estado no esperado do delta de
-  VRAM (`:309-313`), que é a metade que só a placa fecha.
+  VRAM (`:309-314`), que é a metade que só a placa fecha.
 
 Os números que a conta agora devolve, cada um conferido em teste:
 
@@ -386,29 +386,39 @@ nenhum desses casos; o censo distingue.
 
 ### O portão, agora lido do conteúdo
 
-O leitor de cabeçalho do aplicativo é o do candle, e ele aceita exatamente
+> **Lido em 2026-11-24 e já trocado uma passagem depois.** Esta seção é a da
+> #109, e o portão que ela escreveu mudou de natureza na #111: a lista de 15
+> tipos copiada do candle saiu, o leitor passou a ser do aplicativo, e os onze
+> arquivos que ela deixava de fora entraram. Veja
+> `## FEITO — #110 e #111`. As linhas abaixo ficaram como foram medidos, com os
+> apontadores re-derivados para a árvore de hoje.
+
+O leitor de cabeçalho do aplicativo era o do candle, e ele aceitava exatamente
 `f32, f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, q8_1, q2_k, q3_k, q4_k, q5_k,
 q6_k, q8_k` (`GgmlDType::from_u32`, candle-core 0.11.1): os IQ e o MXFP4 caem no
 ramo `_ => bail!("unknown dtype for tensor {u}")`, `Content::read` devolve erro,
 `fichar` devolve erro e **não há veredito de alojamento**. Como o Aether não roda
 o que não mediu antes (#36), a regra passou a ser o portão:
 
-- `CENSO` (`catalog.rs:422`) — 49 linhas, uma por arquivo oferecido, com os tipos
-  lidos do cabeçalho dele;
-- `censo_do_arquivo` (`catalog.rs:476`) — a leitura, `None` para o arquivo que
+- `CENSO` (`catalog.rs:434`) — 49 linhas então, **60 hoje**, uma por arquivo
+  oferecido, com os tipos lidos do cabeçalho dele;
+- `censo_do_arquivo` (`catalog.rs:499`) — a leitura, `None` para o arquivo que
   ninguém abriu;
 - `censo_medido_de_todo_arquivo_oferecido_e_aberto_pelo_leitor`
-  (`catalog.rs:779`) — cada arquivo do catálogo e dos codificadores tem de ter
+  (`catalog.rs:814`) — cada arquivo do catálogo e dos codificadores tem de ter
   linha medida, nenhum nome pode se repetir (é a chave), e cada tipo da linha tem
-  de estar na lista acima. Este teste substituiu o de etiquetas;
-- `granites_sao_executaveis_pelo_caminho_de_cpu` (`catalog.rs:811`) — a parte que
+  de ter conta de bloco no leitor. Este teste substituiu o de etiquetas;
+- `granites_sao_executaveis_pelo_caminho_de_cpu` (`catalog.rs:846`) — a parte que
   ainda é sobre o caminho de CPU, que só existe para o granite e escolhe pelo
   nome da quant, preservada;
-- `tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada`
-  (`alojamento.rs:1122`) — o GGUF sintético de um tensor só: com o tipo 8 a ficha
-  sai e conta os 68 bytes reais (`q8_0`, 64 elementos = 2 blocos de 34), com o
-  tipo 16 `fichar` recusa citando `unknown dtype for tensor 16`. É o preço de
-  entrada dos IQ, escrito como teste e não como intenção.
+- `tipo_sem_bloco_medido_nao_vira_ficha_inventada` (`alojamento.rs:1120`) — o
+  GGUF sintético de um tensor só, escrito na #109 como `tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada`
+  e reescrito na #111: com o tipo 8 a ficha sai e conta os 68 bytes reais
+  (`q8_0`, 64 elementos = 2 blocos de 34), com o tipo 16 conta 66 (`iq2_xxs` —
+  antes recusava o arquivo inteiro com `unknown dtype for tensor 16`), e com o
+  tipo 9 recusa nomeando o tensor e o número lido. O preço de entrada continua
+  sendo a recusa com motivo, só que agora ele pega um tipo que nenhum arquivo
+  dos 74 lidos carrega, e não um que dezesseis deles carregam.
 
 Uma frase sobre o `general.file_type`, porque é a primeira coisa que alguém
 olha: ele é um número que o quantizador escreve, **não** a conta de conteúdo, e
@@ -444,7 +454,10 @@ medidos: **11 têm tipo que o portão recusa** (os IQ acima, mais o MXFP4) e 9 s
 lidas mas não escolhíveis — `Q4_K_S` 20.673.845.888, `Q5_K_S` 24.823.544.448,
 `Q8_0` 36.903.139.968, `UD-Q4_K_L` 20.205.632.160, `UD-Q4_K_XL` 22.241.950.336,
 `UD-Q5_K_XL` 26.385.922.688, `UD-Q6_K_S` 28.515.105.440, `UD-Q6_K_XL`
-32.071.842.432, `UD-Q8_K_XL` 48.688.560.768. Dois deles merecem nota: o
+32.071.842.432, `UD-Q8_K_XL` 48.688.560.768. Os onze do primeiro grupo entraram
+na passagem #111, com o portão trocado por uma conta medida arquivo por arquivo;
+o `## FEITO — #110 e #111` abaixo é quem vale para eles hoje. Dois dos nove do
+segundo grupo merecem nota: o
 `UD-Q4_K_XL` tem **o mesmo censo** do `Q4_K_M` e é maior (22.241.950.336 contra
 22.016.023.168) — é o caso em que a etiqueta `XL` não compra tipo nenhum; e o
 BF16 da série não é arquivo único: `BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf`
@@ -452,11 +465,13 @@ BF16 da série não é arquivo único: `BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002
 follow-up 4.
 
 `routable: false` nos três, e a regra passou a estar escrita: `SO_PARA_BAIXAR`
-(`catalog.rs:831`) é a lista de séries sem quant escolhível, cada uma com o
+(`catalog.rs:866`) é a lista de séries sem quant escolhível, cada uma com o
 motivo, e `every_size_has_a_routable_baseline` confere os dois lados — série nova
 sem escolhível precisa entrar lá com o motivo, e uma série listada que passou a
-ter escolhível tem de sair. O motivo do A3B é o número: 22 GB de pesos não cabem
-inteiros numa placa, e o roteador não escolhe sozinho o que só roda dividido.
+ter escolhível tem de sair. O motivo escrito então foi o número: 22 GB de pesos
+não cabem inteiros numa placa. Ele foi trocado na #111, quando a série passou a
+ter catorze arquivos e o mais leve deles (10.656.955.008) cabe — o que falta não
+é mais conta, é corrida, e a frase hoje dita pelo teste está na seção abaixo.
 `support_repo` é o `Qwen/Qwen3.5-35B-A3B` que o próprio cabeçalho declara em
 `general.base_model.0.repo_url`, e o `tokenizer.json` dele tem `lfs.oid`
 `5f9e4d49…` com 12.807.982 bytes — **a mesma soma do Ornith 1.5 9B, do Qwen3.5 4B
@@ -470,6 +485,13 @@ lado no repositório. O Aether não tem caminho de visão, então ele entra como
 modelo de texto — o que é escolha nossa, registrada, não capacidade medida.
 
 ### Vermelho medido por mutação
+
+As mensagens abaixo são as que foram impressas naquela passagem. Três coisas
+mudaram na #111: o texto do gate do item 1 hoje é *"…carrega iq3_s, que não tem
+conta de bloco medida — sem ficha não há veredito a mostrar"*; o comprimento do
+item 3 é `[; 60]`, com o mesmo mecanismo; e a mutação do item 5 deixou de existir
+— o tipo 16 agora pesa, e o fixture correspondente está reescrito no fim da seção
+`## FEITO — #110 e #111`.
 
 Cinco mutações, cada uma revertida, todas com a mensagem certa:
 
@@ -499,28 +521,232 @@ check --all-targets` → **Finished em 3,35 s, zero avisos**; `npm run build` �
 tocado: as três entradas novas chegam à tela pelos dados do catálogo, e a frase
 do veredito dividido já existia.
 
+## FEITO — #110 e #111: a tabela de blocos medida, e o leitor que passou a ser nosso
+
+Duas passagens, um só motivo. O portão da #109 era uma lista de 15 nomes copiada
+do parser do candle, e copiar a lista de outro programa é aceitar o que ele não
+conhece como limite do que o Aether sabe medir: foi isso que deixou **onze**
+arquivos de fora quando o censo deles já estava lido e os blocos já podiam ser
+pesados. #110 mediu os blocos; #111 trocou o leitor e abriu a porta.
+
+### #110 — `cabecalho::BLOCOS`: 23 linhas, cada uma com uma conta de arquivo
+
+A tabela está em `cabecalho.rs:106` — `(número do tipo, Bloco { nome, elementos,
+bytes })` — e é a conta de `ggml`, não a tabela de um doc:
+
+| tipo | nome | elementos × bytes | bits por elemento |
+| --- | --- | --- | --- |
+| 0 | `f32` | 1 × 4 | 32 |
+| 1 | `f16` | 1 × 2 | 16 |
+| 2 | `q4_0` | 32 × 18 | 4,5 |
+| 3 | `q4_1` | 32 × 20 | 5 |
+| 6 | `q5_0` | 32 × 22 | 5,5 |
+| 7 | `q5_1` | 32 × 24 | 6 |
+| 8 | `q8_0` | 32 × 34 | 8,5 |
+| 10 | `q2_k` | 256 × 84 | 2,625 |
+| 11 | `q3_k` | 256 × 110 | 3,4375 |
+| 12 | `q4_k` | 256 × 144 | 4,5 |
+| 13 | `q5_k` | 256 × 176 | 5,5 |
+| 14 | `q6_k` | 256 × **210** | 6,5625 |
+| 16 | `iq2_xxs` | 256 × 66 | 2,0625 |
+| 17 | `iq2_xs` | 256 × 74 | 2,3125 |
+| 18 | `iq3_xxs` | 256 × 98 | 3,0625 |
+| 19 | `iq1_s` | 256 × **50** | 1,5625 |
+| 20 | `iq4_nl` | 32 × 18 | 4,5 |
+| 21 | `iq3_s` | 256 × 110 | 3,4375 |
+| 22 | `iq2_s` | 256 × 82 | 2,5625 |
+| 23 | `iq4_xs` | 256 × 136 | 4,25 |
+| 29 | `iq1_m` | 256 × 56 | 1,75 |
+| 30 | `bf16` | 1 × 2 | 16 |
+| 39 | `mxfp4` | 32 × 17 | 4,25 |
+
+**Como cada linha foi medida.** Com `Range: bytes=…` sobre a URL LFS resolvida, o
+cabeçalho de cada arquivo foi lido sem baixar o arquivo, e sobre as fichas dos
+tensores rodaram três contas juntas: o espaçamento `offset[i+1] − offset[i]`
+fixa os bytes por elemento de um tensor que não é o último do seu bloco de tipo;
+`div_ceil(elementos, bloco) × bytes` somado sobre todos os tensores, mais
+`início_dos_dados` (`info_fim` arredondado para cima no alinhamento declarado),
+tem de devolver o `size` publicado; e cada vizinhança de ficha tem de cair no
+próximo múltiplo do alinhamento. **74 arquivos no cache desta rodada, todos com
+`diff 0` e zero violações de vizinhança**; os onze IQ/MXFP4 foram re-rodados
+nesta passagem, cada um com 733 fichas conferidas tensor a tensor.
+
+O que a conta não observa é a granularidade do bloco: `32 × 17` e `256 × 136`
+dão o mesmo bits por elemento. A coluna `elementos × bytes` é a convenção do
+ggml sobre um bpw medido; o bpw é o que a evidência fixa.
+
+**Duas linhas erradas saíram da primeira tabela, e as duas foram pegas por
+arquivo, não por doc.** `iq1_s` estava em 52 (copiado de tabela alheia) — em
+`Qwen3-30B-A3B-UD-IQ1_S.gguf` nenhum tensor `iq1_s` é o último, então a soma não
+distingue 50 de 52; foram **58 janelas offset-a-offset** que reprovaram a 52 (em
+`blk.0.ffn_gate_exps.weight`, 786.432 blocos ocupam 39.321.600 bytes e a linha
+errada pediria 40.894.464). `q6_k` estava em 208 e com 210 batem os arquivos IBM
+que estavam saindo curtos em 163.840 e 409.600 bytes. As duas correções hoje têm
+tripwire em `a_tabela_de_blocos_e_a_medida_e_nao_uma_lista_de_desejos`
+(`cabecalho.rs:601`), que também confere os bpw dos quatro tipos que o candle
+recusava (`iq2_xxs` 2,0625, `iq3_xxs` 3,0625, `iq4_xs` e `mxfp4` 4,25).
+
+**O que ficou de fora, e por quê.** Um tipo só entra com bloco medido em arquivo
+real. Não entraram: 4, 5, **9 (`q8_1`)**, **15 (`q8_k`)**, 24–28 (`i8`, `i16`,
+`i32`, `i64`, `f64`), 31–38 e 40+. Os dois primeiros nomes são o caso interessante:
+o parser do candle os conhece e calcularia um peso para eles, mas **nenhum dos 74
+arquivos lidos carrega um tensor daqueles** — pesar por tabela emprestada seria
+prometer um número que ninguém mediu. Está escrito em
+`tipo_sem_arquivo_lido_nao_tem_conta` (`cabecalho.rs:621`), que inclui os números
+133, 139, 145 e 154 vistos em sondas de fork: não são do motor que o aplicativo
+carrega.
+
+### #111 — o leitor
+
+`ai/cabecalho.rs` é o leitor: `ler` (`:248`) e `ler_de` (`:269`) percorrem magic
+(ou byte-reversal), versão, contagens, os 13 tipos de valor do GGUF e as fichas
+de tensor; `Tensor::bytes` (`:176`) faz `div_ceil(elementos, bloco) × bytes` com
+produto saturante; `Cabecalho::bytes_por_tensor` (`:221`) recusa o arquivo no
+primeiro tipo sem conta, nomeando o tensor e o número lido — texto em
+`cabecalhoTipoSemConta`, nos dois idiomas — e `pesos` (`:235`) é a dobra dessa
+mesma conta. `ALINHAMENTO_PADRAO` é 32 (`:60`). O arquivo não precisa estar
+inteiro na mão de ninguém: nada aqui lê a região de dados.
+
+O alojamento passou a usar isto: `fichar` (`alojamento.rs:514`) abre o cabeçalho
+por `cabecalho::ler` (`:515`) e `por_camada` (`:490`) recebe o `Cabecalho` do
+leitor. O candle continua no caminho de CPU do granite, que é outra coisa — carregar
+pesos, não medi-los.
+
+**A troca não muda um número de arquivo que já tinha veredito.** O candle não
+expõe `GgmlDType::from_u32` (é `pub(crate)`), mas `block_size()` e `type_size()`
+são `pub`, e a régua chama os dois: `a_conta_nova_bate_com_a_do_parser_antigo`
+(`cabecalho.rs:1129`) percorre as 23 linhas e, para os **13 tipos que os dois
+leitores conhecem**, confere `bloco.elementos == block_size`, `bloco.bytes ==
+type_size` e `Tensor::bytes() ==` a conta antiga, em **9 formas** (1, 31, 32, 33,
+255, 256, 257, 1024 e 4096×4096 — as que não fecham bloco, inclusive). **117
+acordos byte a byte**, e o `assert_eq!(conferidos, 13 × 9)` é o que avisa se um
+dos lados encolheu. Os dez que só este leitor pesa estão fixos no teste como
+`[16, 17, 18, 19, 20, 21, 22, 23, 29, 39]`; os dois que o parser antigo nomeava e
+aqui continuam recusa (9 e 15) estão logo abaixo, com a afirmação de que a conta
+antiga daria um número — e é justamente por isso que não dá para confiar nela.
+
+**A mesma identidade, agora no disco.** `o_peso_lido_no_disco_bate_com_o_tamanho_do_arquivo`
+(`cabecalho.rs:1186`) varre os 60 specs do catálogo, abre o que está em
+`%LOCALAPPDATA%\ai.aether.core\models` **com o tamanho publicado inteiro** (um
+`.part` não fecha por definição, então não entra) e confere
+`inicio_dos_dados + Σ fichas == tamanho do arquivo` e `pesos() == Σ`. Rodado
+nesta máquina: **4 de 60** — `Qwen3-Embedding-0.6B-Q8_0.gguf`,
+`Qwen3-Embedding-0.6B-f16.gguf`, `granite-4.2-3b-Q4_K_M.gguf` e
+`Ornith-1.5-9B-Q4_K_M.gguf`. O teste imprime a contagem em voz alta porque um
+"ok" com zero arquivos na mão não é evidência. Em `cabecalho.rs:939` a mesma
+identidade está fixada para o `UD-IQ2_XXS` (as 733 fichas por tipo, `início`
+10.989.696, soma batendo com 10.656.955.008) e em `cabecalho.rs:990` as 23
+linhas da tabela são lidas pelo parser de verdade, uma ficha por tipo.
+
+### Os onze arquivos que voltaram
+
+Proveniência de cada número: `GET /api/models/unsloth/Qwen3.5-35B-A3B-GGUF/tree/main?blobs=true`
+em 2026-11-24 — o `lfs.oid` é o sha256 de 64 hex do arquivo inteiro (o `oid`
+liso é o sha de 40 hex do blob git e não serve para o catálogo).
+
+| arquivo | bytes publicados | censo | sha256 |
+| --- | --- | --- | --- |
+| `…-MXFP4_MOE.gguf` | 21.587.638.912 | `f32, mxfp4, q5_k, q6_k, q8_0` | `0f135a59…23cd770` |
+| `…-Q3_K_M.gguf` | 16.356.375.168 | `f32, iq3_xxs, iq4_xs, q6_k, q8_0` | `5607c8fc…d5ab1b2d` |
+| `…-Q3_K_S.gguf` | 15.265.856.128 | `f32, iq3_s, iq3_xxs, q6_k, q8_0` | `315cce21…c08e625d` |
+| `…-UD-IQ2_M.gguf` | 11.391.613.568 | `f32, iq2_xxs, iq3_xxs, q4_k, q5_k, q6_k, q8_0` | `187b5bbb…e15ace0e` |
+| `…-UD-IQ2_XXS.gguf` | 10.656.955.008 | `f32, iq2_s, iq2_xxs, q4_k, q5_k, q6_k, q8_0` | `2a809de3…af84718b` |
+| `…-UD-IQ3_S.gguf` | 13.583.383.168 | `f32, iq2_s, iq3_s, q6_k, q8_0` | `ca6e9542…898c061fb6` |
+| `…-UD-IQ3_XXS.gguf` | 13.080.066.688 | `f32, iq2_s, iq3_xxs, q6_k, q8_0` | `9f7f5928…f5dd96cd` |
+| `…-UD-IQ4_NL.gguf` | 17.821.719.168 | `f32, iq3_s, iq4_nl, q6_k, q8_0` | `6aec31ed…50e3e444` |
+| `…-UD-IQ4_XS.gguf` | 17.486.174.848 | `f32, iq3_s, iq4_xs, q6_k, q8_0` | `745def08…bf1be123` |
+| `…-UD-Q2_K_XL.gguf` | 12.156.754.560 | `f32, iq2_xs, iq3_xxs, iq4_xs, q4_k, q5_k, q6_k, q8_0` | `855b8d11…db3e77270` |
+| `…-UD-Q3_K_XL.gguf` | 16.601.176.704 | `f32, iq3_xxs, iq4_xs, q5_k, q6_k, q8_0` | `fef37f41…300fc945` |
+
+Os onze têm 733 fichas, `info_fim` 10.989.695 e alinhamento 32 (região de dados
+começando em 10.989.696), e cada um fecha com `diff 0` — a série completa de 14
+arquivos oferecidos (os três de antes mais estes) vai de 10.656.955.008 a
+28.852.861.568 bytes.
+
+**Os fatos de cabeçalho foram lidos arquivo por arquivo**, com um `Range` de 1 MiB
+e saída antecipada assim que o conjunto que o catálogo usa está completo:
+`GGUF v3`, 733 tensores, 52 pares, 37 pares percorridos, fim do bloco de KV em
+1877, sem corte. Em todos os onze: arquitetura `qwen35moe`, `general.name`
+`Qwen3.5-35B-A3B`, `size_label` `35B-A3B`, licença `apache-2.0`, 40 camadas,
+janela 262.144, `embedding_length` 2048, 256 peritos com 8 usados,
+`full_attention_interval` 4. Não é um transferido para os outros — é a mesma
+leitura feita onze vezes, e ela é o que autoriza as linhas do catálogo.
+
+No código, o que mudou: `SHA256_QWEN35_35B_A3B_GGUF` passou de 3 para **14**
+linhas (`catalog.rs:325`), `CENSO` de 49 para **60** (`:434`), `CATALOG` de 47
+para **58** (`:511`) com os onze `qwen35moe!` (`:193`), e a constante `DA_FICHA`
+— os 15 nomes copiados do candle — **saiu**: o gate (`catalog.rs:834`) agora
+pergunta `cabecalho::numero_do_nome(tipo)`, que é a tabela medida, não a lista de
+outro programa. O motivo de `routable: false` na série também foi reescrito em
+`SO_PARA_BAIXAR` (`catalog.rs:866`): não é mais "22 GB não cabem numa placa",
+porque o `UD-IQ2_XXS` tem 9,93 GiB de pesos — oito dos onze medem menos de 16
+GiB (9,93; 10,61; 11,32; 12,18; 12,65; 14,22; 15,23; 15,46 GiB). É que nenhum
+arquivo da série rodou com a placa medida, e o que falta agora é corrida, não
+conta. Peso de arquivo não é veredito: o alojamento soma o KV da janela pedida e
+a folga da biblioteca por cima, e esse número continua saindo da conta sem
+placa.
+
+### Vermelho medido por mutação (desta passagem)
+
+Quatro mutações, cada uma revertida e conferida no diff:
+
+1. `q6_k` a **209** bytes por bloco (o número que a primeira tabela tinha) → 5
+   vermelhos, e o que importa é o que não é tripwire:
+   `o_peso_lido_no_disco_bate_com_o_tamanho_do_arquivo` cai em `cabecalho.rs:1211`
+   com *"…granite-4.2-3b-Q4_K_M.gguf: as 363 fichas não fecham o tamanho do
+   arquivo"*. A soma de um arquivo real no disco reprova a linha errada sem
+   ninguém ter de saber que ela estava errada. Caem junto `:986` (o censo do
+   IQ2_XXS), `:1032` (a ficha lida pelo parser), `:1139` (a régua do candle) e
+   `:617` (o tripwire que nomeia `q6_k`).
+2. apagar a linha do `bf16` → 4 vermelhos: o comprimento 22 ≠ 23 (`:602`),
+   *"são 13 os tipos que os dois leitores conhecem"* (`:1152`), o desembrulho da
+   linha na leitura real (`:1024`, que com a linha ausente vira `None` e panic) e
+   *"granite-4.2-3b-bf16.gguf carrega bf16, que não tem conta de bloco medida"*
+   (`:1048`). A conferência em disco **não** caiu — nenhum dos quatro arquivos
+   baixados é bf16, e é por isso que a contagem dela é impressa.
+3. um `q8_1` inventado na linha do censo do `UD-IQ2_XXS` → o gate do catálogo cai
+   em `catalog.rs:833` com *"…carrega q8_1, que não tem conta de bloco medida —
+   sem ficha não há veredito a mostrar"* e o espelho dele em `cabecalho.rs:1048`.
+   Os dois lados do contrato, porque um lê a lista do outro.
+4. trocar a chave do censo do `UD-Q3_K_XL` por um nome que nenhum arquivo tem →
+   `catalog.rs:831`: *"Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf não tem censo medido: o
+   catálogo oferece o que não leu"* — é o caso que a oferta sem leitura pega, e
+   ele só existe porque o arquivo passou a ser oferecido.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **616 passaram, 0
+falharam, 11 ignored, finished in 6,77 s**; recortado por módulo, `--lib
+cabecalho` → **34 passaram, 0 falharam, 1,60 s**, `--lib catalog` → **29
+passaram, 0 falharam, 5,53 s**, `--lib alojamento` → **36 passaram, 0 falharam,
+0,02 s**; `cargo check --all-targets` → **Finished em 4,16 s, zero avisos**;
+`npm run build` → **OK, `✓ built in 188 ms`**, maior bloco `react` a 210,53 kB.
+Nenhum `.tsx` foi tocado, e o aplicativo não foi aberto: as onze entradas novas
+chegam à tela pelos dados do catálogo, pelo mesmo caminho das outras.
+
 ## O que esta frente NÃO mediu, e é exatamente por isso que está registrado
 
 Nada aqui rodou. O que falta é placa, e placa é o portão que a instrução de
 não abrir o app mantém fechado:
 
 1. **Alojamento real.** Os `bytes` são o tamanho do arquivo, e o veredito de
-   quantas camadas sobem sai de `alojamento::alojar` (`:626`) com a VRAM livre
-   medida na hora. Nenhum dos GGUFs novos passou pela placa — e agora três
-   podem passar: o `qwen3.5-35b-a3b-Q4_K_M` é o maior arquivo do catálogo que a
-   placa de 16 GiB desta máquina nunca leva inteiro, então o veredito esperado
-   dele é `Dividida`, e a frase que a tela diz com `camadas`, `na_placa` e
+   quantas camadas sobem sai de `alojamento::alojar` (`:597`) com a VRAM livre
+   medida na hora. Nenhum dos GGUFs novos passou pela placa, e a série agora tem
+   catorze arquivos oferecidos: oito têm pesos abaixo dos 16 GiB da placa desta
+   máquina (9,93 a 15,46 GiB), e para esses `Inteira` é uma possibilidade que
+   depende da janela pedida e da VRAM livre medida na hora — nenhum número saiu
+   do aplicativo. Os outros seis começam acima do teto da placa só de pesos
+   (16,29 a 26,87 GiB), então o veredito esperado deles é `Dividida`, e a frase
+   que a tela diz com `camadas`, `na_placa` e
    `em_ram` nunca foi vista saindo do aplicativo. É #39 que fecha isso. O que #106
-   e #107 fecharam foi a conta: `camadas_de_cache` (`:386`) e `taxa_kv` (`:445`)
+   e #107 fecharam foi a conta: `camadas_de_cache` (`:388`) e `taxa_kv` (`:447`)
    leem `head_count_kv`, `sliding_window_pattern`, `key_length_swa` e
-   `shared_kv_layers` como o b12387 os lê, `memoria_recorrente` (`:325`) e
-   `estado_recorrente` (`:370`) leem o gated delta net, e os 344.064 do Gemma 4
+   `shared_kv_layers` como o b12387 os lê, `memoria_recorrente` (`:327`) e
+   `estado_recorrente` (`:372`) leem o gated delta net, e os 344.064 do Gemma 4
    como os 20.480 do A3B são aritmética conferida em teste, não medida em carga.
    O que continua **não medido** é o estado recorrente em carga: os 62,83 MiB do
    A3B e os 50,25 MiB do 4B saem da fórmula do `llama_memory_recurrent` aplicada
    ao cabeçalho, e o que os confirma é `engine_probe alojar:` com o peso em disco
    — a sonda imprime os dois (`bin/engine_probe.rs:249-253`) e o delta real de
-   VRAM ao lado do previsto (`:309-313`). Um estado que a carga abrir menor que
+   VRAM ao lado do previsto (`:309-314`). Um estado que a carga abrir menor que
    isto não é erro de conta, é a biblioteca tendo mudado a regra: é ela que a
    sonda tem de pegar.
 2. **A qualidade do texto e o custo por rodada** (tokens de entrada e saída,
@@ -540,25 +766,26 @@ não abrir o app mantém fechado:
    que o modelo *entrega* nesse laço — se ele abre a chamada e fecha os
    parâmetros quando o laço pede — continua sendo turno com placa, e vale para as
    cinco famílias de conversa do catálogo, não só para esta.
-5. **Os tipos IQ e MXFP4 não têm conta.** O censo sabe quais tipos um arquivo
-   usa; o que falta é o `block_size`/`type_size` deles no leitor de cabeçalho do
-   aplicativo, que é o do candle — `GgmlDType::from_u32` conhece os números 0…15
-   e o 30, e cai no `bail!` para qualquer outro. Sem
-   isso não há ficha, e sem ficha o catálogo não oferece — é por isso que as
-   onze quants com IQ ou MXFP4 do A3B ficam na fila, e que entre elas estão os
+5. **Os tipos IQ e MXFP4 não têm conta.** *Fechado na #110/#111, e este parágrafo
+   fica como foi medido.* O censo sabia quais tipos um arquivo
+   usa; o que faltava era o `block_size`/`type_size` deles no leitor de cabeçalho do
+   aplicativo, que era o do candle — `GgmlDType::from_u32` conhece os números 0…15
+   e o 30, e caía no `bail!` para qualquer outro, e é por isso que as
+   onze quants com IQ ou MXFP4 do A3B ficavam na fila, entre elas os
    oito arquivos cujos pesos caberiam nos 16 GiB de uma placa (a menor quant que
-   o leitor abre mede 18,82 GiB de pesos). Todos os onze são arquivo único e têm
-   `lfs.oid` medido no `tree/main` de 2026-11-24. A tabela de blocos acima já tem
-   os números de todos eles, conferidos arquivo por arquivo contra o tamanho
-   publicado — `iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98, `iq3_s` 110,
-   `iq4_nl` 18 por 32 elementos, `iq4_xs` 136 e `mxfp4` 17 por 32 — e os dois
-   `iq1` (50 e 56) vieram da sonda fora dos onze, já que nenhum arquivo daqui os
-   usa. O que falta é o parser, não a medida.
+   o leitor abria media 18,82 GiB de pesos). Todos os onze são arquivo único e têm
+   `lfs.oid` medido no `tree/main` de 2026-11-24. A tabela de blocos agora tem a
+   conta de todos eles em `cabecalho::BLOCOS`, conferida arquivo por arquivo contra
+   o tamanho publicado — `iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98,
+   `iq3_s` 110, `iq4_nl` 18 por 32 elementos, `iq4_xs` 136 e `mxfp4` 17 por 32 —
+   e os dois `iq1` (50 e 56) vieram da sonda fora dos onze, já que nenhum arquivo
+   daqui os usa. O que faltava era o parser, não a medida: os onze estão oferecidos,
+   com ficha e veredito. Ver `## FEITO — #110 e #111`.
 
 ## Gates da frente do catálogo
 
 Medidos antes da passagem #106; os números atuais estão nos gates das passagens
-acima (#107, #108 e #109).
+acima (#107, #108, #109 e #110/#111).
 
 ```
 cd src-tauri && cargo test --lib        → 567 passaram, 0 falharam, 11 ignored, finished in 5,92 s
@@ -569,34 +796,35 @@ npm run build                            → ✓ built in 250 ms, maior bloco re
 
 O vermelho do instrumento novo foi medido por mutação, porque não há modelo
 para rodar: com as duas linhas do Gemma 4 marcadas como não-escolhíveis,
-`every_size_has_a_routable_baseline` caiu na lista explícita (`catalog.rs:843`)
+`every_size_has_a_routable_baseline` caiu na lista explícita (`catalog.rs:886`)
 e, retirada essa id da lista, caiu no laço que varre as séries do próprio
-`CATALOG` (`catalog.rs:859`) — ou seja, série nova sem baseline é pega sem
+`CATALOG` (`catalog.rs:901`) — ou seja, série nova sem baseline é pega sem
 ninguém precisar lembrar de escrever o nome dela. As duas mutações foram
 revertidas; o diff daquela passagem (#106) fechou em 133 linhas adicionadas e 7
 removidas.
 
 ## Follow-ups
 
-1. **Leitor de cabeçalho que conheça os tipos IQ e MXFP4.** É o portão que a
-   passagem #109 escreveu e a entrada do `Qwen3.5-35B-A3B` deixou visível: onze
-   dos 23 arquivos de pesos do repositório têm tipo que o candle recusa, e **oito
-   deles são justamente os que caberiam nos 16 GiB de uma placa única** — os
-   pesos medem 9,93 / 10,61 / 11,32 / 12,18 / 12,65 / 14,22 / 15,23 e 15,46 GiB,
-   e o menor arquivo que o leitor abre tem 18,82 GiB. Os onze são arquivo único,
-   cada um com `lfs.oid` medido no `tree/main` de 2026-11-24 e o censo lido
-   tensor a tensor; a menor é a `UD-IQ2_XXS`, 10.656.955.008 bytes. O que falta é conta, não dado: os tamanhos de bloco já estão
-   conferidos acima (`iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98,
-   `iq3_s` 110, `iq4_xs` 136 — cada um batendo com o tamanho publicado do
-   arquivo onde ele aparece), e o `mxfp4` (tipo 39) é o único sem soma conferida.
-   O caminho é um leitor de cabeçalho próprio: hoje o aplicativo tem **um** jeito
-   de ler os dados de um GGUF — `alojamento::fichar` (`alojamento.rs:531`), que é
-   o `gguf_file::Content::read` do candle — e até o codificador passa por ele
-   antes de carregar os pesos (`ggml/mod.rs:603`). Uma tabela de blocos nossa, ao
-   lado do censo que já está escrito no catálogo, é o que devolve ficha a esses
-   onze arquivos, com o `diff 0` dos 69 como instrumento de conferência.
-   Enquanto isso não existir, a frase honesta na tela é "este arquivo tem tipo
-   que não sei medir".
+1. **Leitor de cabeçalho que conheça os tipos IQ e MXFP4 — FECHADO na #110/#111.**
+   Era o portão que a #109 escreveu: onze dos 23 arquivos de pesos do repositório
+   tinham tipo que o candle recusava, e **oito deles eram justamente os que
+   caberiam nos 16 GiB de uma placa única** — pesos de 9,93 / 10,61 / 11,32 /
+   12,18 / 12,65 / 14,22 / 15,23 e 15,46 GiB, contra 18,82 GiB da menor quant que
+   o leitor abria. Os onze são arquivo único, cada um com `lfs.oid` medido no
+   `tree/main` de 2026-11-24 e o censo lido tensor a tensor; a menor é a
+   `UD-IQ2_XXS`, 10.656.955.008 bytes. O que faltava era conta, não dado, e a
+   conta foi medida: `cabecalho::BLOCOS` tem os blocos de todos eles (`iq2_xxs`
+   66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98, `iq3_s` 110, `iq4_xs` 136, `mxfp4`
+   17 por 32 elementos), cada linha batendo com o tamanho publicado do arquivo
+   onde ela aparece — o `mxfp4` deixou de ser exceção nesta rodada, o
+   `MXFP4_MOE` fecha com `diff 0`. O aplicativo passou a ter um leitor próprio
+   (`ai/cabecalho.rs`), e o que era "um jeito só de ler um GGUF" — o
+   `gguf_file::Content::read` do candle atrás de `alojamento::fichar`
+   (`alojamento.rs:514`) — hoje é o caminho de medição nosso; o codificador
+   continua passando por `fichar` antes de carregar pesos (`ggml/mod.rs:603`),
+   então ele também passou a ler os tipos IQ. A frase honesta na tela deixou de
+   ser hipotética: `cabecalhoTipoSemConta` nomeia o tensor e o número lido, e é
+   dela que os tipos 9 e 15 ainda se servem.
 2. **`swa_full` desligado, se um dia valer a pena** — #106 mediu que a chave de
    janela deslizante não reduz nada com o padrão da biblioteca
    (`swa_full = true`), e há 40 das 48 camadas do Gemma 4 nesse caso. Ligar o

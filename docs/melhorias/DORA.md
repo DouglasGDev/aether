@@ -85,7 +85,7 @@ e o aplicativo aberto volta a ser o portão (pendência 1).
   um ponteiro LFS ou outra release); os três nomes de tensor de magnitude não
   podem estar. Clone recém-feito, sem DLL em disco, diz `ausente: nada contra o
   que conferir` em vez de passar fingindo — o mesmo acordo de
-  `catalog.rs:492 every_entry_is_an_architecture_the_engine_runs`.
+  `catalog.rs:783 every_entry_is_an_architecture_the_engine_runs`.
 - `ai/adaptadores.rs:748-822` — `um_dora_aplicado_registra_que_a_magnitude_ficou_fora`:
   escreve dois GGUF reais byte a byte (um com os `mag` nos nomes, um sem), exige
   que as fichas digam o que o teste presume, e confere o estado nos três casos:

@@ -62,20 +62,22 @@ somava `pesos + kv + FOLGA` do mesmo jeito. Num build de release o produto
 embrulha em u64, o KV parece pequeno e a placa jura `Inteira` para um modelo que
 nunca caberia — o OOM vem depois, na carga real. Em debug o mesmo caminho panic.
 
-- alojamento.rs:486 `bytes_do_tensor` agora acumula a forma e o tamanho com
-  `saturating_mul`/`saturating_div_ceil`: um tensor fabricado satura em vez de
-  embrulhar para um número pequeno.
-- alojamento.rs:507 `por_camada` soma cada tensor com `saturating_add`; a
-  `pesos_total` de `fichar` (:561) é um `fold` saturante — o teto honesto para
+- `cabecalho.rs:167` e `:176` — `elementos` e `bytes` do tensor acumulam a forma
+  e o tamanho com `saturating_mul` e `div_ceil`: um tensor fabricado satura em
+  vez de embrulhar para um número pequeno. (A conta morava em
+  `alojamento::bytes_do_tensor`, e passou a morar no leitor quando a #111 trocou
+  o parser.)
+- `alojamento.rs:490` `por_camada` soma cada tensor com `saturating_add`; a
+  `pesos_total` de `fichar` (`:530`) é um `fold` saturante — o teto honesto para
   "estes bytes não cabem em lugar nenhum".
-- alojamento.rs:445 `taxa_kv` é a cadeia `checked_mul` que recusa o arquivo no
+- `alojamento.rs:447` `taxa_kv` é a cadeia `checked_mul` que recusa o arquivo no
   estouro com `erros.alojamentoEstouro` (motivo real, não zero); `fichar` a chama
-  em :572, depois que a conta passou a ser soma camada a camada.
-- alojamento.rs:626 `alojar` é todo saturante (`saturating_mul`/`_add`/`_sub`):
+  em `:543`, depois que a conta passou a ser soma camada a camada.
+- `alojamento.rs:597` `alojar` é todo saturante (`saturating_mul`/`_add`/`_sub`):
   mesmo uma `Ficha` armada à mão não arranca um `Inteira` falso.
 
 Vermelho-primeiro (testes em alojamento.rs):
-- um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira (sintoma, linha 1100):
+- um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira (sintoma, linha 1148):
   ficha com `kv_por_token = 1<<63` e janela 2 → veredito nunca `Inteira`. Com a
   conta original embrulhada, `cargo test` panica em `attempt to multiply with
   overflow` nessa linha (medido).

@@ -82,7 +82,7 @@ movido se um hash divergir. Veja
 
 ## O que ele faz
 
-- **Catálogo de modelos** — 47 variantes GGUF em cinco famílias de conversa:
+- **Catálogo de modelos** — 58 variantes GGUF em cinco famílias de conversa:
   Granite 4.2 (3B e 8B, Apache-2.0), Ornith 1.5 9B (MIT, janela de 262 mil, o
   modelo de programação), Qwen3.5 (4B e 9B, Apache-2.0, mesma arquitetura
   `qwen35` do Ornith) e Gemma 4 12B It (Apache-2.0), mais o Qwen3.5 35B A3B
@@ -95,7 +95,10 @@ movido se um hash divergir. Veja
   arquiteturas da `llama.dll` vendorizada, e cada arquivo oferecido tem o censo
   dos tipos ggml que os tensores dele usam, lido tensor a tensor do cabeçalho —
   a etiqueta do nome (`Q3_K_S`, `UD-Q2_K_XL`) não é um tipo, e o portão compara
-  os tipos. As três famílias novas ainda não
+  os tipos. A conta do peso sai do leitor de cabeçalho do próprio aplicativo
+  (`ai/cabecalho.rs`), com o bloco de cada tipo medido nos arquivos: os tipos IQ
+  e MXFP4, que o parser de biblioteca recusava, entraram — eram onze arquivos
+  sem ficha, hoje têm peso e veredito como os outros. As três famílias novas ainda não
   rodaram na placa: o que está medido é o cabeçalho de cada arquivo e a
   arquitetura no binário, não o alojamento nem a qualidade do texto
   (`docs/melhorias/CATALOGO.md`). Download

@@ -159,7 +159,7 @@ o derrotam:
   não responde. **Correção:** `.read_timeout(...)` e cancelar contra o stream.
 - Arquivos: `ai/memoria.rs`, `conversas.rs`, `ai/download.rs`. (M8 sha256 fechado
   em `M8.md`; a honestidade dos adaptadores DoRA fechada em `DORA.md`; o
-  header-check do catálogo fechado — `catalog.rs:492` confere cada família
+  header-check do catálogo fechado — `catalog.rs:783` confere cada família
   declarada contra a `llama.dll` vendorizada.)
 
 ### CONC — concorrência do motor
@@ -631,7 +631,7 @@ lido a nota no binário. Li. Dossiê em `DORA.md`.
   têm de estar no arquivo (sem eles a comparação seria um ponteiro LFS ou outra
   release), e os três nomes de tensor de magnitude não podem estar. Clone sem
   DLL diz "ausente: nada contra o que conferir", o mesmo acordo de
-  `catalog.rs:492`.
+  `catalog.rs:783`.
 - **Vermelho por mutação, porque não há DoRA para montar.** Não existe aqui um
   adaptador DoRA real contra pesos, então o que foi virado foi a hipótese: com
   `LE_MAGNITUDE = true` — exatamente "a biblioteca passou a ler magnitude" — os
@@ -722,8 +722,8 @@ de cada arquivo.
   ganhou o laço que varre as séries do próprio `CATALOG`: série nova sem
   quant escolhível cai sozinha, sem depender de alguém lembrar de escrever o id
   na lista. Com as duas linhas do Gemma 4 marcadas como não-escolhíveis o teste
-  caiu em `catalog.rs:664`; retirada a id da lista explícita, caiu em
-  `catalog.rs:672`. Mutações revertidas; diff em 133 linhas adicionadas, 7
+  caiu em `catalog.rs:886`; retirada a id da lista explícita, caiu em
+  `catalog.rs:901`. Mutações revertidas; diff em 133 linhas adicionadas, 7
   removidas.
 - **Cross-check que saiu de graça:** os 12.807.982 bytes de `tokenizer.json` de
   `Qwen/Qwen3.5-4B` têm o mesmo `lfs.oid` (`5f9e4d49…`) dos 12.807.982 bytes de
@@ -862,7 +862,10 @@ nenhum aplicativo aberto — a instrução do dono continua.
 - **O que o portão recusa fica fora, com o motivo na tela do doc.** Onze dos 23
   arquivos do repositório têm IQ ou MXFP4, e três deles caberiam numa placa de 16
   GiB (`UD-IQ2_XXS` 10.656.955.008, `UD-Q2_K_XL` 12.156.754.560, `Q3_K_S`
-  15.265.856.128). Sem ficha não há veredito, e o Aether não roda o que não mediu
+  15.265.856.128) — **correção da leva #111, que mediu os onze um por um: são
+  oito abaixo de 16 GiB de pesos** (9,93; 10,61; 11,32; 12,18; 12,65; 14,22;
+  15,23; 15,46 GiB), e o três que está escrito acima é uma lista de exemplos, não
+  uma conta dos onze. Sem ficha não há veredito, e o Aether não roda o que não mediu
   (#36) — então a pendência virou conta, não escolha: falta ao leitor de cabeçalho
   a tabela de blocos dos IQ, e os tamanhos já estão medidos acima. O teste novo em
   `alojamento.rs` grava esse preço: um GGUF sintético com o tipo 16 é recusado por
@@ -891,3 +894,80 @@ passaram, 0 falharam, finished in 4,64 s**; `cargo test --lib alojamento` → **
 passaram, 0 falharam, finished in 0,02 s**; `cargo check --all-targets` →
 **Finished em 3,35 s, zero avisos**; `npm run build` → **OK, `✓ built in 180
 ms`**, maior bloco `react` a 210,53 kB.
+
+## Passagem do maintainer sobre a décima primeira leva: a conta de blocos e o leitor próprio (medido 2026-11-24)
+
+Duas frentes, um motivo, um escritor por arquivo: `ai/cabecalho.rs` (o leitor e a
+tabela), `ai/catalog.rs` (as linhas novas e o portão) e `ai/alojamento.rs` (que
+passou a chamar o leitor). Dossiê em `CATALOGO.md`, seções #110 e #111. Nenhum
+peso baixado, nenhuma DLL carregada, nenhum aplicativo aberto — a instrução do
+dono continua.
+
+- **O portão da #109 era uma lista emprestada, e foi ela que fechou a porta.**
+  `DA_FICHA` eram 15 nomes copiados do parser do candle; o censo dos onze
+  arquivos IQ/MXFP4 já estava lido, os blocos já podiam ser pesados, e mesmo
+  assim eles ficaram de fora porque um outro programa não conhece aqueles tipos.
+  Copiar a lista de outro programa é aceitar o limite dele como limite do
+  Aether. A lista saiu, e no lugar dela o gate pergunta pela tabela medida.
+- **#110 mediu os blocos arquivo a arquivo, não doc a doc.** São **23 linhas** em
+  `cabecalho.rs:106`, e cada uma tem uma conta de arquivo real por trás: com
+  `Range` sobre a URL LFS, o espaçamento offset-a-offset fixa os bytes por
+  elemento, e `início_dos_dados + Σ div_ceil(elementos, bloco) × bytes` tem de
+  devolver o `size` publicado — **74 arquivos no cache com `diff 0`** e zero
+  violações de vizinhança. A primeira tabela tinha duas linhas tortas, e as duas
+  caíram por arquivo: `q6_k` a 208 (com 210 batem os IBM que saíam curtos em
+  163.840 e 409.600 bytes) e `iq1_s` a 52 (58 janelas offset-a-offset a
+  reprovaram — a soma sozinha não distingue as duas, porque nenhum tensor
+  `iq1_s` daquele arquivo é o último). Hoje há tripwire para as duas em
+  `a_tabela_de_blocos_e_a_medida_e_nao_uma_lista_de_desejos`.
+- **Ficar de fora também é medida.** `q8_1` (9) e `q8_k` (15) têm nome no candle e
+  conta sairia, mas **nenhum dos 74 arquivos lidos carrega um tensor daqueles**,
+  então não entraram; o mesmo vale para 4, 5, 24–28, 31–38 e 40+. Está escrito em
+  `tipo_sem_arquivo_lido_nao_tem_conta`, com os números 133, 139, 145 e 154 das
+  sondas de fork incluídos na recusa: não são do motor que o aplicativo carrega.
+- **#111 trocou o leitor, e nenhum número de arquivo já medido mudou.** `ler`
+  (`:248`), `Tensor::bytes` (`:176`), `bytes_por_tensor` (`:221`) e `pesos`
+  (`:235`) são nossos; `fichar` (`alojamento.rs:514`) abre o cabeçalho por
+  `cabecalho::ler` e `por_camada` (`:490`) recebe o `Cabecalho` do leitor. A
+  régua da troca é a `a_conta_nova_bate_com_a_do_parser_antigo`: o candle não
+  expõe `GgmlDType::from_u32`, mas `block_size()` e `type_size()` são `pub`, e os
+  **13 tipos que os dois conhecem** batem em **9 formas** — **117 acordos byte a
+  byte**, com `assert_eq!(conferidos, 13 × 9)` avisando se um dos lados encolher.
+  Os dez que só este leitor pesa estão fixos como `[16, 17, 18, 19, 20, 21, 22,
+  23, 29, 39]`. Nada aqui lê a região de dados: o arquivo inteiro nunca precisou
+  estar na mão de ninguém.
+- **A mesma identidade, agora no disco desta máquina.** `o_peso_lido_no_disco_bate_com_o_tamanho_do_arquivo`
+  varre os 60 specs, abre o que está instalado com o tamanho publicado inteiro e
+  confere a soma. Rodado aqui: **4 de 60** — e o teste imprime a contagem em voz
+  alta, porque um "ok" com zero arquivos na mão não é evidência, é ausência dela.
+- **Os onze voltaram como oferta, ficha e veredito.** `SHA256_QWEN35_35B_A3B_GGUF`
+  foi de 3 a **14** linhas (`catalog.rs:325`), `CENSO` de 49 a **60** (`:434`),
+  `CATALOG` de 47 a **58** (`:511`); os onze têm 733 fichas, `info_fim`
+  10.989.695, alinhamento 32 e `diff 0`, e os fatos de cabeçalho — `qwen35moe`,
+  40 camadas, janela 262.144, 256 peritos com 8 usados, `apache-2.0` — foram
+  lidos **onze vezes**, arquivo por arquivo, com um `Range` de 1 MiB e saída
+  antecipada, não transferidos de um para os outros.
+- **O motivo do `routable: false` teve de ser reescrito, porque a conta nova
+  derrubou o motivo velho.** Ele dizia "22 GB não cabem numa placa", mas oito dos
+  onze medem menos de 16 GiB de pesos (9,93 a 15,46 GiB). O que falta não é
+  conta, é corrida: nenhum arquivo da série passou pela placa medida, e é isso
+  que `SO_PARA_BAIXAR` (`catalog.rs:866`) diz agora. Peso de arquivo não é
+  veredito — o alojamento soma o KV da janela pedida e a folga por cima.
+- **Quatro mutações, todas revertidas, todas com a mensagem certa.** A que
+  importa é a primeira: `q6_k` a 209 derruba cinco coisas, e a que não é
+  tripwire — o arquivo real no disco, `granite-4.2-3b-Q4_K_M.gguf`, 363 fichas
+  que não fecham o tamanho — é a prova de que a tabela errada não sobrevive a um
+  download. Apagar a linha do `bf16` derruba quatro e **não** derruba a
+  conferência em disco, porque nenhum dos quatro arquivos instalados é bf16: a
+  contagem impressa é o que impede esse silêncio de virar verde. Um `q8_1`
+  inventado no censo e uma chave de censo trocada por um nome que nenhum arquivo
+  tem pegam os dois lados do contrato (`catalog.rs:833` e `:831`).
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **616 passaram, 0
+falharam, 11 ignored, finished in 6,77 s**; recortado, `--lib cabecalho` → **34
+passaram, 0 falharam, 1,60 s**, `--lib catalog` → **29 passaram, 0 falharam,
+5,53 s**, `--lib alojamento` → **36 passaram, 0 falharam, 0,02 s**; `cargo check
+--all-targets` → **Finished em 4,16 s, zero avisos**; `npm run build` → **OK, `✓
+built in 188 ms`**, maior bloco `react` a 210,53 kB. Nenhum `.tsx` foi tocado: as
+onze entradas chegam à tela pelos dados do catálogo, pelo mesmo caminho das
+outras, e o README passou a dizer 58 variantes.

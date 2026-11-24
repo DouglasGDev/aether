@@ -182,7 +182,10 @@ macro_rules! qwen35 {
 /// `apache-2.0`, janela de 262.144, 40 camadas, 256 peritos com 8 usados por
 /// token e `full_attention_interval` 4 — dez camadas de atenção cheia e trinta de
 /// atenção linear, o híbrido cujo estado o alojamento já cobra como reserva fixa
-/// em vez de KV. O template que vem dentro do arquivo declara a chamada de
+/// em vez de KV. São os fatos de cada um dos catorze arquivos oferecidos, lidos
+/// um por um, e não de um transferido para os outros: os onze IQ/MXFP4 entraram
+/// com o leitor de cabeçalho próprio, que mede o bloco daqueles tipos. O template
+/// que vem dentro do arquivo declara a chamada de
 /// ferramenta no mesmo XML que o laço do Aether escreve e lê (`CALL_OPEN` e
 /// `FN_OPEN` em `ai/chat.rs`), diferente aqui do Gemma 4, que usa marcadores
 /// próprios. O que falta continua sendo a corrida com a placa, que nenhuma
@@ -313,16 +316,27 @@ const SHA256_QWEN35_9B_GGUF: [(&str, &str); 3] = [
     ("Qwen3.5-9B-Q6_K.gguf", "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59"),
 ];
 
-/// Os pesos do 35B A3B, pelo mesmo `tree/main`, lidos em 2026-11-24. Só as três
-/// quants que o catálogo oferece têm linha, e o resto da conta está medida no
-/// doc: o repositório publica 23 arquivos de pesos, 12 deles só com tipos que o
-/// leitor de cabeçalho do aplicativo aceita, e os outros 11 carregam IQ ou
-/// MXFP4 — oferecer um arquivo desses seria prometer um veredito de alojamento
-/// que `fichar` não consegue produzir.
-const SHA256_QWEN35_35B_A3B_GGUF: [(&str, &str); 3] = [
+/// Os pesos do 35B A3B, pelo mesmo `tree/main` com `?blobs=true`: o `oid` do
+/// bloco LFS é o sha256 de 64 hex do arquivo inteiro, lido em 2026-11-24. As
+/// três quants que já estavam aqui e as onze IQ/MXFP4 que o parser do candle
+/// recusava — oferecer um arquivo desses era prometer um veredito de alojamento
+/// que `fichar` não conseguia produzir. Conseguiu com o leitor próprio: os
+/// blocos daqueles tipos estão medidos em `cabecalho::BLOCOS`, e a ficha sai.
+const SHA256_QWEN35_35B_A3B_GGUF: [(&str, &str); 14] = [
     ("Qwen3.5-35B-A3B-Q4_K_M.gguf", "3b46d1066bc91cc2d613e3bc22ce691dd77e6f0d33c9060690d24ce6de494375"),
     ("Qwen3.5-35B-A3B-Q5_K_M.gguf", "93198787ca7744a813f437317ff086b9abeb3f6fabbd5fa5702aa893fa315d89"),
     ("Qwen3.5-35B-A3B-Q6_K.gguf", "56ddab06cc049b66fee8cff294c0b0e5e848f3381ed0da1a3a16a7bd80e8280a"),
+    ("Qwen3.5-35B-A3B-MXFP4_MOE.gguf", "0f135a59159030f4710477abc6f9922d2f13552c85bff736deaaef71023cd770"),
+    ("Qwen3.5-35B-A3B-Q3_K_M.gguf", "5607c8fcc8b04ada7d1a1152b9a5b6c1e67e6768232c16f6b03d9719d5ab1b2d"),
+    ("Qwen3.5-35B-A3B-Q3_K_S.gguf", "315cce210c0406ae05c4e482ceba154c9225fa0bb4c9e779465209dec08e625d"),
+    ("Qwen3.5-35B-A3B-UD-IQ2_M.gguf", "187b5bbb81d7ec1dc228cb04120302cc0d486cb3c988501af87e5f02e15ace0e"),
+    ("Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf", "2a809de317cfd49ac9130b95619ee6ac039a855e467015b3e996eb61af84718b"),
+    ("Qwen3.5-35B-A3B-UD-IQ3_S.gguf", "ca6e9542e9f9e34f28d59e1e335b3629825daf30a4c0b5c1ec9d2f898c061fb6"),
+    ("Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf", "9f7f59280fcac9373f9122de0ed7a19e014fc14120a68b343ea46ac5f5dd96cd"),
+    ("Qwen3.5-35B-A3B-UD-IQ4_NL.gguf", "6aec31ed654fbf12f9950c98bab0a09faea433ffdc4b3acfeb55a1f050e3e444"),
+    ("Qwen3.5-35B-A3B-UD-IQ4_XS.gguf", "745def087c9ec34d12a94eb9b31eb52dba958b36def510b7e8f6f2e6bf1be123"),
+    ("Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf", "855b8d11f4b52e7ea4b9eeea2fbe3555c4d96d5b7b74702b6144810db3e77270"),
+    ("Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf", "fef37f41877128b0c82195c5cd173ca0e02394f48c7667dbf96172fa300fc945"),
 ];
 
 const SHA256_GEMMA4_12B_GGUF: [(&str, &str); 2] = [
@@ -410,16 +424,14 @@ pub fn apoio_sha256(spec: &ModelSpec, arquivo: &str) -> Option<&'static str> {
 /// `Qwen3.5-35B-A3B-Q3_K_S.gguf` diz o mesmo `11` sem ter um tensor `q3_k`
 /// nenhum — são `iq3_xxs×80`, `iq3_s×40` e `q6_k×2`. O `MXFP4_MOE` declara `15`,
 /// o mesmo número do `Q4_K_M` da série. O que o motor abre é o censo, e o que o
-/// Aether mostra antes de rodar é a ficha que `fichar` consegue tirar dele: o
-/// leitor de cabeçalho do candle aceita `f32, f16, bf16, q4_0, q4_1, q5_0, q5_1,
-/// q8_0, q8_1, q2_k, q3_k, q4_k, q5_k, q6_k, q8_k` (`GgmlDType::from_u32`,
-/// candle-core 0.11.1) e recusa os outros com `unknown dtype for tensor` — um
-/// arquivo com IQ, portanto, é um arquivo sem veredito, e o catálogo não oferece
+/// Aether mostra antes de rodar é a ficha que `fichar` tira dele: todo nome
+/// escrito aqui tem linha medida em `cabecalho::BLOCOS`, e um nome sem linha é
+/// recusa que nomeia o tensor e o número lido — o catálogo continua sem oferecer
 /// o que não pode medir.
 ///
 /// A chave é o nome do arquivo porque ele carrega o modelo dentro:
 /// `granite-4.2-3b-Q4_K_M.gguf` não é o `granite-4.2-8b-Q4_K_M.gguf`.
-const CENSO: [(&str, &[&str]); 49] = [
+const CENSO: [(&str, &[&str]); 60] = [
     ("granite-4.2-3b-bf16.gguf", &["bf16", "f32"]),
     ("granite-4.2-3b-Q2_K.gguf", &["f32", "q2_k", "q3_k", "q4_k", "q6_k"]),
     ("granite-4.2-3b-Q3_K_L.gguf", &["f32", "q3_k", "q5_k", "q6_k"]),
@@ -467,6 +479,17 @@ const CENSO: [(&str, &[&str]); 49] = [
     ("Qwen3.5-35B-A3B-Q4_K_M.gguf", &["f32", "q4_k", "q5_k", "q6_k", "q8_0"]),
     ("Qwen3.5-35B-A3B-Q5_K_M.gguf", &["f32", "q5_k", "q6_k", "q8_0"]),
     ("Qwen3.5-35B-A3B-Q6_K.gguf", &["f32", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-MXFP4_MOE.gguf", &["f32", "mxfp4", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-Q3_K_M.gguf", &["f32", "iq3_xxs", "iq4_xs", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-Q3_K_S.gguf", &["f32", "iq3_s", "iq3_xxs", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-IQ2_M.gguf", &["f32", "iq2_xxs", "iq3_xxs", "q4_k", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf", &["f32", "iq2_s", "iq2_xxs", "q4_k", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-IQ3_S.gguf", &["f32", "iq2_s", "iq3_s", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf", &["f32", "iq2_s", "iq3_xxs", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-IQ4_NL.gguf", &["f32", "iq3_s", "iq4_nl", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-IQ4_XS.gguf", &["f32", "iq3_s", "iq4_xs", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf", &["f32", "iq2_xs", "iq3_xxs", "iq4_xs", "q4_k", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf", &["f32", "iq3_xxs", "iq4_xs", "q5_k", "q6_k", "q8_0"]),
     ("Qwen3-Embedding-0.6B-f16.gguf", &["f16", "f32"]),
     ("Qwen3-Embedding-0.6B-Q8_0.gguf", &["f32", "q8_0"]),
 ];
@@ -485,7 +508,7 @@ pub fn censo_para_conferencia() -> Vec<(&'static str, &'static [&'static str])> 
     CENSO.iter().map(|(arquivo, tipos)| (*arquivo, *tipos)).collect()
 }
 
-pub const CATALOG: [ModelSpec; 47] = [
+pub const CATALOG: [ModelSpec; 58] = [
     granite!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_M", 1_835_968_032, false),
@@ -529,15 +552,28 @@ pub const CATALOG: [ModelSpec; 47] = [
     qwen35!("9", Tier::Pesado, 9.0, "Q4_K_M", 5_680_522_464, true),
     qwen35!("9", Tier::Pesado, 9.0, "Q5_K_M", 6_577_841_376, true),
     qwen35!("9", Tier::Pesado, 9.0, "Q6_K", 7_458_301_152, true),
-    // 22 a 29 GB de pesos medidos no `tree/main`: o roteador não escolhe sozinho
-    // o que não cabe inteiro numa placa, e a pessoa baixa por conta própria e vê
-    // na tela o veredito dividido que a conta dela permite. As outras onze
-    // quants do repositório ficam fora por outro motivo — têm tipos que o leitor
-    // de cabeçalho recusa (IQ e MXFP4) e sem ficha não há veredito a mostrar. A
-    // leitura arquivo por arquivo está em `docs/melhorias/CATALOGO.md`.
+    // As quants do 35B A3B com censo lido tensor a tensor: catorze, de
+    // 10.656.955.008 bytes (UD-IQ2_XXS) a 28.852.861.568 (Q6_K). Nenhuma é
+    // escolhida pelo roteador, e o motivo mudou — não é mais o cabeçalho, porque
+    // com o leitor próprio os onze IQ/MXFP4 têm ficha e veredito como as três de
+    // sempre, e sim que nenhum arquivo da série rodou com a placa medida. A
+    // pessoa baixa por conta própria e vê na tela o veredito que a conta dela
+    // permite. As outras nove do repositório não têm censo lido e continuam
+    // fora. A leitura arquivo por arquivo está em `docs/melhorias/CATALOGO.md`.
     qwen35moe!("Q4_K_M", 22_016_023_168, false),
     qwen35moe!("Q5_K_M", 26_249_607_808, false),
     qwen35moe!("Q6_K", 28_852_861_568, false),
+    qwen35moe!("MXFP4_MOE", 21_587_638_912, false),
+    qwen35moe!("Q3_K_M", 16_356_375_168, false),
+    qwen35moe!("Q3_K_S", 15_265_856_128, false),
+    qwen35moe!("UD-IQ2_M", 11_391_613_568, false),
+    qwen35moe!("UD-IQ2_XXS", 10_656_955_008, false),
+    qwen35moe!("UD-IQ3_S", 13_583_383_168, false),
+    qwen35moe!("UD-IQ3_XXS", 13_080_066_688, false),
+    qwen35moe!("UD-IQ4_NL", 17_821_719_168, false),
+    qwen35moe!("UD-IQ4_XS", 17_486_174_848, false),
+    qwen35moe!("UD-Q2_K_XL", 12_156_754_560, false),
+    qwen35moe!("UD-Q3_K_XL", 16_601_176_704, false),
     gemma4!("Q4_K_M", 7_121_861_440, true),
     gemma4!("Q6_K", 9_786_022_720, true),
 ];
@@ -765,24 +801,15 @@ mod tests {
         }
     }
 
-    /// Os tipos que o leitor de cabeçalho do aplicativo aceita, copiados de
-    /// `GgmlDType::from_u32` do candle-core 0.11.1: um tipo fora dessa lista faz
-    /// `gguf_file::Content::read` devolver `unknown dtype for tensor`, e sem
-    /// cabeçalho lido não há ficha nem veredito de alojamento. É esta lista, e
-    /// não a etiqueta do nome do arquivo, que decide o que o catálogo pode
-    /// oferecer.
-    const DA_FICHA: [&str; 15] = [
-        "bf16", "f16", "f32", "q2_k", "q3_k", "q4_0", "q4_1", "q4_k", "q5_0", "q5_1", "q5_k",
-        "q6_k", "q8_0", "q8_1", "q8_k",
-    ];
-
     /// O censo, não a etiqueta. Todo arquivo oferecido tem de ter linha medida na
     /// tabela `CENSO` — um nome errado ali não confere com a URL nem com a soma
     /// publicada, então o erro aparece aqui em vez de aparecer no download — e
-    /// cada tipo da linha tem de estar na lista do leitor de cabeçalho. Foi esta
-    /// conta que mostrou que o `Qwen3.5-35B-A3B-Q3_K_S.gguf` não tem tensor
-    /// `q3_k` nenhum, e que as onze quants IQ e MXFP4 do repositório não têm
-    /// como entrar enquanto `fichar` não conhecer esses tipos.
+    /// cada tipo da linha tem de ter conta de bloco no leitor de cabeçalho. A
+    /// pergunta é `cabecalho::numero_do_nome`, e não uma lista copiada da tabela
+    /// dele: foi uma lista copiada — os 15 tipos que o parser do candle conhecia
+    /// — que deixou onze quants IQ e MXFP4 do `Qwen3.5-35B-A3B` de fora enquanto
+    /// o leitor já media os blocos delas. Esta conta também mostrou que o
+    /// `Qwen3.5-35B-A3B-Q3_K_S.gguf` não tem tensor `q3_k` nenhum.
     #[test]
     fn censo_medido_de_todo_arquivo_oferecido_e_aberto_pelo_leitor() {
         let arquivos: Vec<&str> = CATALOG
@@ -804,8 +831,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{arquivo} não tem censo medido: o catálogo oferece o que não leu"));
             for tipo in tipos {
                 assert!(
-                    DA_FICHA.contains(tipo),
-                    "{arquivo} carrega {tipo}, que o leitor de cabeçalho recusa — sem ficha não há veredito a mostrar"
+                    crate::ai::cabecalho::numero_do_nome(tipo).is_some(),
+                    "{arquivo} carrega {tipo}, que não tem conta de bloco medida — sem ficha não há veredito a mostrar"
                 );
             }
         }
@@ -838,7 +865,7 @@ mod tests {
     /// aqui listada que passou a ter quant escolhível tem de sair.
     const SO_PARA_BAIXAR: [(&str, &str); 1] = [(
         "Qwen3.5 35B A3B",
-        "22.016.023.168 bytes de pesos no arquivo mais leve: não cabe inteiro numa placa única",
+        "nenhum arquivo da série rodou com a placa medida: o peso e o veredito de alojamento saem da conta de qualquer quant, mas a qualidade e o laço de ferramenta dessa arquitetura ainda não têm corrida",
     )];
 
     /// Toda série do catálogo tem de ter pelo menos uma quant escolhível pelo
