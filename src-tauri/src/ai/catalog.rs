@@ -477,6 +477,14 @@ pub fn censo_do_arquivo(arquivo: &str) -> Option<&'static [&'static str]> {
     CENSO.iter().find(|(a, _)| *a == arquivo).map(|(_, tipos)| *tipos)
 }
 
+/// A tabela de censo toda, para quem confere tipo a tipo. É o que o leitor de
+/// cabeçalho usa para provar que todo nome que o catálogo escreve tem linha na
+/// sua tabela de blocos medida — conferida na tabela, não numa lista copiada
+/// dela, porque lista copiada é justamente o que deixou onze arquivos de fora.
+pub fn censo_para_conferencia() -> Vec<(&'static str, &'static [&'static str])> {
+    CENSO.iter().map(|(arquivo, tipos)| (*arquivo, *tipos)).collect()
+}
+
 pub const CATALOG: [ModelSpec; 47] = [
     granite!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
