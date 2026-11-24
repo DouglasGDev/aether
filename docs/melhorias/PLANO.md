@@ -810,3 +810,67 @@ falharam, 11 ignored, finished in 4,91 s**; `cargo test --lib alojamento` → **
 passaram, 0 falharam**; `cargo check --all-targets` → **Finished em 3,57 s, zero
 avisos**; `npm run build` → **OK, `✓ built in 173 ms`**, maior bloco `react` a
 210,53 kB.
+
+## Passagem do maintainer sobre a décima leva, parte 2: a etiqueta e o censo (medido 2026-11-24)
+
+Frente de catálogo, um escritor: `ai/catalog.rs` com `ai/alojamento.rs` no teste
+de portão, e a saída pela primeira vez em dados, não em código de tela. Dossiê em
+`CATALOGO.md`, seções #108 e #109. Nenhum peso baixado, nenhuma DLL carregada,
+nenhum aplicativo aberto — a instrução do dono continua.
+
+- **#108 fechou a omissão de frase que a #107 deixou.** `modelos.placaSistema`
+  dizia os pesos e o estado mas nunca o cache, no denso e no híbrido, embora o
+  `Alojamento::SoSistema` já devolvesse o `kv` e `roteador.noSistema` o escrevesse.
+  Ajuste em uma chave por idioma, zero chaves novas, e `display.ts` continuou passando os
+  três números — quem estava errado era a frase.
+- **A entrada do A3B aconteceu, e o portão mudou de natureza.** O item que a
+  segurava pedia "dizer o que a etiqueta significa em vez de fingir que é um
+  tipo". Medido arquivo a tensor: `Q3_K_S` da unsloth declara o mesmo
+  `general.file_type` (11) do `Q3_K_S` da IBM e **não tem um tensor `q3_k`
+  nenhum** — são `iq3_xxs×80`, `iq3_s×40` e `q6_k×2`; o `MXFP4_MOE` declara 15,
+  o número do `Q4_K_M` da própria série. O gate velho comparava etiquetas com 16
+  nomes e passava nos dois. No lugar dele entrou `CENSO`: 49 linhas, uma por
+  arquivo oferecido, com os tipos lidos do cabeçalho, e o teste que confere que
+  todo arquivo oferecido tem linha e que cada tipo da linha está na tabela que o
+  `gguf_file::Content::read` aceita.
+- **A numeração dos tipos foi provada duas vezes, e a segunda me pegou.** O
+  bits/elemento saído do espaçamento entre tensores concorda com o nome; e a
+  soma de `div_ceil(elementos, bloco) × bytes_por_bloco` sobre todos os tensores,
+  mais o fixo e o alinhamento, devolve exatamente o `size` publicado — **52
+  arquivos conformes, 0 divergentes**, 49 dos quais são tudo o que o catálogo
+  oferece hoje. Com `q6_k` a 208 bytes por bloco (o número que eu havia escrito
+  de memória) dois arquivos IBM saíam curtos, 163.840 e 409.600 bytes; a 210
+  batem os 52. O `alojamento.rs` nunca esteve errado — ele usa `block_size()` e
+  `type_size()` da biblioteca: a tabela é prova de entendimento, não de código.
+- **O que o portão recusa fica fora, com o motivo na tela do doc.** Onze dos 23
+  arquivos do repositório têm IQ ou MXFP4, e três deles caberiam numa placa de 16
+  GiB (`UD-IQ2_XXS` 10.656.955.008, `UD-Q2_K_XL` 12.156.754.560, `Q3_K_S`
+  15.265.856.128). Sem ficha não há veredito, e o Aether não roda o que não mediu
+  (#36) — então a pendência virou conta, não escolha: falta ao leitor de cabeçalho
+  a tabela de blocos dos IQ, e os tamanhos já estão medidos acima. O teste novo em
+  `alojamento.rs` grava esse preço: um GGUF sintético com o tipo 16 é recusado por
+  `unknown dtype for tensor 16`, e com o tipo 8 tira ficha e conta os 68 bytes
+  reais.
+- **Entraram três linhas, baixáveis e não escolhíveis, e a regra deixou de ser
+  implícita.** `qwen3.5-35b-a3b-{Q4_K_M,Q5_K_M,Q6_K}` com bytes e `lfs.oid` do
+  `tree/main` de hoje, arquitetura `qwen35moe` (que a `llama.dll` já nomeia), janela
+  262.144 e o template do próprio arquivo declarando a gramática de chamada que o
+  laço escreve. `routable: false` nos três, porque 22 GB não cabem inteiros numa
+  placa, e a exceção passou a estar escrita em `SO_PARA_BAIXAR` — com o motivo por
+  série, e o teste conferindo os dois lados (série nova sem escolhível entra com
+  motivo; série listada que ganhou escolhível sai). O `tokenizer.json` do
+  `Qwen/Qwen3.5-35B-A3B` tem o `lfs.oid` `5f9e4d49…` dos outros três repositórios,
+  lido arquivo por arquivo; o comentário que dizia "aparece duas vezes" estava
+  torto havia uma passagem (eram três) e agora diz quatro.
+- **Cinco mutações, todas revertidas, todas com a mensagem certa**: um tipo IQ
+  inventado numa linha do censo; uma linha chaveada por um nome que nenhum
+  arquivo oferecido tem; apagar uma linha (o `[; 49]` nem compila); tornar o
+  A3B escolhível mantendo a série em `SO_PARA_BAIXAR`, e esvaziar a lista (as duas
+  direções da regra); trocar o tipo 16 pelo 14 no fixture de `alojamento.rs`.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **584 passaram, 0
+falharam, 11 ignored, finished in 5,78 s**; `cargo test --lib catalog` → **28
+passaram, 0 falharam, finished in 4,64 s**; `cargo test --lib alojamento` → **35
+passaram, 0 falharam, finished in 0,02 s**; `cargo check --all-targets` →
+**Finished em 3,35 s, zero avisos**; `npm run build` → **OK, `✓ built in 180
+ms`**, maior bloco `react` a 210,53 kB.

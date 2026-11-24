@@ -1004,7 +1004,10 @@ mod testes {
     /// Um GGUF mínimo escrito byte a byte, com os metadados que a ficha lê. O
     /// parser é o do candle, então o que o teste exercita é a nossa leitura de
     /// vocabulário — template, fins de resposta e os tokens que os nomeiam.
-    fn gguf_de_vocabulario(caminho: &Path, com_eot: bool) {
+    /// `tipo_de_tensor` acrescenta um tensor de 64 elementos com aquele número
+    /// ggml: `None` é o arquivo só de metadados, e um número fora da tabela do
+    /// leitor é o caso dos IQ.
+    fn gguf_de_vocabulario(caminho: &Path, com_eot: bool, tipo_de_tensor: Option<u32>) {
         const STR: u32 = 8;
         const U32: u32 = 4;
         const ARR: u32 = 9;
@@ -1056,11 +1059,21 @@ mod testes {
             ));
         }
 
+        let mut tensor: Vec<u8> = Vec::new();
+        if let Some(numero) = tipo_de_tensor {
+            tensor.extend_from_slice(&texto("blk.0.attn_q.weight"));
+            tensor.extend_from_slice(&1u32.to_le_bytes());
+            tensor.extend_from_slice(&64u64.to_le_bytes());
+            tensor.extend_from_slice(&numero.to_le_bytes());
+            tensor.extend_from_slice(&0u64.to_le_bytes());
+        }
+
         let mut arquivo: Vec<u8> = b"GGUF".to_vec();
         arquivo.extend_from_slice(&3u32.to_le_bytes());
-        arquivo.extend_from_slice(&0u64.to_le_bytes());
+        arquivo.extend_from_slice(&(tipo_de_tensor.is_some() as u64).to_le_bytes());
         arquivo.extend_from_slice(&(pares as u64).to_le_bytes());
         arquivo.extend_from_slice(&corpo);
+        arquivo.extend_from_slice(&tensor);
         std::fs::write(caminho, arquivo).unwrap();
     }
 
@@ -1071,7 +1084,7 @@ mod testes {
         std::fs::create_dir_all(&dir).unwrap();
         let caminho = dir.join("mini.gguf");
 
-        gguf_de_vocabulario(&caminho, true);
+        gguf_de_vocabulario(&caminho, true, None);
         let ficha = fichar(&caminho).unwrap();
         assert_eq!(ficha.arquitetura, "qwen35");
         assert_eq!(ficha.janela_maxima, 262_144);
@@ -1082,7 +1095,7 @@ mod testes {
         assert_eq!(ficha.paradas, vec!["<|im_end|>", "<|im_start|>"]);
 
         // Sem o eot declarado fica só o eos: nada é inventado.
-        gguf_de_vocabulario(&caminho, false);
+        gguf_de_vocabulario(&caminho, false, None);
         let ficha = fichar(&caminho).unwrap();
         assert_eq!(ficha.eos, vec![2]);
         assert_eq!(ficha.paradas, vec!["<|im_end|>"]);
@@ -1092,6 +1105,38 @@ mod testes {
         let vazio = dir.join("sem-template.gguf");
         std::fs::write(&vazio, b"GGUF").unwrap();
         assert!(fichar(&vazio).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O preço de um tipo que o leitor de cabeçalho não conhece é a ausência de
+    /// veredito, não uma conta aproximada. Os números abaixo são os do GGUF lido
+    /// dos arquivos: 8 é `q8_0` e 16 é `iq2_xxs`, e os IQ não são hipotéticos — o
+    /// `Qwen3.5-35B-A3B-Q3_K_S.gguf` tem `iq3_xxs×80` e `iq3_s×40` declarados no
+    /// próprio cabeçalho. Um `block_size` chutado para esses números diria "cabe"
+    /// sobre um arquivo que o motor não abre, e é por isto que o catálogo não
+    /// oferece as quants IQ. O controle está no mesmo teste: o mesmo cabeçalho
+    /// com um tipo que o leitor conhece (o 8) tira ficha, e a conta sai da
+    /// tabela da biblioteca — 64 elementos em `q8_0` são 2 blocos de 34 bytes.
+    #[test]
+    fn tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada() {
+        let dir = std::env::temp_dir().join(format!("aether-aloj-dtype-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caminho = dir.join("um-tensor.gguf");
+
+        gguf_de_vocabulario(&caminho, true, Some(8));
+        let ficha = fichar(&caminho).unwrap();
+        assert_eq!(ficha.pesos_total, 68, "q8_0: 64 elementos são 2 blocos de 34 bytes");
+
+        gguf_de_vocabulario(&caminho, true, Some(16));
+        let erro = fichar(&caminho)
+            .err()
+            .expect("iq2_xxs não está na tabela do leitor de cabeçalho");
+        assert!(
+            erro.to_string().contains("unknown dtype for tensor 16"),
+            "o erro devia dizer qual número faltou, e dizia: {erro}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -154,9 +154,9 @@ teste para o dia em que aparecerem.
 
 ## FEITO — #107: a camada de atenção linear não paga cache; paga estado
 
-A correção nasceu de uma frente que ia ser outra. O follow-up 1 desta página
-pedia um downloader de pesos em partes para baixar um MoE de 2026 que coubesse
-na placa; medido o repositório, as partes do `unsloth/GLM-5.3-Flash-GGUF` somam
+A correção nasceu de uma frente que ia ser outra. O item que estava à frente
+desta página — hoje o follow-up 5 — pedia um downloader de pesos em partes para
+baixar um MoE de 2026 que coubesse na placa; medido o repositório, as partes do `unsloth/GLM-5.3-Flash-GGUF` somam
 ≈200 GB e a `llama.dll` b12387 já abre split sozinha (`llama-model-loader.cpp:84`
 `llama_get_list_splits`, `:604-635`, com as strings `of-%05d` e `invalid split
 count` presentes nos 3.877.376 bytes do binário). Sem valor presente, a frente
@@ -277,6 +277,217 @@ Chave i18n nova, registrada nos dois idiomas: `erros.alojamentoArray` — array 
 geometria com comprimento que não bate com `block_count`, citando a chave, o
 esperado e o recebido.
 
+## FEITO — #109: a etiqueta não é um tipo, e o catálogo passou a dizer o censo
+
+O follow-up 2 desta página — o que esta passagem fechou — segurava a entrada do
+`Qwen3.5-35B-A3B` por um motivo honesto: `UD-*` e `IQ*` são nomes de editor, não
+tipos ggml, e o portão
+`quants_are_all_implemented_by_the_engine` comparava a etiqueta do arquivo com
+uma lista fechada de 16 nomes. Entrar exigia medir o conteúdo. Medido, e a
+entrada aconteceu com a lista fechada substituída pelo censo.
+
+### Como foi lido
+
+Um arquivo por vez, `Range: bytes=0-16777215` no `resolve/main`, e o cabeçalho
+GGUF v3 percorrido na ordem em que ele é escrito: magic e versão, `n_tensors` e
+`n_kv` como `uint64`, os `n_kv` pares chave → valor (o tipo do valor é `uint32`,
+não byte — foi a lição de #106), e depois as `n_tensors` entradas de tensor:
+nome, `n_dims` (`uint32`), as dimensões (`uint64` cada), **o tipo ggml
+(`uint32`)** e o `offset` (`uint64`). Dali saem duas coisas:
+
+1. **o censo** — o conjunto de tipos que aquele arquivo usa, com quantos tensores
+   de cada;
+2. **a prova do número** — dois caminhos independentes, e onde os dois estavam
+   disponíveis bateram:
+   - o bits/elemento de um tensor grande, `(8 × (offset_do_próximo −
+     offset_dele)) / elementos`, que é o espaçamento que o arquivo mesmo deixou;
+   - a soma de bytes do arquivo inteiro: com a tabela de blocos do ggml
+     (`elementos_por_bloco`, `bytes_por_bloco`), `div_ceil(elementos, bloco) ×
+     bytes` sobre todos os tensores, mais os pesos fora de camada e o
+     alinhamento (`general.alignment`, 32 por padrão), tem de devolver
+     exatamente o `size` que o HuggingFace publica no `tree/main`.
+
+Os dois rodaram sobre os 46 arquivos que o catálogo oferecia (2026-11-20) e os
+23 arquivos de pesos do repositório do A3B (2026-11-24). A conferência de bytes
+foi rodada nos 49 arquivos que o catálogo oferece hoje mais 3 do A3B que ficam
+fora, e **bate nos 52: 52 conformes, 0 divergentes**. É ela que fixa a numeração
+dos tipos — a conta saiu do arquivo, não da minha memória nem de uma tabela
+copiada:
+
+| número | nome | blocos × bytes | | número | nome | blocos × bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | `f32` | 1 × 4 | | 14 | `q6_k` | 256 × **210** |
+| 1 | `f16` | 1 × 2 | | 16 | `iq2_xxs` | 256 × 66 |
+| 2 | `q4_0` | 32 × 18 | | 17 | `iq2_xs` | 256 × 74 |
+| 3 | `q4_1` | 32 × 20 | | 18 | `iq3_xxs` | 256 × 98 |
+| 6 | `q5_0` | 32 × 22 | | 20 | `iq4_nl` | 32 × 18 |
+| 7 | `q5_1` | 32 × 24 | | 21 | `iq3_s` | 256 × 110 |
+| 8 | `q8_0` | 32 × 34 | | 22 | `iq2_s` | 256 × 82 |
+| 9 | `q8_1` | 32 × 36 | | 23 | `iq4_xs` | 256 × 136 |
+| 10 | `q2_k` | 256 × 84 | | 29 | `iq1_m` | 256 × 56 |
+| 11 | `q3_k` | 256 × 110 | | 30 | `bf16` | 1 × 2 |
+| 12 | `q4_k` | 256 × 144 | | 39 | `mxfp4` | não conferido |
+| 13 | `q5_k` | 256 × 176 | | | | |
+
+A linha do `q6_k` tem negrito porque foi onde o instrumento me pegou: com 208
+bytes por bloco — o número que eu havia escrito de memória — o
+`granite-4.2-3b-Q6_K.gguf` saía **163.840 bytes curto** e o
+`granite-4.2-8b-Q6_K.gguf` **409.600**, contra os tamanhos publicados. Com 210
+(`3 × QK_K/4 + QK_K/16 + 2`) os dois batem e os 52 fecham. O `alojamento.rs`
+nunca esteve errado: ele usa `block_size()` e `type_size()` da própria
+biblioteca, e é por isso que a tabela acima é a prova do *entendimento*, não do
+código.
+
+`mxfp4` (39) aparece no censo do `MXFP4_MOE` e é o único tipo lido cuja soma não
+foi rodada — o arquivo não tem como entrar mesmo assim, e o motivo está logo
+abaixo. É também a prova de que a numeração **não para no 30**: o 39 existe em
+arquivo publicado, e um leitor que conhece só os números até 30 o trata como
+desconhecido. Aqui a resposta dele é a certa, porque o candle também não conhece
+o 39 — mas acertar por desconhecimento dos dois lados não é projeto, é sorte, e
+é por isso que a linha está marcada como não conferida.
+
+Das 23 linhas da tabela acima, **19 tiveram o tamanho conferido** contra um arquivo
+publicado — são exatamente os tipos que aparecem nos 52 arquivos somados. Ficam
+sem prova de arquivo `q8_1` (9), `iq4_nl` (20) e `iq1_m` (29), que nenhum dos 69
+cabeçalhos lidos usa, e o `mxfp4` (39), que aparece em um arquivo lido mas cuja
+soma não foi rodada: onde qualquer deles entrar em jogo, a conta tem de ser
+conferida de novo. Pelo mesmo caminho, o
+bits/elemento derivado do espaçamento **não existe para o `f32` em nenhum arquivo
+lido** — os tensores de `f32` são os pequenos de normalização e de escala, todos
+abaixo dos 8 milhões de elementos que o instrumento exigia — e faltou em quatro
+arquivos para `q4_k`, `q4_1` e `q5_1` e em catorze para `q8_0`. Onde ele existiu,
+concordou com o nome; onde não existiu, quem respondeu foi a soma de bytes.
+
+### O que a etiqueta esconde
+
+| arquivo | etiqueta diz | `general.file_type` | o que os tensores são |
+| --- | --- | --- | --- |
+| `granite-4.2-3b-Q3_K_S.gguf` | Q3_K_S | 11 | `f32×81`, `q3_k×281`, `q6_k×1` |
+| `Qwen3.5-35B-A3B-Q3_K_S.gguf` | Q3_K_S | 11 | `f32×301`, `q8_0×310`, `iq3_xxs×80`, `iq3_s×40`, `q6_k×2` |
+| `Qwen3.5-35B-A3B-Q4_K_M.gguf` | Q4_K_M | 15 | `f32×301`, `q8_0×311`, `q4_k×80`, `q5_k×40`, `q6_k×1` |
+| `Qwen3.5-35B-A3B-UD-Q2_K_XL.gguf` | UD-Q2_K_XL | 10 | `f32×301`, `q8_0×61`, `q4_k×1`, `q5_k×177`, `q6_k×73`, `iq2_xs×78`, `iq3_xxs×41`, `iq4_xs×1` |
+| `Qwen3.5-35B-A3B-MXFP4_MOE.gguf` | MXFP4_MOE | **15** | `f32×301`, `q8_0×312`, `q5_k×41`, `q6_k×1`, `mxfp4×78` |
+
+Os dois primeiros têm a mesma etiqueta e o mesmo número declarado, e um deles não
+tem **um tensor `q3_k` nenhum**. O último declara 15 — o número do `Q4_K_M` da
+própria série — e é um arquivo MXFP4. Uma lista de etiquetas não distingue
+nenhum desses casos; o censo distingue.
+
+### O portão, agora lido do conteúdo
+
+O leitor de cabeçalho do aplicativo é o do candle, e ele aceita exatamente
+`f32, f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, q8_1, q2_k, q3_k, q4_k, q5_k,
+q6_k, q8_k` (`GgmlDType::from_u32`, candle-core 0.11.1): os IQ e o MXFP4 caem no
+ramo `_ => bail!("unknown dtype for tensor {u}")`, `Content::read` devolve erro,
+`fichar` devolve erro e **não há veredito de alojamento**. Como o Aether não roda
+o que não mediu antes (#36), a regra passou a ser o portão:
+
+- `CENSO` (`catalog.rs:422`) — 49 linhas, uma por arquivo oferecido, com os tipos
+  lidos do cabeçalho dele;
+- `censo_do_arquivo` (`catalog.rs:476`) — a leitura, `None` para o arquivo que
+  ninguém abriu;
+- `censo_medido_de_todo_arquivo_oferecido_e_aberto_pelo_leitor`
+  (`catalog.rs:779`) — cada arquivo do catálogo e dos codificadores tem de ter
+  linha medida, nenhum nome pode se repetir (é a chave), e cada tipo da linha tem
+  de estar na lista acima. Este teste substituiu o de etiquetas;
+- `granites_sao_executaveis_pelo_caminho_de_cpu` (`catalog.rs:811`) — a parte que
+  ainda é sobre o caminho de CPU, que só existe para o granite e escolhe pelo
+  nome da quant, preservada;
+- `tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada`
+  (`alojamento.rs:1122`) — o GGUF sintético de um tensor só: com o tipo 8 a ficha
+  sai e conta os 68 bytes reais (`q8_0`, 64 elementos = 2 blocos de 34), com o
+  tipo 16 `fichar` recusa citando `unknown dtype for tensor 16`. É o preço de
+  entrada dos IQ, escrito como teste e não como intenção.
+
+Uma frase sobre o `general.file_type`, porque é a primeira coisa que alguém
+olha: ele é um número que o quantizador escreve, **não** a conta de conteúdo, e
+a medição mostra os dois casos. Os arquivos lidos declaram —
+`granite-4.2-3b-Q3_K_S` 11, `Qwen3.5-35B-A3B-Q3_K_S` 11, `UD-Q2_K_XL` 10,
+`Q4_K_M` 15, `Q5_K_M` 17, `Q6_K` 18 e `MXFP4_MOE` 15. Dois arquivos com o mesmo
+11 têm censos diferentes, e um MXFP4 declara o mesmo 15 do `Q4_K_M` da série. O
+que cada número quer dizer é matéria do fonte da llama.cpp, e isto não foi lido
+dele: o que está provado aqui é que o número não serve de prova de conteúdo, e
+é por isso que o portão lê o censo.
+
+### O que entrou: `Qwen3.5 35B A3B`, três quants, arquivo único
+
+`CATALOG` passou de 44 para **47** entradas; `SHA256_PESOS` de 7 para **8**
+repositórios; `SHA256_APOIO` de 5 para **6**. A tabela de censos nasceu com as
+**49** linhas dos arquivos oferecidos (47 de conversa + 2 de embeddings).
+
+Lido do cabeçalho em 2026-11-24 (`Qwen3.5-35B-A3B-Q4_K_M.gguf`, 733 tensores, 52
+pares): arquitetura `qwen35moe`, `general.name` e `general.size_label` =
+`35B-A3B`, licença `apache-2.0`, janela `262144`, 40 camadas, `embedding_length`
+2048, 16 cabeças com 2 de KV, `key_length` e `value_length` 256, 256 peritos com
+8 usados, `full_attention_interval` 4 (o híbrido que #107 já cobra: 20.480 por
+token e 62,83 MiB de estado), e `tokenizer.chat_template` dentro do arquivo.
+
+| id | bytes publicados | `lfs.oid` (sha256) | censo |
+| --- | --- | --- | --- |
+| `qwen3.5-35b-a3b-Q4_K_M` | 22.016.023.168 | `3b46d106…de494375` | `f32, q4_k, q5_k, q6_k, q8_0` |
+| `qwen3.5-35b-a3b-Q5_K_M` | 26.249.607.808 | `93198787…fa315d89` | `f32, q5_k, q6_k, q8_0` |
+| `qwen3.5-35b-a3b-Q6_K` | 28.852.861.568 | `56ddab06…80e8280a` | `f32, q6_k, q8_0` |
+
+As outras 20 quants do repositório ficaram fora, por dois motivos distintos e
+medidos: **11 têm tipo que o portão recusa** (os IQ acima, mais o MXFP4) e 9 são
+lidas mas não escolhíveis — `Q4_K_S` 20.673.845.888, `Q5_K_S` 24.823.544.448,
+`Q8_0` 36.903.139.968, `UD-Q4_K_L` 20.205.632.160, `UD-Q4_K_XL` 22.241.950.336,
+`UD-Q5_K_XL` 26.385.922.688, `UD-Q6_K_S` 28.515.105.440, `UD-Q6_K_XL`
+32.071.842.432, `UD-Q8_K_XL` 48.688.560.768. Dois deles merecem nota: o
+`UD-Q4_K_XL` tem **o mesmo censo** do `Q4_K_M` e é maior (22.241.950.336 contra
+22.016.023.168) — é o caso em que a etiqueta `XL` não compra tipo nenhum; e o
+BF16 da série não é arquivo único: `BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf`
+49.826.698.560 + `…-00002-of-00002.gguf` 19.549.939.264, o que esbarra no
+follow-up 5.
+
+`routable: false` nos três, e a regra passou a estar escrita: `SO_PARA_BAIXAR`
+(`catalog.rs:831`) é a lista de séries sem quant escolhível, cada uma com o
+motivo, e `every_size_has_a_routable_baseline` confere os dois lados — série nova
+sem escolhível precisa entrar lá com o motivo, e uma série listada que passou a
+ter escolhível tem de sair. O motivo do A3B é o número: 22 GB de pesos não cabem
+inteiros numa placa, e o roteador não escolhe sozinho o que só roda dividido.
+`support_repo` é o `Qwen/Qwen3.5-35B-A3B` que o próprio cabeçalho declara em
+`general.base_model.0.repo_url`, e o `tokenizer.json` dele tem `lfs.oid`
+`5f9e4d49…` com 12.807.982 bytes — **a mesma soma do Ornith 1.5 9B, do Qwen3.5 4B
+e do 9B**, medida arquivo por arquivo. O comentário de `SHA256_APOIO` dizia
+"aparece duas vezes"; eram três, e agora são quatro, e foi corrigido na fonte em
+vez de ficar torto.
+
+Uma frase que o arquivo declara e o aplicativo ainda não usa:
+`general.tags = ["unsloth","image-text-to-text"]`, com `mmproj-BF16/F16/F32` ao
+lado no repositório. O Aether não tem caminho de visão, então ele entra como
+modelo de texto — o que é escolha nossa, registrada, não capacidade medida.
+
+### Vermelho medido por mutação
+
+Cinco mutações, cada uma revertida, todas com a mensagem certa:
+
+1. um `iq3_s` inventado na linha do `granite-4.2-3b-Q4_K_M.gguf` → cai o gate do
+   censo: *"granite-4.2-3b-Q4_K_M.gguf carrega iq3_s, que o leitor de cabeçalho
+   recusa"*;
+2. uma linha trocada por um nome que nenhum arquivo do catálogo tem → cai o mesmo
+   gate: *"Qwen3.5-35B-A3B-Q5_K_M.gguf não tem censo medido: o catálogo oferece o
+   que não leu"*;
+3. apagar uma linha da tabela → o comprimento `[; 49]` não compila, então nem
+   chega a teste;
+4. `qwen35moe!("Q4_K_M", …, true)` mantendo a série em `SO_PARA_BAIXAR` → cai
+   *"está em SO_PARA_BAIXAR mas passou a ter quant escolhível"*; e esvaziando a
+   lista, cai *"não tem nenhuma quant escolhível — entre em SO_PARA_BAIXAR com o
+   motivo, ou dê-lhe uma"*. As duas direções, portanto;
+5. no fixture de `alojamento.rs`, trocar o tipo 16 pelo 14 (`q5_k`, conhecido) →
+   cai *"iq2_xxs não está na tabela do leitor de cabeçalho"*, porque a ficha
+   voltou a sair: o vermelho é sobre o número, não sobre o fixture.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **584 passaram, 0
+falharam, 11 ignored, finished in 5,78 s** (eram 582; dois a mais no total porque
+o gate velho de etiquetas virou dois — `cargo test --lib catalog` → **28
+passaram, 0 falharam, finished in 4,64 s**, eram 27); `cargo test --lib
+alojamento` → **35 passaram, 0 falharam, finished in 0,02 s** (eram 34); `cargo
+check --all-targets` → **Finished em 3,35 s, zero avisos**; `npm run build` →
+**OK, `✓ built in 180 ms`**, maior bloco `react` a 210,53 kB. Nenhum `.tsx` foi
+tocado: as três entradas novas chegam à tela pelos dados do catálogo, e a frase
+do veredito dividido já existia.
+
 ## O que esta frente NÃO mediu, e é exatamente por isso que está registrado
 
 Nada aqui rodou. O que falta é placa, e placa é o portão que a instrução de
@@ -284,9 +495,13 @@ não abrir o app mantém fechado:
 
 1. **Alojamento real.** Os `bytes` são o tamanho do arquivo, e o veredito de
    quantas camadas sobem sai de `alojamento::alojar` (`:626`) com a VRAM livre
-   medida na hora. Nenhum dos GGUFs novos passou pela placa. O que #106 e #107
-   fecharam foi a conta: `camadas_de_cache` (`:386`) e `taxa_kv` (`:445`) leem
-   `head_count_kv`, `sliding_window_pattern`, `key_length_swa` e
+   medida na hora. Nenhum dos GGUFs novos passou pela placa — e agora três
+   podem passar: o `qwen3.5-35b-a3b-Q4_K_M` é o maior arquivo do catálogo que a
+   placa de 16 GiB desta máquina nunca leva inteiro, então o veredito esperado
+   dele é `Dividida`, e a frase que a tela diz com `camadas`, `na_placa` e
+   `em_ram` nunca foi vista saindo do aplicativo. É #39 que fecha isso. O que #106
+   e #107 fecharam foi a conta: `camadas_de_cache` (`:386`) e `taxa_kv` (`:445`)
+   leem `head_count_kv`, `sliding_window_pattern`, `key_length_swa` e
    `shared_kv_layers` como o b12387 os lê, `memoria_recorrente` (`:325`) e
    `estado_recorrente` (`:370`) leem o gated delta net, e os 344.064 do Gemma 4
    como os 20.480 do A3B são aritmética conferida em teste, não medida em carga.
@@ -306,11 +521,31 @@ não abrir o app mantém fechado:
    que a injeta. O que o modelo viu no treino é a gramática do próprio template,
    e no Gemma 4 ela é diferente. Se a continuação forçada chega para governar o
    resto do bloco, é medição com a placa, não leitura de cabeçalho.
+4. **A gramática do 35B A3B, lida mas não corrida.** Diferente do Gemma 4: o
+   `tokenizer.chat_template` do próprio arquivo abre a chamada com a tag
+   `tool_call`, nomeia a função em `function=` e fecha cada valor em
+   `parameter=` — que é, byte a byte, o alfabeto de `CALL_OPEN`, `FN_OPEN` e
+   `PARAM_OPEN` (`ai/chat.rs:242-247`). Isso é fato do arquivo, medido aqui. O
+   que o modelo *entrega* nesse laço — se ele abre a chamada e fecha os
+   parâmetros quando o laço pede — continua sendo turno com placa, e vale para as
+   cinco famílias de conversa do catálogo, não só para esta.
+5. **Os tipos IQ e MXFP4 não têm conta.** O censo sabe quais tipos um arquivo
+   usa; o que falta é o `block_size`/`type_size` deles no leitor de cabeçalho do
+   aplicativo, que é o do candle — `GgmlDType::from_u32` conhece os números 0…15
+   e o 30, e cai no `bail!` para qualquer outro. Sem
+   isso não há ficha, e sem ficha o catálogo não oferece — é por isso que as
+   onze quants com IQ ou MXFP4 do A3B ficam na fila, e que entre elas estão os
+   oito arquivos cujos pesos caberiam nos 16 GiB de uma placa (a menor quant que
+   o leitor abre mede 18,82 GiB de pesos). Todos os onze são arquivo único e têm
+   `lfs.oid` medido no `tree/main` de 2026-11-24. A tabela de blocos acima **já tem** os números conferidos de seis deles
+   (`iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98, `iq3_s` 110, `iq4_xs`
+   136), porque a soma de bytes dos três arquivos do A3B bateu com o tamanho
+   publicado — o que falta é o parser, não a medida.
 
 ## Gates da frente do catálogo
 
-Medidos antes da passagem #106; os números atuais estão no gates daquela
-passagem, acima.
+Medidos antes da passagem #106; os números atuais estão nos gates das passagens
+acima (#107, #108 e #109).
 
 ```
 cd src-tauri && cargo test --lib        → 567 passaram, 0 falharam, 11 ignored, finished in 5,92 s
@@ -321,34 +556,39 @@ npm run build                            → ✓ built in 250 ms, maior bloco re
 
 O vermelho do instrumento novo foi medido por mutação, porque não há modelo
 para rodar: com as duas linhas do Gemma 4 marcadas como não-escolhíveis,
-`every_size_has_a_routable_baseline` caiu na lista explícita (`catalog.rs:664`)
-e, retirada essa id da lista, caiu no laço novo que varre as séries do próprio
-`CATALOG` (`catalog.rs:672`) — ou seja, série nova sem baseline é pega sem
+`every_size_has_a_routable_baseline` caiu na lista explícita (`catalog.rs:843`)
+e, retirada essa id da lista, caiu no laço que varre as séries do próprio
+`CATALOG` (`catalog.rs:859`) — ou seja, série nova sem baseline é pega sem
 ninguém precisar lembrar de escrever o nome dela. As duas mutações foram
-revertidas; o diff do arquivo fecha em 133 linhas adicionadas e 7 removidas.
+revertidas; o diff daquela passagem (#106) fechou em 133 linhas adicionadas e 7
+removidas.
 
 ## Follow-ups
 
-1. **Downloader de pesos em partes (multi-shard) — adiado com medida, não com
-   palpite.** O registro anterior dizia "sem ele, GLM-5.3-Flash e qualquer quant
-   >48 GB ficam fora". Medido nesta passagem: a `llama.dll` b12387 já abre split
-   sozinha (`llama-model-loader.cpp:84`, `:604-635`), então o que falta é só o
-   download das partes — mas as seis partes do `unsloth/GLM-5.3-Flash-GGUF`
-   UD-Q4_K_XL somam ≈200 GB, e as quants do `Qwen3.5-35B-A3B`, que é o híbrido
-   grande que a conta nova sabe medir, são arquivo único. Baixar 200 GB para
-   rodar o que não cabe em 16 GiB de placa nem em desta máquina não é trabalho
-   pendente, é trabalho sem valor presente. Volta a ter valor quando houver um
-   repositório dividido cujo arquivo caiba, e o caminho é `ai/download.rs`: a
-   conferência por sha256 de cada parte antes da junção, e o `rename` só depois
-   de todas elas estarem conferidas.
-2. **`Qwen3.5-35B-A3B` no catálogo** — as três quants single-file medidas no
-   `tree/main` (UD-IQ2_XXS 10.656.955.008, UD-Q2_K_XL 12.156.754.560, Q3_K_S
-   15.265.856.128, cada uma com o `lfs.oid` na mão) e a arquitetura `qwen35moe`
-   presente na tabela da DLL. O que segura a entrada não é tamanho: as etiquetas
-   `UD-*` da unsloth são nomes de editor para quant mista, não tipos ggml, e o
-   gate `quants_are_all_implemented_by_the_engine` (`catalog.rs:624`) compara com
-   uma lista fechada dos 16 tipos que o motor implementa. Entrar com elas exige
-   dizer no catálogo o que a etiqueta significa, em vez de fingir que é um tipo.
+1. **Leitor de cabeçalho que conheça os tipos IQ e MXFP4.** É o portão que a
+   passagem #109 escreveu e a entrada do `Qwen3.5-35B-A3B` deixou visível: onze
+   dos 23 arquivos de pesos do repositório têm tipo que o candle recusa, e **oito
+   deles são justamente os que caberiam nos 16 GiB de uma placa única** — os
+   pesos medem 9,93 / 10,61 / 11,32 / 12,18 / 12,65 / 14,22 / 15,23 e 15,46 GiB,
+   e o menor arquivo que o leitor abre tem 18,82 GiB. Os onze são arquivo único,
+   cada um com `lfs.oid` medido no `tree/main` de 2026-11-24 e o censo lido
+   tensor a tensor; a menor é a `UD-IQ2_XXS`, 10.656.955.008 bytes. O que falta é conta, não dado: os tamanhos de bloco já estão
+   conferidos acima (`iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98,
+   `iq3_s` 110, `iq4_xs` 136 — cada um batendo com o tamanho publicado do
+   arquivo onde ele aparece), e o `mxfp4` (tipo 39) é o único sem soma conferida.
+   O caminho é um leitor de cabeçalho próprio: hoje o aplicativo tem **um** jeito
+   de ler os dados de um GGUF — `alojamento::fichar` (`alojamento.rs:531`), que é
+   o `gguf_file::Content::read` do candle — e até o codificador passa por ele
+   antes de carregar os pesos (`ggml/mod.rs:603`). Uma tabela de blocos nossa, ao
+   lado do censo que já está escrito no catálogo, é o que devolve ficha a esses
+   onze arquivos, com o `diff 0` dos 52 como instrumento de conferência.
+   Enquanto isso não existir, a frase honesta na tela é "este arquivo tem tipo
+   que não sei medir".
+2. **`mxfp4` sem soma conferida.** É o tipo 39 do `Qwen3.5-35B-A3B-MXFP4_MOE.gguf`
+   (21.587.638.912 bytes publicados, censo `q5_k×41`, `q6_k×1`, `mxfp4×78`): o
+   único arquivo lido cujo censo tem um tipo que a tabela acima não conferiu
+   contra tamanho publicado. Entra na mesma fila do item 1 e não tem pressa — com
+   21 GB ele não cabe inteiro em placa única de 16 GiB nem dividido com folga.
 3. **`swa_full` desligado, se um dia valer a pena** — #106 mediu que a chave de
    janela deslizante não reduz nada com o padrão da biblioteca
    (`swa_full = true`), e há 40 das 48 camadas do Gemma 4 nesse caso. Ligar o
@@ -356,6 +596,28 @@ revertidas; o diff do arquivo fecha em 133 linhas adicionadas e 7 removidas.
    muda o que a atenção vê fora da janela — é escolha de qualidade, e o que a
    decide é medição com a placa, não conta de cabeçalho.
 4. **Veredito de ferramenta por família** — medir, com a placa, quais das
-   famílias do catálogo conseguem entregar uma chamada no formato que o laço
-   parseia, e dizer isso na tela em vez de deixar a pessoa descobrir no meio de
-   um turno.
+   famílias de conversa do catálogo conseguem entregar uma chamada no formato que
+   o laço parseia, e dizer isso na tela em vez de deixar a pessoa descobrir no
+   meio de um turno. A leitura de cabeçalho de #109 já separou o problema e deu
+   um fato novo: percorrido o `tokenizer.chat_template` de um arquivo por
+   arquitetura, **quatro das quatro** declaram o alfabeto que o laço escreve
+   (`granite` 9.013 caracteres, `qwen35` 7.816 no 4B e no 9B e 7.828 no Ornith
+   1.5 9B, `qwen35moe` 7.817 no A3B), e o `gemma4` é o único em que as três
+   aberturas — de chamada, de função e de parâmetro — não aparecem nos 18.922
+   caracteres do template dele. O que falta deixou de ser "qual família fala a
+   língua": é se cada uma *entrega* o bloco fechado quando o laço pede, e isso só
+   a corrida diz.
+5. **Downloader de pesos em partes (multi-shard) — adiado com medida, não com
+   palpite.** O registro anterior dizia "sem ele, GLM-5.3-Flash e qualquer quant
+   >48 GB ficam fora". Medido na passagem #107: a `llama.dll` b12387 já abre
+   split sozinha (`llama-model-loader.cpp:84`, `:604-635`), então o que falta é
+   só o download das partes — mas as seis partes do `unsloth/GLM-5.3-Flash-GGUF`
+   UD-Q4_K_XL somam ≈200 GB, e as quants do `Qwen3.5-35B-A3B` oferecidas são
+   arquivo único. A #109 mediu mais um caso concreto do mesmo tipo: o BF16 do
+   A3B está em duas partes, `BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf`
+   49.826.698.560 e `…-00002-of-00002.gguf` 19.549.939.264. Baixar 69 GB para
+   rodar o que não cabe em 16 GiB de placa nem nesta máquina não é trabalho
+   pendente, é trabalho sem valor presente. Volta a ter valor quando houver um
+   repositório dividido cujo arquivo caiba, e o caminho é `ai/download.rs`: a
+   conferência por sha256 de cada parte antes da junção, e o `rename` só depois
+   de todas elas estarem conferidas.

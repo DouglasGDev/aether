@@ -82,14 +82,20 @@ movido se um hash divergir. Veja
 
 ## O que ele faz
 
-- **Catálogo de modelos** — 44 variantes GGUF em quatro famílias de conversa:
+- **Catálogo de modelos** — 47 variantes GGUF em cinco famílias de conversa:
   Granite 4.2 (3B e 8B, Apache-2.0), Ornith 1.5 9B (MIT, janela de 262 mil, o
   modelo de programação), Qwen3.5 (4B e 9B, Apache-2.0, mesma arquitetura
-  `qwen35` do Ornith e o mesmo tokenizador, medido nos dois repositórios) e
-  Gemma 4 12B It (Apache-2.0), mais 2 quants do Qwen3-Embedding 0.6B. Cada
+  `qwen35` do Ornith) e Gemma 4 12B It (Apache-2.0), mais o Qwen3.5 35B A3B
+  (Apache-2.0, arquitetura `qwen35moe`: 256 peritos com 8 por token e atenção
+  cheia em uma de cada quatro camadas) e 2 quants do Qwen3-Embedding 0.6B. O
+  tokenizador do Ornith, do 4B, do 9B e do A3B é o mesmo arquivo — 12.807.982
+  bytes e a mesma soma publicada, medidos nos quatro repositórios. Cada
   tamanho é lido do `tree/main` do HuggingFace, arquivo por arquivo, cada soma
-  é o `lfs.oid` publicado, e cada família é conferida contra a tabela de
-  arquiteturas da `llama.dll` vendorizada. As duas famílias novas ainda não
+  é o `lfs.oid` publicado, cada família é conferida contra a tabela de
+  arquiteturas da `llama.dll` vendorizada, e cada arquivo oferecido tem o censo
+  dos tipos ggml que os tensores dele usam, lido tensor a tensor do cabeçalho —
+  a etiqueta do nome (`Q3_K_S`, `UD-Q2_K_XL`) não é um tipo, e o portão compara
+  os tipos. As três famílias novas ainda não
   rodaram na placa: o que está medido é o cabeçalho de cada arquivo e a
   arquitetura no binário, não o alojamento nem a qualidade do texto
   (`docs/melhorias/CATALOGO.md`). Download

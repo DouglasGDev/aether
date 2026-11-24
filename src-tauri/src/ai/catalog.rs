@@ -143,10 +143,11 @@ macro_rules! ornith {
 
 /// O que cada arquivo destes GGUF declara sobre si, lido do próprio cabeçalho
 /// com `Range: bytes=0-16777215` no `resolve/main` do HuggingFace em
-/// 2026-11-20 — o script e a saída estão em `docs/melhorias/CATALOGO.md`. Nada
-/// aqui veio do cartão do repositório: `general.architecture`,
-/// `general.size_label`, `general.license` e `*.context_length` são o que o
-/// arquivo que roda carrega. A lição da leitura: no GGUF v3 o tipo de um par
+/// 2026-11-20 — como a leitura foi feita e o que ela devolveu estão em
+/// `docs/melhorias/CATALOGO.md`. Nada aqui veio do cartão do repositório:
+/// `general.architecture`, `general.size_label`, `general.license` e
+/// `*.context_length` são o que o arquivo que roda carrega. A lição da leitura:
+/// no GGUF v3 o tipo de um par
 /// chave → valor é `uint32`, não um byte, e um parser que assume o byte pede um
 /// tokenizador de 100.663.296 bytes e falha em silêncio.
 macro_rules! qwen35 {
@@ -166,6 +167,43 @@ macro_rules! qwen35 {
             weights_file: concat!("Qwen3.5-", $size, "B-", $quant, ".gguf"),
             weights_bytes: $bytes,
             support_repo: concat!("Qwen/Qwen3.5-", $size, "B"),
+            support_files: &SUPPORT_TOKENIZADOR,
+            query_prefix: None,
+            context_limit: 262_144,
+            routable: $routable,
+        }
+    };
+}
+
+/// O Qwen3.5 35B A3B, lido do cabeçalho do próprio arquivo com
+/// `Range: bytes=0-16777215` no `resolve/main` em 2026-11-24 (a leitura está em
+/// `docs/melhorias/CATALOGO.md`):
+/// arquitetura `qwen35moe`, `general.size_label` = `35B-A3B`, licença
+/// `apache-2.0`, janela de 262.144, 40 camadas, 256 peritos com 8 usados por
+/// token e `full_attention_interval` 4 — dez camadas de atenção cheia e trinta de
+/// atenção linear, o híbrido cujo estado o alojamento já cobra como reserva fixa
+/// em vez de KV. O template que vem dentro do arquivo declara a chamada de
+/// ferramenta no mesmo XML que o laço do Aether escreve e lê (`CALL_OPEN` e
+/// `FN_OPEN` em `ai/chat.rs`), diferente aqui do Gemma 4, que usa marcadores
+/// próprios. O que falta continua sendo a corrida com a placa, que nenhuma
+/// família tem medida.
+macro_rules! qwen35moe {
+    ($quant:literal, $bytes:expr, $routable:expr) => {
+        ModelSpec {
+            id: concat!("qwen3.5-35b-a3b-", $quant),
+            display: concat!("Qwen3.5 35B A3B ", $quant),
+            series: "Qwen3.5 35B A3B",
+            family: "qwen35moe",
+            tier: Tier::Pesado,
+            genero: Genero::Conversa,
+            parameters_b: 35.0,
+            license: "Apache-2.0",
+            quant: $quant,
+            dir: "qwen3.5-35b-a3b",
+            weights_repo: "unsloth/Qwen3.5-35B-A3B-GGUF",
+            weights_file: concat!("Qwen3.5-35B-A3B-", $quant, ".gguf"),
+            weights_bytes: $bytes,
+            support_repo: "Qwen/Qwen3.5-35B-A3B",
             support_files: &SUPPORT_TOKENIZADOR,
             query_prefix: None,
             context_limit: 262_144,
@@ -275,6 +313,18 @@ const SHA256_QWEN35_9B_GGUF: [(&str, &str); 3] = [
     ("Qwen3.5-9B-Q6_K.gguf", "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59"),
 ];
 
+/// Os pesos do 35B A3B, pelo mesmo `tree/main`, lidos em 2026-11-24. Só as três
+/// quants que o catálogo oferece têm linha, e o resto da conta está medida no
+/// doc: o repositório publica 23 arquivos de pesos, 12 deles só com tipos que o
+/// leitor de cabeçalho do aplicativo aceita, e os outros 11 carregam IQ ou
+/// MXFP4 — oferecer um arquivo desses seria prometer um veredito de alojamento
+/// que `fichar` não consegue produzir.
+const SHA256_QWEN35_35B_A3B_GGUF: [(&str, &str); 3] = [
+    ("Qwen3.5-35B-A3B-Q4_K_M.gguf", "3b46d1066bc91cc2d613e3bc22ce691dd77e6f0d33c9060690d24ce6de494375"),
+    ("Qwen3.5-35B-A3B-Q5_K_M.gguf", "93198787ca7744a813f437317ff086b9abeb3f6fabbd5fa5702aa893fa315d89"),
+    ("Qwen3.5-35B-A3B-Q6_K.gguf", "56ddab06cc049b66fee8cff294c0b0e5e848f3381ed0da1a3a16a7bd80e8280a"),
+];
+
 const SHA256_GEMMA4_12B_GGUF: [(&str, &str); 2] = [
     ("gemma-4-12b-it-Q4_K_M.gguf", "0a270ec9fe6b34f4a0d33992b6135117b484ebc4766ab76b51d4ae8c457e4c42"),
     ("gemma-4-12b-it-Q6_K.gguf", "6f394336500bb5409bd68c31aa9d75097b5e6104f6cf30c82a09a7b64df41faf"),
@@ -290,10 +340,10 @@ const SHA256_QWEN_EMBEDS_GGUF: [(&str, &str); 2] = [
 /// Git LFS, e o `lfs.oid` é o sha256 do conteúdo — conferido baixando o arquivo
 /// e somando os bytes servidos (ver `docs/melhorias/M8.md`).
 ///
-/// O `5f9e4d49…` aparece duas vezes de propósito, e é isso que o Ornith e o
-/// Qwen3.5 têm em comum: os 12.807.982 bytes do tokenizador são os mesmos dos
-/// dois repositórios, lidos arquivo por arquivo. Não é cópia confiada — é a
-/// mesma soma medida duas vezes, em caminhos diferentes.
+/// O `5f9e4d49…` aparece quatro vezes de propósito: é o tokenizador comum do
+/// Ornith 1.5 9B, do Qwen3.5 4B, do 9B e do 35B A3B — os mesmos 12.807.982 bytes
+/// nos quatro repositórios, lidos arquivo por arquivo. Não é cópia confiada: é a
+/// mesma soma medida quatro vezes, em caminhos diferentes.
 ///
 /// O tokenizador do Granite **não** está aqui de propósito: com 7.153.414 bytes
 /// ele é um blob git comum, então a API devolve só `oid` — o SHA-1 de
@@ -303,22 +353,24 @@ const SHA256_QWEN_EMBEDS_GGUF: [(&str, &str); 2] = [
 /// de conteúdo até a soma sair do repositório (pendência no doc). O
 /// `tokenizer_config.json` de todos eles está na mesma situação: blob git, sem
 /// sha256 publicado.
-const SHA256_APOIO: [(&str, &[(&str, &str)]); 5] = [
+const SHA256_APOIO: [(&str, &[(&str, &str)]); 6] = [
     ("ornith-ai/Ornith-1.5-9B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
     ("Qwen/Qwen3.5-4B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
     ("Qwen/Qwen3.5-9B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
+    ("Qwen/Qwen3.5-35B-A3B", &[("tokenizer.json", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42")]),
     ("google/gemma-4-12B-it", &[("tokenizer.json", "9788bdb6a021b3170357cd3587b5d622b1177561ad3c5bf43d73728fd71aeacb")]),
     ("Qwen/Qwen3-Embedding-0.6B", &[("tokenizer.json", "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a")]),
 ];
 
 /// Onde cada tabela de pesos mora, pelo nome do repositório — a mesma chave que
 /// a URL de `resolve/main` usa, então uma linha trocada não confere com nada.
-const SHA256_PESOS: [(&str, &[(&str, &str)]); 7] = [
+const SHA256_PESOS: [(&str, &[(&str, &str)]); 8] = [
     ("ibm-granite/granite-4.2-3b-GGUF", &SHA256_GRANITE_3B_GGUF),
     ("ibm-granite/granite-4.2-8b-GGUF", &SHA256_GRANITE_8B_GGUF),
     ("ornith-ai/Ornith-1.5-9B-GGUF", &SHA256_ORNITH_GGUF),
     ("unsloth/Qwen3.5-4B-GGUF", &SHA256_QWEN35_4B_GGUF),
     ("unsloth/Qwen3.5-9B-GGUF", &SHA256_QWEN35_9B_GGUF),
+    ("unsloth/Qwen3.5-35B-A3B-GGUF", &SHA256_QWEN35_35B_A3B_GGUF),
     ("unsloth/gemma-4-12b-it-GGUF", &SHA256_GEMMA4_12B_GGUF),
     ("Qwen/Qwen3-Embedding-0.6B-GGUF", &SHA256_QWEN_EMBEDS_GGUF),
 ];
@@ -345,7 +397,87 @@ pub fn apoio_sha256(spec: &ModelSpec, arquivo: &str) -> Option<&'static str> {
     sha256_publicado(spec.support_repo, arquivo)
 }
 
-pub const CATALOG: [ModelSpec; 44] = [
+/// O censo de tipos ggml de cada arquivo que o catálogo oferece: que tipos os
+/// tensores daquele arquivo **são**, lidos tensor a tensor do cabeçalho real
+/// (`Range: bytes=0-16777215` no `resolve/main`, em 2026-11-20 para os 46
+/// arquivos que já estavam aqui e em 2026-11-24 para os do 35B A3B; o
+/// instrumento é `scratch/censo.mjs` e a saída completa está em
+/// `docs/melhorias/CATALOGO.md`).
+///
+/// A tabela existe porque a etiqueta do nome não é um tipo, e o
+/// `general.file_type` que o arquivo declara tampouco resolve: o
+/// `granite-4.2-3b-Q3_K_S.gguf` diz `11` e tem `q3_k×281`, e o
+/// `Qwen3.5-35B-A3B-Q3_K_S.gguf` diz o mesmo `11` sem ter um tensor `q3_k`
+/// nenhum — são `iq3_xxs×80`, `iq3_s×40` e `q6_k×2`. O `MXFP4_MOE` declara `15`,
+/// o mesmo número do `Q4_K_M` da série. O que o motor abre é o censo, e o que o
+/// Aether mostra antes de rodar é a ficha que `fichar` consegue tirar dele: o
+/// leitor de cabeçalho do candle aceita `f32, f16, bf16, q4_0, q4_1, q5_0, q5_1,
+/// q8_0, q8_1, q2_k, q3_k, q4_k, q5_k, q6_k, q8_k` (`GgmlDType::from_u32`,
+/// candle-core 0.11.1) e recusa os outros com `unknown dtype for tensor` — um
+/// arquivo com IQ, portanto, é um arquivo sem veredito, e o catálogo não oferece
+/// o que não pode medir.
+///
+/// A chave é o nome do arquivo porque ele carrega o modelo dentro:
+/// `granite-4.2-3b-Q4_K_M.gguf` não é o `granite-4.2-8b-Q4_K_M.gguf`.
+const CENSO: [(&str, &[&str]); 49] = [
+    ("granite-4.2-3b-bf16.gguf", &["bf16", "f32"]),
+    ("granite-4.2-3b-Q2_K.gguf", &["f32", "q2_k", "q3_k", "q4_k", "q6_k"]),
+    ("granite-4.2-3b-Q3_K_L.gguf", &["f32", "q3_k", "q5_k", "q6_k"]),
+    ("granite-4.2-3b-Q3_K_M.gguf", &["f32", "q3_k", "q4_k", "q5_k", "q6_k"]),
+    ("granite-4.2-3b-Q3_K_S.gguf", &["f32", "q3_k", "q6_k"]),
+    ("granite-4.2-3b-Q4_0.gguf", &["f32", "q4_0", "q6_k"]),
+    ("granite-4.2-3b-Q4_1.gguf", &["f32", "q4_1", "q6_k"]),
+    ("granite-4.2-3b-Q4_K_M.gguf", &["f32", "q4_k", "q6_k"]),
+    ("granite-4.2-3b-Q4_K_S.gguf", &["f32", "q4_k", "q5_k", "q6_k"]),
+    ("granite-4.2-3b-Q5_0.gguf", &["f32", "q5_0", "q6_k"]),
+    ("granite-4.2-3b-Q5_1.gguf", &["f32", "q5_1", "q6_k"]),
+    ("granite-4.2-3b-Q5_K_M.gguf", &["f32", "q5_k", "q6_k"]),
+    ("granite-4.2-3b-Q5_K_S.gguf", &["f32", "q5_k", "q6_k"]),
+    ("granite-4.2-3b-Q6_K.gguf", &["f32", "q6_k"]),
+    ("granite-4.2-3b-Q8_0.gguf", &["f32", "q8_0"]),
+    ("granite-4.2-8b-bf16.gguf", &["bf16", "f32"]),
+    ("granite-4.2-8b-Q2_K.gguf", &["f32", "q2_k", "q3_k", "q4_k", "q6_k"]),
+    ("granite-4.2-8b-Q3_K_L.gguf", &["f32", "q3_k", "q5_k", "q6_k"]),
+    ("granite-4.2-8b-Q3_K_M.gguf", &["f32", "q3_k", "q4_k", "q5_k", "q6_k"]),
+    ("granite-4.2-8b-Q3_K_S.gguf", &["f32", "q3_k", "q6_k"]),
+    ("granite-4.2-8b-Q4_0.gguf", &["f32", "q4_0", "q6_k"]),
+    ("granite-4.2-8b-Q4_1.gguf", &["f32", "q4_1", "q6_k"]),
+    ("granite-4.2-8b-Q4_K_M.gguf", &["f32", "q4_k", "q6_k"]),
+    ("granite-4.2-8b-Q4_K_S.gguf", &["f32", "q4_k", "q5_k", "q6_k"]),
+    ("granite-4.2-8b-Q5_0.gguf", &["f32", "q5_0", "q6_k"]),
+    ("granite-4.2-8b-Q5_1.gguf", &["f32", "q5_1", "q6_k"]),
+    ("granite-4.2-8b-Q5_K_M.gguf", &["f32", "q5_k", "q6_k"]),
+    ("granite-4.2-8b-Q5_K_S.gguf", &["f32", "q5_k", "q6_k"]),
+    ("granite-4.2-8b-Q6_K.gguf", &["f32", "q6_k"]),
+    ("granite-4.2-8b-Q8_0.gguf", &["f32", "q8_0"]),
+    ("Ornith-1.5-9B-BF16.gguf", &["bf16", "f32"]),
+    ("Ornith-1.5-9B-Q4_K_M.gguf", &["f32", "q4_k", "q6_k"]),
+    ("Ornith-1.5-9B-Q5_K_M.gguf", &["f32", "q5_k", "q6_k"]),
+    ("Ornith-1.5-9B-Q6_K.gguf", &["f32", "q6_k"]),
+    ("Ornith-1.5-9B-Q8_0.gguf", &["f32", "q8_0"]),
+    ("Qwen3.5-4B-Q4_K_M.gguf", &["f32", "q4_k", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-4B-Q5_K_M.gguf", &["f32", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-4B-Q6_K.gguf", &["f32", "q6_k", "q8_0"]),
+    ("Qwen3.5-4B-Q8_0.gguf", &["f32", "q8_0"]),
+    ("Qwen3.5-9B-Q4_K_M.gguf", &["f32", "q4_k", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-9B-Q5_K_M.gguf", &["f32", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-9B-Q6_K.gguf", &["f32", "q6_k", "q8_0"]),
+    ("gemma-4-12b-it-Q4_K_M.gguf", &["f32", "q4_k", "q6_k"]),
+    ("gemma-4-12b-it-Q6_K.gguf", &["f32", "q6_k"]),
+    ("Qwen3.5-35B-A3B-Q4_K_M.gguf", &["f32", "q4_k", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-Q5_K_M.gguf", &["f32", "q5_k", "q6_k", "q8_0"]),
+    ("Qwen3.5-35B-A3B-Q6_K.gguf", &["f32", "q6_k", "q8_0"]),
+    ("Qwen3-Embedding-0.6B-f16.gguf", &["f16", "f32"]),
+    ("Qwen3-Embedding-0.6B-Q8_0.gguf", &["f32", "q8_0"]),
+];
+
+/// Os tipos medidos de um arquivo, ou `None` para o arquivo que nunca foi lido:
+/// estado que o teste do catálogo não deixa chegar a uma entrada oferecida.
+pub fn censo_do_arquivo(arquivo: &str) -> Option<&'static [&'static str]> {
+    CENSO.iter().find(|(a, _)| *a == arquivo).map(|(_, tipos)| *tipos)
+}
+
+pub const CATALOG: [ModelSpec; 47] = [
     granite!("3", Tier::Leve, 3.0, "Q2_K", 1_455_736_352, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_S", 1_677_207_072, false),
     granite!("3", Tier::Leve, 3.0, "Q3_K_M", 1_835_968_032, false),
@@ -389,6 +521,15 @@ pub const CATALOG: [ModelSpec; 44] = [
     qwen35!("9", Tier::Pesado, 9.0, "Q4_K_M", 5_680_522_464, true),
     qwen35!("9", Tier::Pesado, 9.0, "Q5_K_M", 6_577_841_376, true),
     qwen35!("9", Tier::Pesado, 9.0, "Q6_K", 7_458_301_152, true),
+    // 22 a 29 GB de pesos medidos no `tree/main`: o roteador não escolhe sozinho
+    // o que não cabe inteiro numa placa, e a pessoa baixa por conta própria e vê
+    // na tela o veredito dividido que a conta dela permite. As outras onze
+    // quants do repositório ficam fora por outro motivo — têm tipos que o leitor
+    // de cabeçalho recusa (IQ e MXFP4) e sem ficha não há veredito a mostrar. A
+    // leitura arquivo por arquivo está em `docs/melhorias/CATALOGO.md`.
+    qwen35moe!("Q4_K_M", 22_016_023_168, false),
+    qwen35moe!("Q5_K_M", 26_249_607_808, false),
+    qwen35moe!("Q6_K", 28_852_861_568, false),
     gemma4!("Q4_K_M", 7_121_861_440, true),
     gemma4!("Q6_K", 9_786_022_720, true),
 ];
@@ -616,41 +757,87 @@ mod tests {
         }
     }
 
-    /// O caminho de CPU é o candle, e ele só implementa granite. Para as outras
-    /// famílias a placa é obrigatória, e o que se cobra aqui é que a quant exista
-    /// como tipo GGUF — uma quant escrita errado seria um download que nenhum
-    /// motor abre.
+    /// Os tipos que o leitor de cabeçalho do aplicativo aceita, copiados de
+    /// `GgmlDType::from_u32` do candle-core 0.11.1: um tipo fora dessa lista faz
+    /// `gguf_file::Content::read` devolver `unknown dtype for tensor`, e sem
+    /// cabeçalho lido não há ficha nem veredito de alojamento. É esta lista, e
+    /// não a etiqueta do nome do arquivo, que decide o que o catálogo pode
+    /// oferecer.
+    const DA_FICHA: [&str; 15] = [
+        "bf16", "f16", "f32", "q2_k", "q3_k", "q4_0", "q4_1", "q4_k", "q5_0", "q5_1", "q5_k",
+        "q6_k", "q8_0", "q8_1", "q8_k",
+    ];
+
+    /// O censo, não a etiqueta. Todo arquivo oferecido tem de ter linha medida na
+    /// tabela `CENSO` — um nome errado ali não confere com a URL nem com a soma
+    /// publicada, então o erro aparece aqui em vez de aparecer no download — e
+    /// cada tipo da linha tem de estar na lista do leitor de cabeçalho. Foi esta
+    /// conta que mostrou que o `Qwen3.5-35B-A3B-Q3_K_S.gguf` não tem tensor
+    /// `q3_k` nenhum, e que as onze quants IQ e MXFP4 do repositório não têm
+    /// como entrar enquanto `fichar` não conhecer esses tipos.
     #[test]
-    fn quants_are_all_implemented_by_the_engine() {
-        const DO_CANDLE: [&str; 15] = [
-            "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q4_1", "Q5_0",
-            "Q5_K_S", "Q5_K_M", "Q5_1", "Q6_K", "Q8_0", "bf16",
-        ];
-        const DO_GGUF: [&str; 16] = [
-            "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q4_1", "Q5_0",
-            "Q5_K_S", "Q5_K_M", "Q5_1", "Q6_K", "Q8_0", "bf16", "BF16",
-        ];
-        for spec in CATALOG {
-            assert!(
-                DO_GGUF.contains(&spec.quant),
-                "{} não é um tipo de quant que o motor abre",
-                spec.quant
-            );
-            if spec.family == "granite" {
+    fn censo_medido_de_todo_arquivo_oferecido_e_aberto_pelo_leitor() {
+        let arquivos: Vec<&str> = CATALOG
+            .iter()
+            .chain(EMBEDS.iter())
+            .map(|spec| spec.weights_file)
+            .collect();
+        let mut ordenados = arquivos.clone();
+        ordenados.sort_unstable();
+        let antes = ordenados.len();
+        ordenados.dedup();
+        assert_eq!(
+            antes - ordenados.len(),
+            0,
+            "dois arquivos oferecidos têm o mesmo nome: a chave do censo deixaria de ser única"
+        );
+        for arquivo in &arquivos {
+            let tipos = censo_do_arquivo(arquivo)
+                .unwrap_or_else(|| panic!("{arquivo} não tem censo medido: o catálogo oferece o que não leu"));
+            for tipo in tipos {
                 assert!(
-                    DO_CANDLE.contains(&spec.quant),
-                    "granite na quant {} não é executável pelo candle",
-                    spec.quant
+                    DA_FICHA.contains(tipo),
+                    "{arquivo} carrega {tipo}, que o leitor de cabeçalho recusa — sem ficha não há veredito a mostrar"
                 );
             }
         }
     }
 
+    /// O caminho de CPU é o candle, e ele só implementa granite: para as outras
+    /// famílias a placa é obrigatória. Aqui se cobra a etiqueta que o motor de
+    /// CPU escolhe; o censo dos arquivos IBM está todo dentro da lista de tipos
+    /// acima, e é por isso que os dois testes não se sobrepõem.
+    #[test]
+    fn granites_sao_executaveis_pelo_caminho_de_cpu() {
+        const DO_CANDLE: [&str; 15] = [
+            "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q4_1", "Q5_0",
+            "Q5_K_S", "Q5_K_M", "Q5_1", "Q6_K", "Q8_0", "bf16",
+        ];
+        for spec in CATALOG.iter().filter(|s| s.family == "granite") {
+            assert!(
+                DO_CANDLE.contains(&spec.quant),
+                "granite na quant {} não é executável pelo candle",
+                spec.quant
+            );
+        }
+    }
+
+    /// Séries oferecidas só para baixar, sem que o roteador as escolha sozinhas. O
+    /// `routable` pede duas coisas — qualidade suficiente e carga que caiba na
+    /// conta da placa — e cada linha aqui diz qual das duas falta. A lista é a
+    /// exceção escrita à mão, e o teste abaixo confere os dois lados: uma série
+    /// nova sem quant escolhível precisa entrar aqui com o motivo, e uma série
+    /// aqui listada que passou a ter quant escolhível tem de sair.
+    const SO_PARA_BAIXAR: [(&str, &str); 1] = [(
+        "Qwen3.5 35B A3B",
+        "22.016.023.168 bytes de pesos no arquivo mais leve: não cabe inteiro numa placa única",
+    )];
+
     /// Toda série do catálogo tem de ter pelo menos uma quant escolhível pelo
-    /// roteador: uma série em que nenhuma linha passa o critério de qualidade é
-    /// um modelo que a pessoa vê na tela e o assistente nunca usa sozinho. A
-    /// lista é lida do catálogo, não escrita à mão — entra série nova, o teste
-    /// cobra série nova.
+    /// roteador: uma série em que nenhuma linha passa o critério é um modelo que
+    /// a pessoa vê na tela e o assistente nunca usa sozinho. A lista de séries é
+    /// lida do catálogo, não escrita à mão — entra série nova, o teste cobra
+    /// série nova.
     #[test]
     fn every_size_has_a_routable_baseline() {
         for id in [
@@ -670,9 +857,22 @@ mod tests {
             v
         };
         for serie in &series {
+            if let Some((_, motivo)) = SO_PARA_BAIXAR.iter().find(|(s, _)| s == serie) {
+                assert!(
+                    !CATALOG.iter().any(|s| s.series == *serie && s.routable),
+                    "a série {serie} está em SO_PARA_BAIXAR mas passou a ter quant escolhível: {motivo}"
+                );
+                continue;
+            }
             assert!(
                 CATALOG.iter().any(|s| s.series == *serie && s.routable),
-                "a série {serie} não tem nenhuma quant escolhível"
+                "a série {serie} não tem nenhuma quant escolhível — entre em SO_PARA_BAIXAR com o motivo, ou dê-lhe uma"
+            );
+        }
+        for (serie, _) in SO_PARA_BAIXAR {
+            assert!(
+                series.contains(&serie),
+                "SO_PARA_BAIXAR cita {serie}, que não é mais uma série do catálogo"
             );
         }
     }
