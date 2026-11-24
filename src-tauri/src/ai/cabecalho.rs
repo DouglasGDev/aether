@@ -41,6 +41,13 @@
 //! da biblioteca de carga. Onde este módulo é mais estrito que o candle é na
 //! versão: GGUF v1 escreve comprimentos em 4 bytes, nenhum dos 74 cabeçalhos
 //! medidos é v1, e o leitor recusa em vez de adivinhar o layout que não conferiu.
+//!
+//! Trocar de leitor não muda o veredito de nenhum arquivo que já tinha: para os
+//! 13 tipos que os dois conhecem, a conta nova é a conta antiga byte a byte, e é
+//! o que confere `a_conta_nova_bate_com_a_do_parser_antigo`, contra o
+//! `block_size` e o `type_size` do próprio candle. Os
+//! outros dez pesos desta tabela — os IQ e o MXFP4 — são tipos que aquele parser
+//! não abria, e é por isso que onze quants continuaram fora do catálogo até aqui.
 
 use crate::idiomas::tr;
 use anyhow::Result;
@@ -207,11 +214,31 @@ impl Cabecalho {
             .map(|t| (t, t.tipo))
     }
 
-    /// Bytes de todos os tensores, ou `None` se algum tipo não tem conta medida.
-    pub fn pesos(&self) -> Option<u64> {
+    /// Bytes de cada tensor, na ordem das fichas. O arquivo em que algum tipo não
+    /// tem conta medida é recusado aqui, com o nome do tensor e o número escrito
+    /// no cabeçalho: meio arquivo pesado e meio arquivo chamado de zero é a
+    /// forma como um veredito mente "cabe".
+    pub fn bytes_por_tensor(&self) -> Result<Vec<u64>> {
         self.tensores
             .iter()
-            .try_fold(0u64, |total, t| t.bytes().map(|b| total.saturating_add(b)))
+            .map(|t| match t.bytes() {
+                Some(bytes) => Ok(bytes),
+                None => Err(erro(
+                    "cabecalhoTipoSemConta",
+                    &[("nome", &t.nome), ("tipo", &t.tipo.to_string())],
+                )),
+            })
+            .collect()
+    }
+
+    /// Bytes de todos os tensores, ou `None` se algum tipo não tem conta medida.
+    pub fn pesos(&self) -> Option<u64> {
+        Some(
+            self.bytes_por_tensor()
+                .ok()?
+                .iter()
+                .fold(0u64, |total, bytes| total.saturating_add(*bytes)),
+        )
     }
 }
 
@@ -681,6 +708,16 @@ mod tests {
         let (tensor, tipo) = c.tipo_sem_conta().unwrap();
         assert_eq!(tensor.nome, "blk.0.attn_q.weight");
         assert_eq!(tipo, 139);
+        // O caminho que o aplicativo usa para decidir é `bytes_por_tensor`, e a
+        // recusa dele tem de dizer o mesmo que os dois acima.
+        let erro = c.bytes_por_tensor().unwrap_err().to_string();
+        assert!(erro.contains("blk.0.attn_q.weight"), "a recusa nomeia o tensor: {erro}");
+        assert!(erro.contains("139"), "a recusa diz o número lido: {erro}");
+        // O outro arquivo — o que o candle recusava por tipo IQ — passa aqui.
+        let mut iq = cabecalho_minimo();
+        iq.ficha("blk.0.attn_q.weight", &[2048, 2048], 16, 0);
+        let c = ler_buf(&iq.montar(0)).unwrap();
+        assert_eq!(c.bytes_por_tensor().unwrap(), vec![4_194_304 / 256 * 66]);
     }
 
     #[test]
@@ -1043,11 +1080,148 @@ mod tests {
             "cabecalhoProfundidade",
             "cabecalhoBool",
             "cabecalhoTipoValor",
+            "cabecalhoTipoSemConta",
         ] {
             assert!(
                 crate::idiomas::tem_texto(&format!("erros.{chave}")),
                 "erros.{chave} não tem texto publicado em todo idioma"
             );
         }
+    }
+
+    /// Os tipos que o parser que o aplicativo usava sabia nomear: a lista de
+    /// `GgmlDType::from_u32`, em candle-core 0.11.1 `quantized/mod.rs:304`,
+    /// transcrita com o número que o cabeçalho escreve para cada um.
+    fn dtype_do_parser_antigo(numero: u32) -> Option<candle::quantized::GgmlDType> {
+        use candle::quantized::GgmlDType as D;
+        Some(match numero {
+            0 => D::F32,
+            1 => D::F16,
+            2 => D::Q4_0,
+            3 => D::Q4_1,
+            6 => D::Q5_0,
+            7 => D::Q5_1,
+            8 => D::Q8_0,
+            9 => D::Q8_1,
+            10 => D::Q2K,
+            11 => D::Q3K,
+            12 => D::Q4K,
+            13 => D::Q5K,
+            14 => D::Q6K,
+            15 => D::Q8K,
+            30 => D::BF16,
+            _ => return None,
+        })
+    }
+
+    /// A conta que o alojamento fazia com o parser antigo, transcrita para servir
+    /// de régua. Não é o que roda no aplicativo.
+    fn peso_pelo_parser_antigo(elementos: u64, numero: u32) -> Option<u64> {
+        let dtype = dtype_do_parser_antigo(numero)?;
+        let bloco = dtype.block_size() as u64;
+        if bloco == 0 {
+            return Some(0);
+        }
+        Some(elementos.div_ceil(bloco).saturating_mul(dtype.type_size() as u64))
+    }
+
+    #[test]
+    fn a_conta_nova_bate_com_a_do_parser_antigo() {
+        // A troca de leitor não pode mudar o peso de um arquivo que já tinha
+        // veredito: a mesma forma, no mesmo tipo, dá o mesmo número — inclusive
+        // quando os elementos não fecham um bloco inteiro.
+        let formas = [1u64, 31, 32, 33, 255, 256, 257, 1024, 4096 * 4096];
+        let mut conferidos = 0usize;
+        for (numero, _) in BLOCOS {
+            let Some(dtype) = dtype_do_parser_antigo(*numero) else { continue };
+            let bloco = bloco_de(*numero).unwrap();
+            assert_eq!(bloco.elementos, dtype.block_size() as u64, "elementos por bloco do tipo {numero}");
+            assert_eq!(bloco.bytes, dtype.type_size() as u64, "bytes por bloco do tipo {numero}");
+            for elementos in formas.iter() {
+                let t = Tensor {
+                    nome: "t".to_string(),
+                    dimensoes: vec![*elementos],
+                    tipo: *numero,
+                    deslocamento: 0,
+                };
+                let antigo = peso_pelo_parser_antigo(*elementos, *numero).unwrap();
+                assert_eq!(t.bytes(), Some(antigo), "tipo {numero} com {elementos} elementos");
+                conferidos += 1;
+            }
+        }
+        assert_eq!(conferidos, 13 * formas.len(), "são 13 os tipos que os dois leitores conhecem");
+
+        // Os dez que só este leitor pesa: com o parser antigo esses cabeçalhos
+        // morriam em "unknown dtype" antes de qualquer veredito.
+        let so_deste: Vec<u32> = BLOCOS
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| dtype_do_parser_antigo(*n).is_none())
+            .collect();
+        assert_eq!(
+            so_deste,
+            vec![16, 17, 18, 19, 20, 21, 22, 23, 29, 39],
+            "os tipos IQ e MXFP4 que entraram com este leitor"
+        );
+
+        // E os dois que o parser antigo nomeava sem que nenhum arquivo dos 74 os
+        // carregue: aqui continuam recusa, porque pesar por tabela emprestada é
+        // prometer um número que ninguém mediu.
+        for numero in [9u32, 15] {
+            assert!(dtype_do_parser_antigo(numero).is_some(), "o parser antigo nomeava {numero}");
+            assert!(bloco_de(numero).is_none(), "{numero} não tem bloco medido em arquivo algum");
+            assert!(
+                peso_pelo_parser_antigo(256, numero).unwrap() > 0,
+                "{numero} pesaria por tabela, não por medida"
+            );
+        }
+    }
+
+    /// A mesma identidade que a medida remota provou sobre 74 cabeçalhos, agora
+    /// com este leitor abrindo o disco: `inicio_dos_dados + Σ fichas == tamanho
+    /// do arquivo`. Um `.part` baixado pela metade não fecha por definição, e é
+    /// por isso que só entram os arquivos que têm o tamanho publicado inteiro — o
+    /// veredito que se confere é o de arquivo completo.
+    #[test]
+    fn o_peso_lido_no_disco_bate_com_o_tamanho_do_arquivo() {
+        let Some(local) = std::env::var("LOCALAPPDATA").ok() else {
+            eprintln!("sem LOCALAPPDATA: nenhum GGUF do catálogo para conferir");
+            return;
+        };
+        let raiz = std::path::PathBuf::from(local).join("ai.aether.core").join("models");
+        let specs = crate::ai::catalog::todos_de_conversa()
+            .chain(crate::ai::catalog::todos_de_embeddings())
+            .collect::<Vec<_>>();
+        let mut conferidos = 0usize;
+        for spec in &specs {
+            let caminho = crate::ai::catalog::model_dir(&raiz, spec).join(spec.weights_file);
+            let Ok(metadata) = std::fs::metadata(&caminho) else { continue };
+            if metadata.len() != spec.weights_bytes {
+                continue;
+            }
+            let c = ler(&caminho).unwrap_or_else(|e| panic!("{}: {e}", caminho.display()));
+            // Pela conta que nomeia o tensor: se o catálogo oferecesse um tipo sem
+            // medida, o pânico diria qual ficha, não só que a soma saiu `None`.
+            let soma: u64 = c
+                .bytes_por_tensor()
+                .unwrap_or_else(|e| panic!("{}: {e}", caminho.display()))
+                .iter()
+                .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+            assert_eq!(c.pesos(), Some(soma), "{}: `pesos` é a dobra da conta ficha a ficha", caminho.display());
+            assert_eq!(
+                c.inicio_dos_dados.saturating_add(soma),
+                metadata.len(),
+                "{}: as {} fichas não fecham o tamanho do arquivo",
+                caminho.display(),
+                c.tensores.len()
+            );
+            conferidos += 1;
+        }
+        // Quantos foram conferidos, dito em voz alta: um "ok" com zero arquivos
+        // na mão não é evidência de nada.
+        eprintln!(
+            "{conferidos} de {} specs do catálogo têm GGUF inteiro em disco e fecharam a conta",
+            specs.len()
+        );
     }
 }

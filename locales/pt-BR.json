@@ -933,6 +933,7 @@
     "cabecalhoMagia": "o arquivo não começa com GGUF: li {magic}",
     "cabecalhoProfundidade": "o cabeçalho aninha arrays além de {max} níveis",
     "cabecalhoSemDimensoes": "o tensor {nome} declara zero dimensões, e sem forma não há peso a contar",
+    "cabecalhoTipoSemConta": "o tensor {nome} tem tipo {tipo}, que não teve bloco medido em arquivo algum: pesar o que se conhece e chamar o resto de zero faria o veredito prometer o que o arquivo não cabe",
     "cabecalhoTruncado": "{coisa} precisa de {necessario} bytes e o arquivo tem só {restante} no lugar",
     "cabecalhoTipoValor": "o cabeçalho escreve um metadado de tipo {tipo}, que o formato GGUF não define",
     "cabecalhoVersao": "li GGUF versão {versao}: este leitor confere as versões 2 e 3, e nenhum arquivo medido aqui é da {versao}",

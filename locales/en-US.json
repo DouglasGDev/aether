@@ -933,6 +933,7 @@
     "cabecalhoMagia": "the file doesn't start with GGUF: I read {magic}",
     "cabecalhoProfundidade": "the header nests arrays beyond {max} levels",
     "cabecalhoSemDimensoes": "tensor {nome} declares zero dimensions, and without a shape there are no bytes to count",
+    "cabecalhoTipoSemConta": "tensor {nome} has type {tipo}, whose block was never measured in any file: counting what is known and calling the rest zero would make the verdict promise what the file cannot fit",
     "cabecalhoTruncado": "{coisa} needs {necessario} bytes and the file has only {restante} left at that spot",
     "cabecalhoTipoValor": "the header writes metadata of type {tipo}, which the GGUF format doesn't define",
     "cabecalhoVersao": "I read GGUF version {versao}: this reader checks versions 2 and 3, and no file measured here is {versao}",

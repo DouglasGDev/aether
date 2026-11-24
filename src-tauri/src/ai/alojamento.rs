@@ -21,16 +21,18 @@
 //!   conta antiga nem de perto passava: `gemma4.attention.head_count_kv` é um
 //!   array de 48 inteiros (8 nas camadas de janela deslizante, 1 nas de atenção
 //!   cheia) e as dimensões de cabeça são 256 em umas e 512 nas outras.
-//! - **bytes de tensor**: `elementos / bloco * tamanho_do_bloco` com o dtype e a
-//!   forma que estão no cabeçalho, lidos pelo parser que o projeto já usa para
-//!   carregar os pesos. Somando os tensores do mesmo arquivo dá 2136,65 MiB, e a
-//!   carga respondeu `Vulkan0 model buffer size = 1998.84 MiB` mais
-//!   `CPU_Mapped model buffer size = 137.81 MiB` — os mesmos 2136,65 MiB.
+//! - **bytes de tensor**: `elementos / bloco * tamanho_do_bloco`, com o cabeçalho
+//!   lido por [`crate::ai::cabecalho`] e o bloco de cada tipo medido nos arquivos
+//!   oferecidos, publicado em `cabecalho::BLOCOS`. A soma sai de
+//!   `Cabecalho::bytes_por_tensor`, e um tipo sem medida é recusa que nomeia o
+//!   tensor — não um zero na soma. Somando os tensores do mesmo arquivo dá
+//!   2136,65 MiB, e a carga respondeu `Vulkan0 model buffer size = 1998.84 MiB`
+//!   mais `CPU_Mapped model buffer size = 137.81 MiB` — os mesmos 2136,65 MiB.
 
+use super::cabecalho::{self, Valor};
 use super::ggml;
 use crate::idiomas::tr;
 use anyhow::{Result, bail};
-use candle::quantized::gguf_file;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,21 +110,21 @@ pub struct Ficha {
     pub paradas: Vec<String>,
 }
 
-fn inteiro(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Option<u32> {
+fn inteiro(metadata: &HashMap<String, Valor>, chave: &str) -> Option<u32> {
     match metadata.get(chave) {
-        Some(gguf_file::Value::U32(v)) => Some(*v),
-        Some(gguf_file::Value::U64(v)) => u32::try_from(*v).ok(),
-        Some(gguf_file::Value::I32(v)) if *v >= 0 => Some(*v as u32),
+        Some(Valor::U32(v)) => Some(*v),
+        Some(Valor::U64(v)) => u32::try_from(*v).ok(),
+        Some(Valor::I32(v)) if *v >= 0 => Some(*v as u32),
         _ => None,
     }
 }
 
 fn lista_de_textos<'a>(
-    metadata: &'a HashMap<String, gguf_file::Value>,
+    metadata: &'a HashMap<String, Valor>,
     chave: &str,
-) -> Option<&'a [gguf_file::Value]> {
+) -> Option<&'a [Valor]> {
     match metadata.get(chave) {
-        Some(gguf_file::Value::Array(itens)) => Some(itens),
+        Some(Valor::Array(itens)) => Some(itens),
         _ => None,
     }
 }
@@ -131,10 +133,10 @@ fn lista_de_textos<'a>(
 /// resposta e os tokens que os nomeiam. Um arquivo sem vocabulário escrito nele
 /// devolve as partes que tem — quem chama decide o que fazer com a ausência.
 fn vocabulario(
-    metadata: &HashMap<String, gguf_file::Value>,
+    metadata: &HashMap<String, Valor>,
 ) -> (Option<String>, Vec<u32>, Vec<String>) {
     let template = match metadata.get("tokenizer.chat_template") {
-        Some(gguf_file::Value::String(t)) if !t.is_empty() => Some(t.clone()),
+        Some(Valor::String(t)) if !t.is_empty() => Some(t.clone()),
         _ => None,
     };
     let mut eos: Vec<u32> = Vec::new();
@@ -150,17 +152,17 @@ fn vocabulario(
         .iter()
         .filter_map(|id| tokens?.get(*id as usize))
         .filter_map(|v| match v {
-            gguf_file::Value::String(t) if !t.is_empty() => Some(t.clone()),
+            Valor::String(t) if !t.is_empty() => Some(t.clone()),
             _ => None,
         })
         .collect();
     (template, eos, paradas)
 }
 
-fn numero(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Result<u64> {
+fn numero(metadata: &HashMap<String, Valor>, chave: &str) -> Result<u64> {
     let valor = metadata
         .get(chave)
-        .and_then(|v| if matches!(v, gguf_file::Value::Array(_)) { None } else { Some(v) })
+        .and_then(|v| if matches!(v, Valor::Array(_)) { None } else { Some(v) })
         .and_then(contagem)
         .ok_or_else(|| anyhow::anyhow!(tr("erros.metadadoAusente", &[("chave", chave)])))?;
     Ok(valor)
@@ -168,17 +170,17 @@ fn numero(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Result<u
 
 /// Uma linha do cabeçalho lida como contagem: os inteiros que o GGUF escreve
 /// para geometria, e o `Bool` que o array de `sliding_window_pattern` usa.
-fn contagem(valor: &gguf_file::Value) -> Option<u64> {
+fn contagem(valor: &Valor) -> Option<u64> {
     match valor {
-        gguf_file::Value::U8(v) => Some(*v as u64),
-        gguf_file::Value::U16(v) => Some(*v as u64),
-        gguf_file::Value::U32(v) => Some(*v as u64),
-        gguf_file::Value::U64(v) => Some(*v),
-        gguf_file::Value::I8(v) if *v >= 0 => Some(*v as u64),
-        gguf_file::Value::I16(v) if *v >= 0 => Some(*v as u64),
-        gguf_file::Value::I32(v) if *v >= 0 => Some(*v as u64),
-        gguf_file::Value::I64(v) if *v >= 0 => Some(*v as u64),
-        gguf_file::Value::Bool(v) => Some(u64::from(*v)),
+        Valor::U8(v) => Some(*v as u64),
+        Valor::U16(v) => Some(*v as u64),
+        Valor::U32(v) => Some(*v as u64),
+        Valor::U64(v) => Some(*v),
+        Valor::I8(v) if *v >= 0 => Some(*v as u64),
+        Valor::I16(v) if *v >= 0 => Some(*v as u64),
+        Valor::I32(v) if *v >= 0 => Some(*v as u64),
+        Valor::I64(v) if *v >= 0 => Some(*v as u64),
+        Valor::Bool(v) => Some(u64::from(*v)),
         _ => None,
     }
 }
@@ -193,7 +195,7 @@ fn contagem(valor: &gguf_file::Value) -> Option<u64> {
 /// camadas de janela deslizante e 1 nas de atenção cheia. `None` é a chave
 /// ausente, que cada chamada trata do jeito que o motor trata.
 fn escalares_por_camada(
-    metadata: &HashMap<String, gguf_file::Value>,
+    metadata: &HashMap<String, Valor>,
     chave: &str,
     camadas: usize,
 ) -> Result<Option<Vec<u64>>> {
@@ -201,7 +203,7 @@ fn escalares_por_camada(
         return Ok(None);
     };
     match valor {
-        gguf_file::Value::Array(itens) => {
+        Valor::Array(itens) => {
             if itens.len() != camadas {
                 return Err(anyhow::anyhow!(tr(
                     "erros.alojamentoArray",
@@ -230,9 +232,9 @@ fn escalares_por_camada(
 /// motor também ignora array nessas chaves, porque as lê com `get_key`, e a
 /// dimensão de cabeça do Gemma 4 é a única forma que ele aceita escrita em
 /// escalar (`llama-model.cpp:1621-1648`).
-fn escalar(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Option<u64> {
+fn escalar(metadata: &HashMap<String, Valor>, chave: &str) -> Option<u64> {
     match metadata.get(chave) {
-        Some(valor) if !matches!(valor, gguf_file::Value::Array(_)) => contagem(valor),
+        Some(valor) if !matches!(valor, Valor::Array(_)) => contagem(valor),
         _ => None,
     }
 }
@@ -246,11 +248,11 @@ fn escalar(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> Option<
 /// com `il % n < n - 1`, e `n = 0` torna todas deslizantes
 /// (`llama-hparams.cpp:8-18`). Sem nenhuma das duas chaves, nada é deslizante.
 fn padrao_deslizante(
-    metadata: &HashMap<String, gguf_file::Value>,
+    metadata: &HashMap<String, Valor>,
     chave: &str,
     camadas: usize,
 ) -> Vec<bool> {
-    if let Some(gguf_file::Value::Array(itens)) = metadata.get(chave) {
+    if let Some(Valor::Array(itens)) = metadata.get(chave) {
         let mut marcas = vec![false; camadas];
         for (indice, item) in itens.iter().take(camadas).enumerate() {
             marcas[indice] = contagem(item).unwrap_or(0) != 0;
@@ -323,7 +325,7 @@ pub struct MemoriaRecurrente {
 /// 24.576 + 524.288 elementos = 2.195.456 bytes por camada, 62,8 MiB pelas 30 —
 /// constante com a janela, e é por isso que ele não entra na taxa por token.
 pub(crate) fn memoria_recorrente(
-    metadata: &HashMap<String, gguf_file::Value>,
+    metadata: &HashMap<String, Valor>,
     prefixo: &str,
     camadas: usize,
 ) -> Result<MemoriaRecurrente> {
@@ -368,7 +370,7 @@ pub(crate) fn memoria_recorrente(
 
 /// Bytes de estado recorrente que a carga abre: nada quando o arquivo é denso.
 pub(crate) fn estado_recorrente(
-    metadata: &HashMap<String, gguf_file::Value>,
+    metadata: &HashMap<String, Valor>,
     prefixo: &str,
     camadas: usize,
 ) -> Result<u64> {
@@ -384,7 +386,7 @@ pub(crate) fn estado_recorrente(
 /// (`llama-model.cpp:1573-1576`); sem `attention.key_length`, a dimensão de
 /// cabeça é `embedding_length / head_count`.
 pub(crate) fn camadas_de_cache(
-    metadata: &HashMap<String, gguf_file::Value>,
+    metadata: &HashMap<String, Valor>,
     prefixo: &str,
     camadas: usize,
 ) -> Result<Vec<CamadaKv>> {
@@ -473,48 +475,29 @@ pub fn celulas_da_janela(janela: usize) -> usize {
     janela.div_ceil(256) * 256
 }
 
-fn texto(metadata: &HashMap<String, gguf_file::Value>, chave: &str) -> String {
+fn texto(metadata: &HashMap<String, Valor>, chave: &str) -> String {
     match metadata.get(chave) {
-        Some(gguf_file::Value::String(v)) => v.clone(),
+        Some(Valor::String(v)) => v.clone(),
         _ => String::new(),
     }
 }
 
-/// Quantos bytes um tensor ocupa no arquivo: o dtype diz o tamanho do bloco e a
-/// forma diz quantos elementos há. `elementos / bloco * tamanho_do_bloco` é a
-/// conta do próprio ggml, e vale para f32/f16 também, cujo bloco é 1.
-fn bytes_do_tensor(info: &gguf_file::TensorInfo) -> u64 {
-    // As dimensões vêm do cabeçalho, que é dado de entrada não-confiável: uma
-    // forma fabricada embrulharia o produto em `u64` e o tensor pareceria
-    // minúsculo. Saturar é a direção segura — o peso deixa de existir como
-    // número falso e passa a gritar "não cabe", em vez de sorrir "cabe".
-    let elementos: u64 = info
-        .shape
-        .dims()
-        .iter()
-        .fold(1u64, |acum, d| acum.saturating_mul(*d as u64));
-    let bloco = info.ggml_dtype.block_size() as u64;
-    if bloco == 0 {
-        return 0;
-    }
-    // O ggml arredonda para cima: um tensor cujo número de elementos não é
-    // múltiplo do bloco ainda paga o bloco inteiro.
-    elementos.div_ceil(bloco).saturating_mul(info.ggml_dtype.type_size() as u64)
-}
-
 /// Os bytes de `blk.N.*` somados por camada. A camada de um tensor se lê do
 /// nome, que é o que o contêiner GGUF usa para dizer a quem o tensor pertence.
-fn por_camada(tensor_infos: &HashMap<String, gguf_file::TensorInfo>, camadas: usize) -> (Vec<u64>, u64) {
+/// O peso de cada ficha vem de `bytes_por_tensor`, que recusa o tipo sem conta
+/// medida — somar o que se conhece e chamar o resto de zero é como um veredito
+/// mentiria "cabe".
+fn por_camada(cabecalho: &cabecalho::Cabecalho, camadas: usize) -> Result<(Vec<u64>, u64)> {
+    let pesos = cabecalho.bytes_por_tensor()?;
     let mut soma = vec![0u64; camadas];
     let mut fixo = 0u64;
-    for (nome, info) in tensor_infos {
-        let bytes = bytes_do_tensor(info);
-        match camada_do_nome(nome, camadas) {
-            Some(indice) => soma[indice] = soma[indice].saturating_add(bytes),
-            None => fixo = fixo.saturating_add(bytes),
+    for (tensor, bytes) in cabecalho.tensores.iter().zip(pesos.iter()) {
+        match camada_do_nome(&tensor.nome, camadas) {
+            Some(indice) => soma[indice] = soma[indice].saturating_add(*bytes),
+            None => fixo = fixo.saturating_add(*bytes),
         }
     }
-    (soma, fixo)
+    Ok((soma, fixo))
 }
 
 fn camada_do_nome(nome: &str, camadas: usize) -> Option<usize> {
@@ -529,20 +512,8 @@ fn camada_do_nome(nome: &str, camadas: usize) -> Option<usize> {
 /// Abre o GGUF e tira dele o que a decisão precisa. Um arquivo que não é GGUF,
 /// ou a que faltam as chaves de geometria, é recusado aqui e não na tela.
 pub fn fichar(caminho: &Path) -> Result<Ficha> {
-    let aberto = std::fs::File::open(caminho).map_err(|e| {
-        anyhow::anyhow!(tr(
-            "erros.falhaLer",
-            &[("caminho", &caminho.display().to_string()), ("detalhe", &e.to_string())]
-        ))
-    })?;
-    let mut leitor = std::io::BufReader::new(aberto);
-    let cabecalho = gguf_file::Content::read(&mut leitor).map_err(|e| {
-        anyhow::anyhow!(tr(
-            "erros.alojamentoGguf",
-            &[("caminho", &caminho.display().to_string()), ("detalhe", &e.to_string())]
-        ))
-    })?;
-    let md = &cabecalho.metadata;
+    let lido = cabecalho::ler(caminho)?;
+    let md = &lido.kv;
     let arquitetura = texto(md, "general.architecture");
     if arquitetura.is_empty() {
         bail!(tr("erros.alojamentoSemArquitetura", &[]));
@@ -553,7 +524,7 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
     if camadas == 0 {
         bail!(tr("erros.alojamentoSemCamadas", &[]));
     }
-    let (camada, fixo) = por_camada(&cabecalho.tensor_infos, camadas);
+    let (camada, fixo) = por_camada(&lido, camadas)?;
     // Somar com `sum` embrulharia num arquivo fabricado; o teto em `u64::MAX` é
     // o valor honesto para "estes bytes não cabem em lugar nenhum".
     let pesos_total = camada
@@ -930,40 +901,68 @@ mod testes {
         assert_eq!(camada_do_nome("output.weight", 40), None);
     }
 
+    /// Uma ficha como o cabeçalho a escreve: o número do tipo é o que o arquivo
+    /// guarda, e a forma é o produto das dimensões.
+    fn ficha(nome: &str, dimensoes: &[u64], tipo: u32) -> cabecalho::Tensor {
+        cabecalho::Tensor {
+            nome: nome.to_string(),
+            dimensoes: dimensoes.to_vec(),
+            tipo,
+            deslocamento: 0,
+        }
+    }
+
+    fn cabecalho_de(tensores: Vec<cabecalho::Tensor>) -> cabecalho::Cabecalho {
+        cabecalho::Cabecalho {
+            versao: 3,
+            alinhamento: cabecalho::ALINHAMENTO_PADRAO,
+            inicio_dos_dados: cabecalho::ALINHAMENTO_PADRAO,
+            kv: HashMap::new(),
+            tensores,
+        }
+    }
+
     #[test]
     fn bytes_de_tensor_usam_o_bloco_do_dtype_e_arredondam_para_cima() {
-        use candle::quantized::GgmlDType;
-        let mk = |dtype: GgmlDType, dims: &[usize]| gguf_file::TensorInfo {
-            ggml_dtype: dtype,
-            shape: candle::Shape::from_dims(dims),
-            offset: 0,
-        };
         // Q4_K_M: 256 elementos por bloco de 144 bytes.
-        let q4 = mk(GgmlDType::Q4K, &[4096usize, 4096]);
-        assert_eq!(bytes_do_tensor(&q4), 4096 * 4096 / 256 * 144);
+        let q4 = ficha("blk.0.attn_q.weight", &[4096, 4096], 12);
+        assert_eq!(q4.bytes(), Some(4096 * 4096 / 256 * 144));
         // f32 é bloco de um: a conta degenera em elementos vezes o tamanho.
-        let f32 = mk(GgmlDType::F32, &[10usize, 10]);
-        assert_eq!(bytes_do_tensor(&f32), 400);
+        let f32 = ficha("t", &[10, 10], 0);
+        assert_eq!(f32.bytes(), Some(400));
         // Um tensor que não fecha o bloco inteiro paga o bloco mesmo assim.
-        let torto = mk(GgmlDType::Q4K, &[300usize, 1]);
-        assert_eq!(bytes_do_tensor(&torto), 2 * 144);
+        let torto = ficha("t", &[300, 1], 12);
+        assert_eq!(torto.bytes(), Some(2 * 144));
+        // O tipo sem conta medida não devolve zero: devolve `None`, e é isso que
+        // impede um arquivo pesado pela metade de parecer barato.
+        let sem_conta = ficha("t", &[300, 1], 9);
+        assert_eq!(sem_conta.bytes(), None);
     }
 
     #[test]
     fn por_camada_separa_o_que_e_da_placa_do_que_fica_fora() {
-        use candle::quantized::GgmlDType;
-        let mk = |dims: &[usize]| gguf_file::TensorInfo {
-            ggml_dtype: GgmlDType::F32,
-            shape: candle::Shape::from_dims(dims),
-            offset: 0,
-        };
-        let mut tensores = HashMap::new();
-        tensores.insert("blk.0.attn_q.weight".to_string(), mk(&[10usize, 10]));
-        tensores.insert("blk.1.attn_q.weight".to_string(), mk(&[10usize, 10]));
-        tensores.insert("token_embd.weight".to_string(), mk(&[4usize, 4]));
-        let (camada, fixo) = por_camada(&tensores, 2);
+        let lido = cabecalho_de(vec![
+            ficha("blk.0.attn_q.weight", &[10, 10], 0),
+            ficha("blk.1.attn_q.weight", &[10, 10], 0),
+            ficha("token_embd.weight", &[4, 4], 0),
+        ]);
+        let (camada, fixo) = por_camada(&lido, 2).unwrap();
         assert_eq!(camada, vec![400, 400]);
         assert_eq!(fixo, 64);
+    }
+
+    #[test]
+    fn um_tipo_sem_conta_recusa_a_ficha_em_vez_de_pesar_meio_arquivo() {
+        // Exatamente o caso que deixava o arquivo fora do catálogo: o candle o
+        // recusava antes de qualquer conta. Aqui ele tem conta, e o que sobra para
+        // recusar é o tipo nunca medido — que não pode virar zero na soma.
+        let lido = cabecalho_de(vec![
+            ficha("blk.0.attn_q.weight", &[10, 10], 0),
+            ficha("blk.0.attn_k.weight", &[10, 10], 140),
+        ]);
+        let erro = por_camada(&lido, 1).unwrap_err().to_string();
+        assert!(erro.contains("blk.0.attn_k.weight"), "a recusa devia nomear o tensor: {erro}");
+        assert!(erro.contains("140"), "a recusa devia dizer o número lido: {erro}");
     }
 
     #[test]
@@ -1109,17 +1108,16 @@ mod testes {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// O preço de um tipo que o leitor de cabeçalho não conhece é a ausência de
-    /// veredito, não uma conta aproximada. Os números abaixo são os do GGUF lido
-    /// dos arquivos: 8 é `q8_0` e 16 é `iq2_xxs`, e os IQ não são hipotéticos — o
-    /// `Qwen3.5-35B-A3B-Q3_K_S.gguf` tem `iq3_xxs×80` e `iq3_s×40` declarados no
-    /// próprio cabeçalho. Um `block_size` chutado para esses números diria "cabe"
-    /// sobre um arquivo que o motor não abre, e é por isto que o catálogo não
-    /// oferece as quants IQ. O controle está no mesmo teste: o mesmo cabeçalho
-    /// com um tipo que o leitor conhece (o 8) tira ficha, e a conta sai da
-    /// tabela da biblioteca — 64 elementos em `q8_0` são 2 blocos de 34 bytes.
+    /// O preço de um tipo sem bloco medido é a ausência de veredito, não uma
+    /// conta aproximada. O número abaixo que tem conta é o 16 — `iq2_xxs`, o tipo
+    /// que o leitor anterior não conhecia e que deixava os onze arquivos do
+    /// `Qwen3.5-35B-A3B` sem ficha; hoje ele pesa, e é o que devolve veredito a
+    /// eles. O 9 (`q8_1`) é o que continua de fora: o candle nomeia o tipo, mas
+    /// nenhum dos 74 arquivos lidos tensor a tensor tem um tensor dele, então não
+    /// há bloco medido — e um `block_size` chutado diria "cabe" sobre um arquivo
+    /// que ninguém pesou.
     #[test]
-    fn tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada() {
+    fn tipo_sem_bloco_medido_nao_vira_ficha_inventada() {
         let dir = std::env::temp_dir().join(format!("aether-aloj-dtype-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1129,14 +1127,19 @@ mod testes {
         let ficha = fichar(&caminho).unwrap();
         assert_eq!(ficha.pesos_total, 68, "q8_0: 64 elementos são 2 blocos de 34 bytes");
 
+        // O tipo que abria porta fechada: 64 elementos não fecham o bloco de 256,
+        // e o tensor paga o bloco inteiro — 66 bytes, como o ggml faz.
         gguf_de_vocabulario(&caminho, true, Some(16));
+        let ficha = fichar(&caminho).unwrap();
+        assert_eq!(ficha.pesos_total, 66, "iq2_xxs entra na conta em vez de recusar o arquivo");
+
+        gguf_de_vocabulario(&caminho, true, Some(9));
         let erro = fichar(&caminho)
             .err()
-            .expect("iq2_xxs não está na tabela do leitor de cabeçalho");
-        assert!(
-            erro.to_string().contains("unknown dtype for tensor 16"),
-            "o erro devia dizer qual número faltou, e dizia: {erro}"
-        );
+            .expect("q8_1 não teve bloco medido em arquivo algum");
+        let erro = erro.to_string();
+        assert!(erro.contains("blk.0.attn_q.weight"), "a recusa nomeia o tensor: {erro}");
+        assert!(erro.contains('9'), "a recusa diz o número lido: {erro}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1239,20 +1242,20 @@ mod testes {
         Bools(Vec<bool>),
     }
 
-    fn valor_de(geometria: &Geometria) -> gguf_file::Value {
+    fn valor_de(geometria: &Geometria) -> Valor {
         match geometria {
-            Geometria::Numero(v) => gguf_file::Value::U32(*v),
-            Geometria::Texto(s) => gguf_file::Value::String((*s).to_string()),
-            Geometria::Inteiros(itens) => gguf_file::Value::Array(
-                itens.iter().map(|v| gguf_file::Value::I32(*v)).collect(),
+            Geometria::Numero(v) => Valor::U32(*v),
+            Geometria::Texto(s) => Valor::String((*s).to_string()),
+            Geometria::Inteiros(itens) => Valor::Array(
+                itens.iter().map(|v| Valor::I32(*v)).collect(),
             ),
-            Geometria::Bools(itens) => gguf_file::Value::Array(
-                itens.iter().map(|v| gguf_file::Value::Bool(*v)).collect(),
+            Geometria::Bools(itens) => Valor::Array(
+                itens.iter().map(|v| Valor::Bool(*v)).collect(),
             ),
         }
     }
 
-    fn mapa_de(pares: &[(&'static str, Geometria)]) -> HashMap<String, gguf_file::Value> {
+    fn mapa_de(pares: &[(&'static str, Geometria)]) -> HashMap<String, Valor> {
         pares
             .iter()
             .map(|(chave, valor)| (chave.to_string(), valor_de(valor)))
@@ -1530,7 +1533,7 @@ mod testes {
         let mut md = mapa_de(&qwen35a3b());
         md.insert(
             "qwen35moe.attention.recurrent_layers".to_string(),
-            gguf_file::Value::Array((0..40).map(|il| gguf_file::Value::Bool(il == 0)).collect()),
+            Valor::Array((0..40).map(|il| Valor::Bool(il == 0)).collect()),
         );
         let camadas = camadas_de_cache(&md, "qwen35moe.", 40).unwrap();
         assert_eq!(camadas.iter().filter(|c| c.recorrente).count(), 1);
@@ -1618,7 +1621,7 @@ mod testes {
         let mut md = mapa_de(&gemma4());
         md.insert(
             "gemma4.attention.head_count_kv".to_string(),
-            gguf_file::Value::Array((0..47).map(|_| gguf_file::Value::I32(8)).collect()),
+            Valor::Array((0..47).map(|_| Valor::I32(8)).collect()),
         );
         let erro = camadas_de_cache(&md, "gemma4.", 48)
             .expect_err("47 entradas para 48 camadas não é uma geometria lida");
@@ -1684,7 +1687,7 @@ mod testes {
         let mut md = mapa_de(&granite());
         md.insert(
             "granite.attention.sliding_window_pattern".to_string(),
-            gguf_file::Value::U32(0),
+            Valor::U32(0),
         );
         assert_eq!(taxa_kv(&camadas_de_cache(&md, "granite.", 40).unwrap()).unwrap(), 81_920);
     }
