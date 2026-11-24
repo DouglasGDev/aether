@@ -1068,6 +1068,7 @@ mod tests {
                     total: 40,
                     na_placa: 1000,
                     em_ram: 1136,
+                    estado: 0,
                     livre: 6000,
                 },
                 cedido: 1900,

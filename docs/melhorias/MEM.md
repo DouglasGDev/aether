@@ -144,7 +144,7 @@ pasta revogada.
   todo; pegá-la sob esse guard fecharia um ciclo contra quem escreve. É por isso
   que a correção certa é a trava nova, não alargar a existente.
 
-Vermelho-primeiro: `dois_escritores_do_indice_nao_se_atropelam` (memoria.rs:2671)
+Vermelho-primeiro: `dois_escritores_do_indice_nao_se_atropelam` (memoria.rs:2672)
 semeia três arquivos, e por 150 rodadas solta dois `escrever_indice` concorrentes
 apagando arquivos diferentes, exigindo que sobre só o terceiro. Verde: 0
 perdidas. Vermelho medido com a trava retirada (sozinha, sem ela): 150 de 150

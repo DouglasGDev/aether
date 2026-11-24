@@ -856,6 +856,7 @@ mod tests {
             // camadas com as mesmas cabeças e a mesma dimensão, então a soma
             // camada a camada de `fichar` fecha neste produto.
             kv_por_token: 2 * camadas as u64 * cabecas_kv * dimensao * 2,
+            estado_recorrente: 0,
             janela_maxima: 32_768,
             template: None,
             eos: Vec::new(),

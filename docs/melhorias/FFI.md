@@ -76,7 +76,7 @@ Comandos e saídas: ver *Medições do lote* abaixo.
 
 ### Medição do arquivo real
 
-Teste `o_arquivo_real_do_codificador_sobe_inteiro_por_conta` (mod.rs:969-1021):
+Teste `o_arquivo_real_do_codificador_sobe_inteiro_por_conta` (mod.rs:967-1023):
 lê o cabeçalho do GGUF do catálogo que está em disco
 (`%LOCALAPPDATA%\ai.aether.core\models\qwen3-embedding-0.6b\Qwen3-Embedding-0.6B-Q8_0.gguf`,
 caminho montado por `catalog::find_embeddings` + `catalog::model_dir`, não
@@ -201,10 +201,10 @@ novo:
 - `Estado` ganha `despacho: Option<Despacho>` (`memoria.rs:1514`), lido do
   espelho (`memoria.rs:2112`) e nunca do lock do motor — a lição de #40 continua
   valendo: `estado()` não espera a varredura;
-- a frente espelha o contrato: `Despacho` em `types.ts:239`, `despacho` em
-  `EstadoMemoria` (`types.ts:887`);
+- a frente espelha o contrato: `Despacho` em `types.ts:240`, `despacho` em
+  `EstadoMemoria` (`types.ts:888`);
 - a **formulação** do veredito sai de dentro do `ModelManager` e vira
-  `previsao()` em `display.ts:145`. Era uma função local com as três frases
+  `previsao()` em `display.ts:147`. Era uma função local com as três frases
   (`modelos.placaInteira` / `placaDividida` / `placaSistema`); duplicá-la na tela
   de memória seria ter duas versões para a mesma conta — o mesmo motivo pelo qual
   `useJobs` e `Regua` existem. `ModelManager.tsx:24-33` agora só acrescenta a

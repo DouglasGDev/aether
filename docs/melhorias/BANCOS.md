@@ -22,7 +22,7 @@ O que faltava era a outra metade da promessa: nada, em `src/components/`,
 `src/lib/api.ts` ou `locales/`, citava o campo. `ConexaoView`
 (`src-tauri/src/commands.rs:475`) — a forma como a tela enxerga o cadastro —
 não tinha o campo, então `bancos_listar` devolvia uma conexão sem dizer se o
-canal era conferido, e `ConexaoRegistro` (`src/lib/types.ts:661`) não tinha para
+canal era conferido, e `ConexaoRegistro` (`src/lib/types.ts:686`) não tinha para
 onde levar a marcação do dono. O interruptor existia no disco e não existia na
 interface: o motor obedecía a algo que ninguém podia ligar.
 
@@ -86,7 +86,7 @@ herdada.
   não nega nada (`mysql.rs:529`).
 
 **Front**
-- `src/lib/types.ts:655` e `:672` — `tlsVerificado` em `ConexaoBanco` (o que
+- `src/lib/types.ts:680` e `:697` — `tlsVerificado` em `ConexaoBanco` (o que
   volta) e em `ConexaoRegistro` (o que vai). Obrigatório nos dois: `registro()`
   do dialog é checado pelo `tsc`, então não há como esquecer o campo em silêncio.
 - `src/components/BancosDialog.tsx:402-418` — o toggle, no lugar de sempre

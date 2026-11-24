@@ -100,12 +100,13 @@ o derrotam:
   marcam os marcadores como especiais (Granite/Qwen). Modelo repetindo turnos vai
   até max_tokens. **Correção:** detectar marcador por id de token cru, ou decodificar
   com `false` só para a detecção de parada.
-- **A3 [MED]** `router.rs:195`: candidato sem ficha devolve `(3, true)`, violando o
+- **A3 [MED]** `router.rs:195` (de antes da correção; hoje o ramo sem ficha está
+  em `:199`): candidato sem ficha devolve `(3, true)`, violando o
   invariante `:168-169` ("None nunca deve ser lido como cabe"); modelo não-medido
   passa nos filtros `cabem` e pode vencer um medido que não cabe. **Correção:**
   `(3, false)` e ranquear não-medidos por último.
 - **A4 [MED]** `alojamento.rs:256,303-304` (de antes da correção; hoje a conta é
-  `taxa_kv` em `:338` e `alojar` em `:513`): `kv_por_token` e `kv*janela`,
+  `taxa_kv` em `:445` e `alojar` em `:626`): `kv_por_token` e `kv*janela`,
   `pesos+kv+FOLGA` multiplicam metadado u32 do GGUF sem checagem; header crafted
   estoura u64 → panic em debug / wrap em release → veredito `Inteira` falso e OOM.
   **Correção:** aritmética checked, recusar no overflow.
@@ -229,7 +230,7 @@ o derrotam:
   `expect("… envenenad…")` que ainda ocorrem — `grep -rnE "expect\(\"[^\"]*envenenad"
   --include="*.rs" src-tauri/src | wc -l`, baixado de 100 na conta antiga — **16**
   estão dentro de `#[cfg(test)]` (é assim que o teste segura a trava de propósito:
-  `state.rs` :678–:830, `memoria.rs` :2573–:2711, `session.rs` :837, `config.rs`
+  `state.rs` :678–:830, `memoria.rs` :2573–:2712, `session.rs` :837, `config.rs`
   :360, `conversas.rs` :1020, `idiomas.rs` :371, todos acima da linha do
   `cfg(test)` do próprio arquivo) e **2** são comentário de doc (`contrato.rs:5`,
   `session.rs:821`). O que a frente tinha como "fechar por arquivo, não em
@@ -248,14 +249,14 @@ o derrotam:
   - a detecção era lida pela frente — `item.ficha.dora` vira o chip `aviso` em
     `AdaptadoresDialog.tsx:233-238` (a linha desta mesma seção dizia "nada fora
     de `adaptadores.rs` lê o campo": falsa hoje; `git grep -n dora -- src` devolve
-    `types.ts:933` e o dialog).
+    `types.ts:934` e o dialog).
   - no **crate**, `git grep -n dora -- 'src-tauri/src' ':!src-tauri/src/ai/adaptadores.rs' ':!src-tauri/src/voz'`
     devolve **zero linhas** (medido nesta passagem, e continua zero: quem lê o
     flag é o próprio módulo): a carga não olhava para ele, e um DoRA entrava pelo
     mesmo caminho de um LoRA comum sem que nada registrasse a diferença. É
     exatamente isso que fecha aqui — `LE_MAGNITUDE` (`ggml/mod.rs:159-172`)
     declara o que a biblioteca lê, com o próprio binário como instrumento
-    (`ggml/mod.rs:1023-1067`), e `Item::magnitude_fora` (`adaptadores.rs:341-372`)
+    (`ggml/mod.rs:1025-1069`), e `Item::magnitude_fora` (`adaptadores.rs:341-372`)
     grava por adaptador aplicado que a normalização ficou de fora. A linha da
     tela para de dizer "Na placa" a seco: diz "Na placa, sem magnitude".
   - o que a nota da tela alega sobre a biblioteca foi **medido no binário** dele,
@@ -321,7 +322,7 @@ vermelho-primeiro, o que foi medido e o que ficou pendente):
 - `FRONT.md` — F1 a F6. Verde.
 - `CORE.md` — A2 a A7 todos na árvore. O agente de CORE parou no meio por
   estouro de limite de crédito (só A2 e A5 ficaram dele); o maintainer fechou
-  A4 (`alojamento.rs:338,513`), A3 (`router.rs:199`), A6 (`session.rs:499,710`)
+  A4 (`alojamento.rs:445,626`), A3 (`router.rs:199`), A6 (`session.rs:499,710`)
   e A7 (`chat.rs:330`), cada um com o vermelho-primeiro rodado antes do verde.
   Chaves i18n novas do lote: `erros.alojamentoEstouro`, `erros.pensamentoTruncado`,
   `erros.motorSemPlaca`, nos dois idiomas.
@@ -472,9 +473,9 @@ aplicativo. Quatro buracos de honestidade no Rust e quatro correções na casca.
   é lido do fonte das crates.
 - **SONDAS** — `engine_probe` usava `unwrap_or` para ter número onde o motor não
   devolveu medida: a VRAM "cedida" saía de um palpite e a régua de recorte do KV
-  idem. Agora `cedido` é `Option` (`bin/engine_probe.rs:311`, `src/bin/`, não
+  idem. Agora `cedido` é `Option` (`bin/engine_probe.rs:321`, `src/bin/`, não
   `bin/`) e imprime `não medida`, e a rodada 3 **recusa** em vez de medir quando o
-  motor não declara o cache ocupado (`:1424`). Uma régua inventada aceita o que
+  motor não declara o cache ocupado (`:1434`). Uma régua inventada aceita o que
   não deveria.
 - **VOZ** — o último aviso de `dead code` do crate era o `prefixo` que `remessas`
   calculava e somava por fora. Fechado na causa (`voz/baixar.rs:110`):
@@ -625,7 +626,7 @@ lido a nota no binário. Li. Dossiê em `DORA.md`.
   normalização ficou de fora. O motor não mudou uma linha: `usar_adaptadores`
   responde `aplicada`/`erro`, e quem tem a ficha para interpretar isso é o
   `adaptadores`. O pin órfão passa pela mesma função, não por um `false` copiado.
-- **A capacidade virou instrumento.** `ai/ggml/mod.rs:1023-1067` lê o
+- **A capacidade virou instrumento.** `ai/ggml/mod.rs:1025-1069` lê o
   `llama.dll` vendorizado byte a byte: os dois símbolos com que a ponte fala
   têm de estar no arquivo (sem eles a comparação seria um ponteiro LFS ou outra
   release), e os três nomes de tensor de magnitude não podem estar. Clone sem
@@ -731,11 +732,10 @@ de cada arquivo.
 
 Fora do alcance e registrado como tal, em `CATALOGO.md`: a carga dos pesos novos
 na placa (a conta de `kv_por_token` fechou na passagem #106 — `camadas_de_cache`
-e `taxa_kv` leem o array de geometria como o b12387; o que continua **teto** são
-as 24 camadas recorrentes do `qwen35`, que pagam como atenção porque o estado
-recorrente não é KV cache), qualidade de texto e custo por rodada, e o que o laço
-de ferramentas entrega num Gemma 4, cujo template usa marcadores próprios e não o
-XML que o parser lê.
+e `taxa_kv` leem o array de geometria como o b12387; o que ali ficou como **teto**
+eram as 24 camadas recorrentes do `qwen35`, e a passagem #107 as tirou do teto),
+qualidade de texto e custo por rodada, e o que o laço de ferramentas entrega num
+Gemma 4, cujo template usa marcadores próprios e não o XML que o parser lê.
 
 Gates desta passagem: `cd src-tauri && cargo test --lib` → **567 passaram, 0
 falharam, 11 ignored, finished in 5,92 s**; `cargo test --lib catalog` → **27
@@ -743,3 +743,70 @@ passaram, 0 falharam**; `cargo check --all-targets` → **Finished, zero avisos*
 `npm run build` → **OK, `✓ built in 250 ms`**, maior bloco `react` a 210,53 kB.
 README: a linha do catálogo passou de "35 variantes em duas famílias" para o que
 existe hoje.
+
+## Passagem do maintainer sobre a décima leva (medido 2026-11-24)
+
+Frente de conta, um escritor: `ai/alojamento.rs`, com o número novo atravessando
+roteador, fio, tela e sonda. Dossiê em `CATALOGO.md`, seção #107. Nenhum peso
+foi baixado, nenhuma DLL foi carregada, nenhum aplicativo foi aberto.
+
+- **A fila virou outra frente por medição.** O item em espera era o downloader de
+  GGUF em partes. Lido o fonte do b12387 vendorizado, a `llama.dll` já junta os
+  splits sozinha — `llama_get_list_splits` em `llama-model-loader.cpp:84` e o
+  ramo `n_split > 1` que abre o primeiro `-of-0000N` em `:604-635` —, então não
+  faltava loader, faltava só o arquivo. E o único repositório em partes ao
+  alcance anônimo, o `GLM-5.3-Flash` UD-Q4_K_XL, são 6 arquivos ≈ 200 GB: não
+  cabem na placa de 16 GB nem na prova. O adiamento ficou registrado com o
+  motivo medido, não como pendência aberta.
+- **O defeito estava no `taxa_kv`.** Cobrando K e V de toda camada `propria`, um
+  `qwen35moe` de 40 camadas pagava 81.920 por token quando o motor abre cache em
+  dez: 20.480. São as 30 camadas de atenção linear, que no b12387 entram em
+  `filter_attn = il < n_layer && !is_recr(il)` (`llama-model.cpp:3332-3338`) e
+  por isso não chegam ao `llama_kv_cache`. O mesmo cabeçalho, lido por rede, deu
+  a regra: `full_attention_interval = 4`, `ssm.conv_kernel` 4, `ssm.state_size`
+  128, `ssm.group_count` 16, `ssm.inner_size` 4096 e **nenhuma** chave
+  `attention.recurrent_layers` — então o período vem do intervalo, como em
+  `qwen35.cpp:17-22`.
+- **O que elas gastam em vez de cache também entrou.** `memoria_recorrente` lê as
+  cinco chaves do gated delta net e devolve o mapa de recorrentes mais o custo de
+  uma camada — `(conv-1) × (inner + 2 × grupo × estado) + estado × inner`, em
+  f32 (`llama-hparams.cpp:229` e `:257`, tipos em `llama-model.cpp:3368-3370`) —
+  e `n_rs_seq = 0` (`llama-context.cpp:4421`) é o que faz ser uma linha por
+  sequência, fixa com a janela. O veredito agora desconta esse estado do orçamento
+  da placa antes de empilhar camada, o roteador soma estado na conta de RAM do
+  caso sem placa, e a sonda conta estado no esperado do delta de VRAM.
+- **Os quatro números conferidos em teste:** A3B 20.480 por token e 65.863.680
+  bytes (62,83 MiB) de estado; Qwen3.5-4B 32.768 e 52.690.944 (50,25 MiB);
+  Granite 81.920 e estado 0, Gemma 4 344.064 e estado 0. Que os densos não tenham
+  se movido é metade do teste — os 320,00 MiB do Granite em 4096 continuam
+  batendo com o que a biblioteca escreveu na carga.
+- **Vermelho medido por mutação, duas mutações revertidas.** Tirar
+  `&& !c.recorrente` de `taxa_kv` derruba 4 testes e deixa 30 verdes; tirar
+  `.saturating_add(estado)` do predicado de `Inteira` em `alojar` derruba 1 e
+  deixa 33 verdes — é o teste que distingue o número que decide do número que
+  enfeita.
+- **As citações voltaram a apontar para a árvore.** Crescer `alojamento.rs`,
+  `router.rs`, `engine_probe.rs`, `memoria.rs`, `ggml/mod.rs`, `types.ts` e
+  `display.ts` moveu os `arquivo:linha` dos dossiês, e cada um foi re-lido na
+  árvore de hoje: `CORE.md` tem `taxa_kv` em 445, `alojar` em 626,
+  `bytes_do_tensor` em 486, `por_camada` em 507 e o teste do candidato sem ficha
+  em 620; `MEM.md` tem `dois_escritores_do_indice_nao_se_atropelam` em 2672;
+  `FFI.md` tem o teste do arquivo real em 967-1023, `Despacho` em `types.ts:240`,
+  `despacho` em `types.ts:888` e `previsao()` em `display.ts:147`; `DORA.md` tem
+  a capacidade lida do binário em 1025-1069 e `magnitudeFora` em `types.ts:951`;
+  `BANCOS.md` tem `tlsVerificado` em `types.ts:680` e `:697`; e aqui mesmo
+  `router.rs:195` passou a dizer onde o ramo está hoje (`:199`) e as sondas
+  voltaram para `engine_probe.rs:321` e `:1434`.
+
+Fora do alcance e registrado como tal, em `CATALOGO.md`: o estado recorrente
+**em carga** — os 62,83 MiB do A3B saem da fórmula aplicada ao cabeçalho, e quem
+os confere é `engine_probe alojar:` com o peso no disco, o que pede placa e
+aplicativo aberto; a entrada do `Qwen3.5-35B-A3B` no catálogo, que ainda não tem
+como dizer honestamente que uma `UD-Q4_K_XL` é a quant que o portão do binário
+reconhece; `swa_full = false`; e o veredito de chamada de ferramenta por família.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **582 passaram, 0
+falharam, 11 ignored, finished in 4,91 s**; `cargo test --lib alojamento` → **34
+passaram, 0 falharam**; `cargo check --all-targets` → **Finished em 3,57 s, zero
+avisos**; `npm run build` → **OK, `✓ built in 173 ms`**, maior bloco `react` a
+210,53 kB.

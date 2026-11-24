@@ -79,7 +79,7 @@ e o aplicativo aberto volta a ser o portão (pendência 1).
 
 ### Instrumento, não frase
 
-- `ai/ggml/mod.rs:1023-1067` — `a_dll_vendorizada_e_a_que_esta_capacidade_descreve`
+- `ai/ggml/mod.rs:1025-1069` — `a_dll_vendorizada_e_a_que_esta_capacidade_descreve`
   lê o `llama.dll` e confronta o binário com `LE_MAGNITUDE`. Os dois símbolos da
   ponte precisam estar no arquivo (sem eles a comparação não valeria nada: seria
   um ponteiro LFS ou outra release); os três nomes de tensor de magnitude não
@@ -96,8 +96,8 @@ e o aplicativo aberto volta a ser o portão (pendência 1).
 
 ### Frente
 
-- `src/lib/types.ts:950` — `magnitudeFora: boolean` no `ItemAdaptador`, e o
-  comentário do `dora` da ficha (`:930-932`) corrigido: a biblioteca não recusa
+- `src/lib/types.ts:951` — `magnitudeFora: boolean` no `ItemAdaptador`, e o
+  comentário do `dora` da ficha (`:931-933`) corrigido: a biblioteca não recusa
   tensor nenhum, ela monta os pares e deixa a magnitude de fora.
 - `src/components/AdaptadoresDialog.tsx:273-289` — a linha de estado: aplicado
   com magnitude fora deixa de dizer "Na placa" e diz **"Na placa, sem

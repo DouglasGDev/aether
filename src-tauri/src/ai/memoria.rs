@@ -2624,6 +2624,7 @@ mod testes {
                 total: 24,
                 na_placa: 4 << 30,
                 em_ram: 2 << 30,
+                estado: 0,
                 livre: 5 << 30,
             }),
             motivo: None,

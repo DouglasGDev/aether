@@ -204,7 +204,12 @@ fn posto(c: &Candidato, hardware: &Hardware, pedida: usize) -> (u8, bool) {
         Alojamento::Dividida { camadas, em_ram, .. } => {
             (if camadas > 0 { 1 } else { 2 }, em_ram <= hardware.available_ram_bytes)
         }
-        Alojamento::SoSistema { pesos, kv } => (2, pesos + kv <= hardware.available_ram_bytes),
+        // Sem placa, o estado recorrente também vira RAM: é reserva da carga,
+        // fixa por sequência, do mesmo lado da conta que os pesos.
+        Alojamento::SoSistema { pesos, kv, estado } => (
+            2,
+            pesos.saturating_add(kv).saturating_add(estado) <= hardware.available_ram_bytes,
+        ),
     }
 }
 
@@ -217,9 +222,15 @@ fn situacao(c: &Candidato, hardware: &Hardware, pedida: usize) -> String {
     };
     let janela = janela_efetiva(c, pedida);
     match super::alojamento::alojar(ficha, hardware.placa.as_ref(), janela) {
-        Alojamento::Inteira { pesos, kv, .. } => tr(
-            "roteador.naPlaca",
-            &[("pesos", &gibs(pesos)), ("kv", &gibs(kv))],
+        // O estado recorrente é a reserva fixa das camadas de atenção linear:
+        // ele não é cache por token, então só aparece na frase quando existe.
+        Alojamento::Inteira { pesos, kv, estado, .. } => tr(
+            if estado > 0 { "roteador.naPlacaEstado" } else { "roteador.naPlaca" },
+            &[
+                ("pesos", &gibs(pesos)),
+                ("kv", &gibs(kv)),
+                ("estado", &gibs(estado)),
+            ],
         ),
         Alojamento::Dividida { camadas, total, na_placa, em_ram, .. } => {
             let passo = gibs(media_da_camada(ficha));
@@ -234,9 +245,13 @@ fn situacao(c: &Candidato, hardware: &Hardware, pedida: usize) -> String {
                 ],
             )
         }
-        Alojamento::SoSistema { pesos, kv } => tr(
-            "roteador.noSistema",
-            &[("pesos", &gibs(pesos)), ("kv", &gibs(kv))],
+        Alojamento::SoSistema { pesos, kv, estado } => tr(
+            if estado > 0 { "roteador.noSistemaEstado" } else { "roteador.noSistema" },
+            &[
+                ("pesos", &gibs(pesos)),
+                ("kv", &gibs(kv)),
+                ("estado", &gibs(estado)),
+            ],
         ),
     }
 }
@@ -397,6 +412,7 @@ mod tests {
             camada: vec![20 * MIB; 40],
             fixo: 2136 * MIB - 40 * 20 * MIB,
             kv_por_token: 2 * 40 * 8 * 64 * 2,
+            estado_recorrente: 0,
             janela_maxima: 131_072,
             template: None,
             eos: vec![100257],
@@ -413,6 +429,7 @@ mod tests {
             camada: vec![116 * MIB; 40],
             fixo: 5099 * MIB - 40 * 116 * MIB,
             kv_por_token: 2 * 40 * 8 * 128 * 2,
+            estado_recorrente: 0,
             janela_maxima: 131_072,
             template: None,
             eos: vec![100257],

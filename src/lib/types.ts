@@ -214,16 +214,17 @@ export interface ModelStatus {
 /// livre medida antes da carga. Os nomes vêm do serde do núcleo, que pineia as
 /// três formas em `alojamento.rs`.
 export type Alojamento =
-  | { tipo: "inteira"; pesos: number; kv: number; livre: number }
+  | { tipo: "inteira"; pesos: number; kv: number; estado: number; livre: number }
   | {
       tipo: "dividida";
       camadas: number;
       total: number;
       naPlaca: number;
       emRam: number;
+      estado: number;
       livre: number;
     }
-  | { tipo: "soSistema"; pesos: number; kv: number };
+  | { tipo: "soSistema"; pesos: number; kv: number; estado: number };
 
 export interface Alojado {
   previsto: Alojamento;

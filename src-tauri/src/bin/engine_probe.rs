@@ -246,7 +246,11 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
         mib(ficha.fixo),
         mib(media_da_camada(&ficha))
     );
-    println!("kv: {} por token", mib(ficha.kv_por_token));
+    println!(
+        "memória: {} de kv por token + {} de estado recorrente fixo",
+        mib(ficha.kv_por_token),
+        mib(ficha.estado_recorrente)
+    );
 
     let pastas = dlls();
     let cap = capacidade(&pastas)?;
@@ -263,23 +267,26 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
     for janela in janelas {
         let veredito = alojar(&ficha, cap.as_ref(), *janela);
         match veredito {
-            Alojamento::Inteira { pesos, kv, livre } => println!(
-                "  janela {janela}: INTEIRA na placa (pesos {} + kv {} = {} de {} livres)",
+            Alojamento::Inteira { pesos, kv, estado, livre } => println!(
+                "  janela {janela}: INTEIRA na placa (pesos {} + kv {} + estado {} = {} de {} livres)",
                 mib(pesos),
                 mib(kv),
-                mib(pesos + kv),
+                mib(estado),
+                mib(pesos + kv + estado),
                 mib(livre)
             ),
-            Alojamento::Dividida { camadas, total, na_placa, em_ram, livre } => println!(
-                "  janela {janela}: DIVIDIDA — {camadas}/{total} camadas na placa ({}), resto em RAM ({}) | livre {}",
+            Alojamento::Dividida { camadas, total, na_placa, em_ram, estado, livre } => println!(
+                "  janela {janela}: DIVIDIDA — {camadas}/{total} camadas na placa ({}, estado {} em f32), resto em RAM ({}) | livre {}",
                 mib(na_placa),
+                mib(estado),
                 mib(em_ram),
                 mib(livre)
             ),
-            Alojamento::SoSistema { pesos, kv } => println!(
-                "  janela {janela}: SÓ SISTEMA (pesos {}, kv {})",
+            Alojamento::SoSistema { pesos, kv, estado } => println!(
+                "  janela {janela}: SÓ SISTEMA (pesos {}, kv {}, estado {})",
                 mib(pesos),
-                mib(kv)
+                mib(kv),
+                mib(estado)
             ),
         }
     }
@@ -297,9 +304,12 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
     let veredito = alojar(&ficha, cap.as_ref(), context);
     let camadas = despacho(&veredito);
     let kv = ficha.kv_por_token * celulas_da_janela(context) as u64;
+    // O estado recorrente é reserva fixa da placa, não proporcional à janela:
+    // entra no esperado do delta mesmo quando o modelo divide as camadas.
+    let estado = ficha.estado_recorrente;
     let na_placa = match veredito {
-        Alojamento::Inteira { pesos, .. } => pesos + kv,
-        Alojamento::Dividida { na_placa, .. } => na_placa + kv,
+        Alojamento::Inteira { pesos, .. } => pesos + kv + estado,
+        Alojamento::Dividida { na_placa, .. } => na_placa + kv + estado,
         Alojamento::SoSistema { .. } => 0,
     };
     let inicio = Instant::now();

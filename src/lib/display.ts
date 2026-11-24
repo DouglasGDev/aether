@@ -141,22 +141,35 @@ export function medida(linha: VistaPar, idioma: string): string {
 
 /// As palavras do veredito de alojamento. Uma só versão porque o gerenciador de
 /// modelos e a tela de memória mostram a mesma conta — duas formulações do mesmo
-/// número é como uma delas envelhece torto.
+/// número é como uma delas envelhece torto. A variante `Estado` é a dos arquivos
+/// híbridos: o estado recorrente das camadas de atenção linear é fixo por
+/// sequência e não cabe dentro da palavra "cache" do caso denso.
 export function previsao(
   previsto: Alojamento,
   traduzir: Traduzir,
   idioma: string,
 ): string {
   return previsto.tipo === "inteira"
-    ? traduzir("modelos.placaInteira", {
-        pesos: bytes(previsto.pesos, idioma),
-        kv: bytes(previsto.kv, idioma),
-      })
+    ? traduzir(
+        previsto.estado > 0 ? "modelos.placaInteiraEstado" : "modelos.placaInteira",
+        {
+          pesos: bytes(previsto.pesos, idioma),
+          kv: bytes(previsto.kv, idioma),
+          estado: bytes(previsto.estado, idioma),
+        },
+      )
     : previsto.tipo === "dividida"
       ? traduzir("modelos.placaDividida", {
           camadas: inteiro(previsto.camadas, idioma),
           total: inteiro(previsto.total, idioma),
           emRam: bytes(previsto.emRam, idioma),
         })
-      : traduzir("modelos.placaSistema", { pesos: bytes(previsto.pesos, idioma) });
+      : traduzir(
+          previsto.estado > 0 ? "modelos.placaSistemaEstado" : "modelos.placaSistema",
+          {
+            pesos: bytes(previsto.pesos, idioma),
+            kv: bytes(previsto.kv, idioma),
+            estado: bytes(previsto.estado, idioma),
+          },
+        );
 }

@@ -139,14 +139,112 @@ Medido nos cabeçalhos reais, lidos por `Range` do `resolve/main` nesta passagem
 | --- | --- | --- | --- | --- |
 | `gemma-4-12b-it-Q4_K_M` | 48 (40 deslizantes, 8 cheias) | array: 8 naquelas, 1 nestas | 256/256 e 512/512 | 344.064 |
 | `granite-4.2-3b-Q4_K_M` | 40 | 8 (escalar) | 64, pelo padrão 2560/40 | 81.920 |
-| `Qwen3.5-4B-Q4_K_M` | 32 (24 recorrentes, 8 de atenção) | 4 (escalar) | 256 | 131.072, como **teto** |
+| `Qwen3.5-4B-Q4_K_M` | 32 (24 recorrentes, 8 de atenção) | 4 (escalar) | 256 | 32.768, lido depois da correção #107 |
 
 O `gemma4.attention.shared_kv_layers` do arquivo é `0` — as camadas que leem o
 cache de outra ainda não aparecem nos pesos que entraram, e estão pinadas em
-teste para o dia em que aparecerem. As 24 camadas recorrentes do `qwen35`
-continham fora da conta: o estado delas existe e não é medido aqui, então o
-número cobra-as como se fossem de atenção. Conservador por construção, como
-estava registrado.
+teste para o dia em que aparecerem.
+
+> **O que esta linha escreveu e #107 desfez.** O registro original fechava o
+> `Qwen3.5-4B` em 131.072 "como teto", porque as 24 camadas recorrentes pagavam
+> cache como se fossem de atenção. Elas não pagam: `llama-memory-hybrid.cpp`
+> entrega ao `llama_kv_cache` o `filter_attn = !is_recr(il)`, e o que aquelas
+> camadas abrem é um estado recorrente fixo. O número real é 32.768 por token
+> mais 52.690.944 bytes de estado — a passagem #107, abaixo, é quem mede isso.
+
+## FEITO — #107: a camada de atenção linear não paga cache; paga estado
+
+A correção nasceu de uma frente que ia ser outra. O follow-up 1 desta página
+pedia um downloader de pesos em partes para baixar um MoE de 2026 que coubesse
+na placa; medido o repositório, as partes do `unsloth/GLM-5.3-Flash-GGUF` somam
+≈200 GB e a `llama.dll` b12387 já abre split sozinha (`llama-model-loader.cpp:84`
+`llama_get_list_splits`, `:604-635`, com as strings `of-%05d` e `invalid split
+count` presentes nos 3.877.376 bytes do binário). Sem valor presente, a frente
+virou o que estava no caminho: o `unsloth/Qwen3.5-35B-A3B-GGUF`, que é de arquivo
+único, tem as quants cabendo em disco — e é híbrido.
+
+Medido no cabeçalho dele (`Range` do `resolve/main`, 52 pares, 733 tensores):
+
+```
+general.architecture = qwen35moe        qwen35moe.block_count = 40
+qwen35moe.attention.head_count = 16     qwen35moe.attention.head_count_kv = 2
+qwen35moe.attention.key_length = 256    qwen35moe.attention.value_length = 256
+qwen35moe.full_attention_interval = 4   qwen35moe.embedding_length = 2048
+qwen35moe.ssm.conv_kernel = 4           qwen35moe.ssm.state_size = 128
+qwen35moe.ssm.group_count = 16          qwen35moe.ssm.time_step_rank = 32
+qwen35moe.ssm.inner_size = 4096         qwen35moe.context_length = 262144
+```
+
+e no censo de tensores do mesmo arquivo: `attn_k|q|v(.norm)` em 10 camadas,
+`ssm_conv1d|ssm_a|ssm_beta…` em 30. As 40 nunca tiveram K e V; 30 delas não têm
+nem camada de atenção.
+
+A regra, lida do b12387 antes de virar conta:
+
+| fato | onde |
+| --- | --- |
+| recorrente vem de `attention.recurrent_layers`; sem a chave, `(il + 1) % intervalo != 0` com intervalo 4 por padrão | `qwen35.cpp:17-22`, `qwen35moe.cpp:19-25` |
+| o gated delta net é obrigatório nas cinco chaves `ssm.*` — sem elas a arquitetura não é híbrida | `qwen35.cpp:9-13`, `qwen35moe.cpp:11-15` |
+| o cache de KV recebe `filter_attn = il < n_layer && !is_recr(il)` | `llama-model.cpp:3332-3338`, `llama-memory-hybrid.cpp` |
+| o estado por camada recorrente é `(conv-1) × (inner + 2 × grupo × estado) + estado × inner`, em f32, uma linha por sequência | `llama-hparams.cpp:229` e `:257`, tipos em `llama-model.cpp:3368-3370`, `n_rs_seq = 0` em `llama-context.cpp:4421` |
+
+O que mudou em código:
+
+- `CamadaKv` ganhou `recorrente` (`alojamento.rs:289`) e `taxa_kv` (`:445`) soma
+  só quem é `propria && !recorrente` — as 30 lineares saem do número por token.
+- `memoria_recorrente` (`:325`) lê as chaves `ssm.*` e o padrão das camadas, com
+  cada produto `checked`; `estado_recorrente` (`:370`) multiplica pelo número de
+  camadas recorrentes. Um cabeçalho sem as quatro chaves do gated delta net não
+  é híbrido e continua cobrando cache de tudo — a regra vem do arquivo, não de
+  uma lista de arquiteturas.
+- `Ficha.estado_recorrente` (`:93`) é preenchido por `fichar` e entra no veredito:
+  `Alojamento` leva `estado` nos três casos (`:598-620`), `alojar` (`:626`)
+  desconta o estado do orçamento da placa antes de empilhar camadas, e o roteador
+  soma o estado na conta de RAM do caso sem placa (`router.rs:209`).
+- O fio ganhou `estado` nas três formas, pinado byte a byte em
+  `as_tres_formas_do_veredito_sao_camelcase_no_wire`, e o `types.ts` espelha.
+- Quatro chaves i18n novas, nos dois idiomas, só para o caso em que o estado
+  existe: `modelos.placaInteiraEstado`, `modelos.placaSistemaEstado`,
+  `roteador.naPlacaEstado`, `roteador.noSistemaEstado`. Um arquivo denso segue
+  lendo a frase de sempre — número zero não é medida, é ruído. Na frase nova do
+  caso sem placa o cache também entrou: o `Alojamento::SoSistema` já devolviam
+  `kv` e a tela de modelos nunca o mostrou, nem no híbrido nem no denso — o que
+  fica aberto está nos follow-ups, como omissão antiga e não como conta nova.
+- `engine_probe alojar:` passou a imprimir os dois juntos
+  (`bin/engine_probe.rs:249-253`) e a contar o estado no esperado do delta de
+  VRAM (`:309-313`), que é a metade que só a placa fecha.
+
+Os números que a conta agora devolve, cada um conferido em teste:
+
+| arquivo | cache por token | estado por sequência |
+| --- | --- | --- |
+| `Qwen3.5-35B-A3B` (40 camadas, 10 de atenção) | 20.480 — eram 81.920, **4×** | 65.863.680 bytes = 62,83 MiB (30 × 2.195.456) |
+| `Qwen3.5-4B` (32 camadas, 8 de atenção) | 32.768 — eram 131.072, **4×** | 52.690.944 bytes = 50,25 MiB (24 × 2.195.456) |
+| `granite-4.2-3b` (denso) | 81.920, inalterado | 0 |
+| `gemma-4-12b-it` (deslizante, não híbrido) | 344.064, inalterado | 0 |
+
+Que o denso não se moveu é metade do teste: os 320,00 MiB do Granite na janela de
+4096 continuam saindo iguais aos que a biblioteca escreveu na carga.
+
+Vermelho medido por mutação, duas mutações, cada uma revertida:
+
+- tirando `&& !c.recorrente` de `taxa_kv` — ou seja, voltando ao comportamento de
+  antes — caem `as_camadas_lineares_nao_pagam_cache_e_o_estado_ocupa_o_lugar_delas`,
+  `a_um_hibrido_de_32_camadas_o_estado_sobe_com_elas`,
+  `a_chave_de_camadas_recorrentes_manda_no_periodo` e
+  `a_ficha_hibrida_sai_do_cabecalho_escrito_e_entra_na_conta` (4 falhas, 30
+  verdes: nenhum teste de arquivo denso ou deslizante se moveu).
+- tirando `.saturating_add(estado)` do predicado de `Inteira` em `alojar` cai
+  `o_estado_recorrente_nao_cresce_com_a_janela_e_muda_o_veredito` (1 falha, 33
+  verdes) — é o teste que distingue o número que entra na decisão do número que
+  só enfeita a tela.
+
+Gates desta passagem: `cd src-tauri && cargo test --lib` → **582 passaram, 0
+falharam, 11 ignored, finished in 4,91 s** (eram 575; 7 testes novos em
+`alojamento.rs`, que passou a 34 — `cargo test --lib alojamento` → **34 passaram,
+0 falharam**); `cargo check --all-targets` → **Finished em 3,57 s, zero avisos**;
+`npm run build` → **OK, `✓ built in 173 ms`**, maior bloco `react` a 210,53 kB.
+
 
 Os dois números que fecham a prova:
 
@@ -184,22 +282,25 @@ Nada aqui rodou. O que falta é placa, e placa é o portão que a instrução de
 não abrir o app mantém fechado:
 
 1. **Alojamento real.** Os `bytes` são o tamanho do arquivo, e o veredito de
-   quantas camadas sobem sai de `alojamento::alojar` com a VRAM livre medida na
-   hora. Nenhum dos GGUFs novos passou pela placa. O que a passagem #106 fechou
-   foi a conta: `camadas_de_cache` (`alojamento.rs:287-324`) e `taxa_kv`
-   (`:338-351`) agora leem `head_count_kv`, `sliding_window_pattern`,
-   `key_length_swa` e `shared_kv_layers` como o b12387 os lê, e o 344.064 do
-   Gemma 4 é aritmética conferida em teste, não medida em carga. O que continua
-   **teto**, e por um motivo escrito no código: as 24 camadas recorrentes do
-   `qwen35` pagam como se fossem de atenção, porque o estado de uma camada
-   recorrente não é KV cache e não está conta nenhuma. Conferir os dois é
-   `engine_probe alojar:` com o peso em disco — a sonda imprime a taxa por token
-   (`engine_probe.rs:249`) e o previsto na placa ao lado do delta real de VRAM.
+   quantas camadas sobem sai de `alojamento::alojar` (`:626`) com a VRAM livre
+   medida na hora. Nenhum dos GGUFs novos passou pela placa. O que #106 e #107
+   fecharam foi a conta: `camadas_de_cache` (`:386`) e `taxa_kv` (`:445`) leem
+   `head_count_kv`, `sliding_window_pattern`, `key_length_swa` e
+   `shared_kv_layers` como o b12387 os lê, `memoria_recorrente` (`:325`) e
+   `estado_recorrente` (`:370`) leem o gated delta net, e os 344.064 do Gemma 4
+   como os 20.480 do A3B são aritmética conferida em teste, não medida em carga.
+   O que continua **não medido** é o estado recorrente em carga: os 62,83 MiB do
+   A3B e os 50,25 MiB do 4B saem da fórmula do `llama_memory_recurrent` aplicada
+   ao cabeçalho, e o que os confirma é `engine_probe alojar:` com o peso em disco
+   — a sonda imprime os dois (`bin/engine_probe.rs:249-253`) e o delta real de
+   VRAM ao lado do previsto (`:309-313`). Um estado que a carga abrir menor que
+   isto não é erro de conta, é a biblioteca tendo mudado a regra: é ela que a
+   sonda tem de pegar.
 2. **A qualidade do texto e o custo por rodada** (tokens de entrada e saída,
    t/s) — medição de turno, placa, aplicativo aberto.
 3. **Chamada de ferramenta no Gemma 4.** O laço do Aether não lê a gramática do
-   template: ele define a sua, em `chat.rs:241-246` (abertura de chamada, nome
-   de função e parâmetros em XML), e `inicio_de_chamada` (mesmo arquivo, `:254`)
+   template: ele define a sua, em `chat.rs:242-247` (abertura de chamada, nome
+   de função e parâmetros em XML), e `inicio_de_chamada` (mesmo arquivo, `:255`)
    escreve essa gramática como continuação forçada — `session.rs:513` é o ponto
    que a injeta. O que o modelo viu no treino é a gramática do próprio template,
    e no Gemma 4 ela é diferente. Se a continuação forçada chega para governar o
@@ -227,16 +328,39 @@ revertidas; o diff do arquivo fecha em 133 linhas adicionadas e 7 removidas.
 
 ## Follow-ups
 
-1. **Downloader de pesos em partes** (multi-shard) — sem ele, GLM-5.3-Flash e
-   qualquer quant >48 GB ficam fora. É trabalho em `ai/download.rs`, com a
-   conferência por sha256 de cada parte e a junção antes do `rename`.
-2. **`swa_full` desligado, se um dia valer a pena** — #106 mediu que a chave de
+1. **Downloader de pesos em partes (multi-shard) — adiado com medida, não com
+   palpite.** O registro anterior dizia "sem ele, GLM-5.3-Flash e qualquer quant
+   >48 GB ficam fora". Medido nesta passagem: a `llama.dll` b12387 já abre split
+   sozinha (`llama-model-loader.cpp:84`, `:604-635`), então o que falta é só o
+   download das partes — mas as seis partes do `unsloth/GLM-5.3-Flash-GGUF`
+   UD-Q4_K_XL somam ≈200 GB, e as quants do `Qwen3.5-35B-A3B`, que é o híbrido
+   grande que a conta nova sabe medir, são arquivo único. Baixar 200 GB para
+   rodar o que não cabe em 16 GiB de placa nem em desta máquina não é trabalho
+   pendente, é trabalho sem valor presente. Volta a ter valor quando houver um
+   repositório dividido cujo arquivo caiba, e o caminho é `ai/download.rs`: a
+   conferência por sha256 de cada parte antes da junção, e o `rename` só depois
+   de todas elas estarem conferidas.
+2. **`Qwen3.5-35B-A3B` no catálogo** — as três quants single-file medidas no
+   `tree/main` (UD-IQ2_XXS 10.656.955.008, UD-Q2_K_XL 12.156.754.560, Q3_K_S
+   15.265.856.128, cada uma com o `lfs.oid` na mão) e a arquitetura `qwen35moe`
+   presente na tabela da DLL. O que segura a entrada não é tamanho: as etiquetas
+   `UD-*` da unsloth são nomes de editor para quant mista, não tipos ggml, e o
+   gate `quants_are_all_implemented_by_the_engine` (`catalog.rs:624`) compara com
+   uma lista fechada dos 16 tipos que o motor implementa. Entrar com elas exige
+   dizer no catálogo o que a etiqueta significa, em vez de fingir que é um tipo.
+3. **`swa_full` desligado, se um dia valer a pena** — #106 mediu que a chave de
    janela deslizante não reduz nada com o padrão da biblioteca
    (`swa_full = true`), e há 40 das 48 camadas do Gemma 4 nesse caso. Ligar o
    contrário (`p.swa_full = false` em `ggml/ffi.rs:454-459`) encurta o cache, mas
    muda o que a atenção vê fora da janela — é escolha de qualidade, e o que a
    decide é medição com a placa, não conta de cabeçalho.
-3. **Veredito de ferramenta por família** — medir, com a placa, quais das
+4. **Veredito de ferramenta por família** — medir, com a placa, quais das
    famílias do catálogo conseguem entregar uma chamada no formato que o laço
    parseia, e dizer isso na tela em vez de deixar a pessoa descobrir no meio de
    um turno.
+5. **`modelos.placaSistema` continua sem dizer o cache** — o
+   `Alojamento::SoSistema` devolve `pesos`, `kv` e `estado`, e a frase do arquivo
+   denso na tela de modelos só mostra `pesos`, embora o `kv` da janela também
+   morde na RAM (#107 pôs o cache na frase nova do híbrido; a antiga é anterior e
+   ficou como estava). É uma frase para ajustar, não uma conta para refazer, e o
+   mesmo `previsao` de `display.ts` fecha os dois.

@@ -67,7 +67,10 @@ Vulkan é a porta única para NVIDIA, AMD e Intel — não há SDK de fabricante
 meio. Antes de carregar qualquer modelo, `src-tauri/src/ai/alojamento.rs` lê a VRAM livre
 e decide entre carga inteira na placa, camada a camada dividida com a RAM, ou só
 sistema; o veredito vira `n_gpu_layers` e é conferido contra o delta real de
-VRAM que a carga produz.
+VRAM que a carga produz. Num arquivo híbrido — Qwen3.5, Ornith — a conta lê o
+cabeçalho camada a camada: as camadas de atenção linear não pagam cache por
+token, pagam um estado recorrente fixo por sequência, e é esse estado que entra
+no orçamento da placa junto com os pesos.
 
 Os binários do llama.cpp e do sherpa-onnx não estão no repositório: são 46 MB de
 pacotes de outros projetos. **O aplicativo instala o runtime sozinho** — a tela

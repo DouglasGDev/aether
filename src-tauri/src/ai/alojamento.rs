@@ -83,8 +83,14 @@ pub struct Ficha {
     /// normalizações. Fica do lado de fora da conta de camadas porque é isso que
     /// a biblioteca faz quando a placa aperta.
     pub fixo: u64,
-    /// Bytes de KV cache por token, no dtype que o flash attention usa.
+    /// Bytes de KV cache por token, no dtype que o flash attention usa. Só as
+    /// camadas que abrem cache entram aqui; o que uma camada de atenção linear
+    /// guarda não cresce com a janela e está em `estado_recorrente`.
     pub kv_por_token: u64,
+    /// Bytes do estado recorrente das camadas de atenção linear, para uma
+    /// sequência. É constante: 0 num modelo denso, e no `Qwen3.5-35B-A3B` os
+    /// 62,8 MiB das suas 30 camadas de gated delta net.
+    pub estado_recorrente: u64,
     /// A janela que o arquivo declara — o teto do que o modelo aceita.
     pub janela_maxima: usize,
     /// O template de conversa que o próprio arquivo publica. É o que a biblioteca
@@ -276,6 +282,99 @@ pub struct CamadaKv {
     /// que `attention.shared_kv_layers` declara para as últimas N camadas
     /// (`src/models/gemma4.cpp:11-18` do b12387).
     propria: bool,
+    /// `true` é a camada de atenção linear: ela não abre cache de KV nenhum,
+    /// porque o que ela guarda é um estado recorrente de tamanho fixo —
+    /// `estado_recorrente` abaixo. A camada continua existindo e continuando
+    /// paga pelos próprios pesos.
+    recorrente: bool,
+}
+
+/// A parte recorrente da memória de um cabeçalho: quais camadas são de atenção
+/// linear e quanto custa o estado de uma delas.
+pub struct MemoriaRecurrente {
+    recorrentes: Vec<bool>,
+    /// Bytes do estado (`cache_r` + `cache_s`) de uma camada recorrente, para uma
+    /// sequência. `0` é o arquivo que não tem camada recorrente alguma.
+    bytes_por_camada: u64,
+}
+
+/// Camadas recorrentes, como o motor as marca.
+///
+/// Um arquivo só tem camada recorrente quando declara as chaves do gated
+/// delta net — `ssm.conv_kernel`, `ssm.inner_size`, `ssm.state_size` e
+/// `ssm.group_count` — que `qwen35.cpp:9-13` e `qwen35moe.cpp:11-15` lêem como
+/// obrigatórias. Sem elas a arquitetura não é híbrida e nenhuma camada deixa de
+/// pagar KV, o que vale para o granite e para o gemma4 como vale para qualquer
+/// denso: a regra é lida do arquivo, não de uma lista de arquiteturas.
+///
+/// Tendo-as, o padrão vem de `attention.recurrent_layers` (um array, ou um
+/// número para todas) e, na falta dela, do período `full_attention_interval`,
+/// cujo padrão ausente é 4: recorrente é a camada em que `(il + 1) % intervalo
+/// != 0`, ou seja, a última de cada grupo é a única com atenção
+/// (`qwen35.cpp:17-22`, `qwen35moe.cpp:19-25`). Medido no censo de tensores do
+/// `Qwen3.5-35B-A3B-UD-Q4_K_XL`: 40 camadas, 10 com `attn_k.weight`, 30 com
+/// `ssm_conv1d.weight`.
+///
+/// O estado é o que a biblioteca aloja por camada recorrente, em f32
+/// (`GGML_TYPE_F32` para R e S em `llama-model.cpp:3368-3369`), com uma linha por
+/// sequência e `n_rs_seq = 0` (`llama-context.cpp:4421`, e o aplicativo não toca
+/// nele): `n_embd_r = (conv - 1) × (inner + 2 × grupo × estado)` e
+/// `n_embd_s = estado × inner` (`llama-hparams.cpp:229` e `:257`). No A3B são
+/// 24.576 + 524.288 elementos = 2.195.456 bytes por camada, 62,8 MiB pelas 30 —
+/// constante com a janela, e é por isso que ele não entra na taxa por token.
+pub(crate) fn memoria_recorrente(
+    metadata: &HashMap<String, gguf_file::Value>,
+    prefixo: &str,
+    camadas: usize,
+) -> Result<MemoriaRecurrente> {
+    let chave = |s: &str| format!("{prefixo}{s}");
+    let algumas = |nomes: &[&str]| nomes.iter().all(|n| metadata.contains_key(&chave(n)));
+    let do_gdn = [
+        "ssm.conv_kernel",
+        "ssm.inner_size",
+        "ssm.state_size",
+        "ssm.group_count",
+    ];
+    if !algumas(&do_gdn) {
+        return Ok(MemoriaRecurrente { recorrentes: vec![false; camadas], bytes_por_camada: 0 });
+    }
+    let recorrentes = match escalares_por_camada(metadata, &chave("attention.recurrent_layers"), camadas)? {
+        Some(marcas) => marcas.into_iter().map(|v| v != 0).collect(),
+        None => {
+            let intervalo = escalar(metadata, &chave("full_attention_interval")).unwrap_or(4);
+            (0..camadas)
+                .map(|il| if intervalo == 0 { true } else { (il as u64 + 1) % intervalo != 0 })
+                .collect()
+        }
+    };
+    let conv = numero(metadata, &chave("ssm.conv_kernel"))?;
+    let inner = numero(metadata, &chave("ssm.inner_size"))?;
+    let estado = numero(metadata, &chave("ssm.state_size"))?;
+    let grupo = numero(metadata, &chave("ssm.group_count"))?;
+    // `checked` aqui é o que separa um número honesto de um cabeçalho fabricado
+    // que passaria a cobrar estado de uma camada que não existe.
+    let elementos = conv
+        .checked_sub(1)
+        .and_then(|menos| menos.checked_mul(inner.checked_add(2u64.checked_mul(grupo)?.checked_mul(estado)?)?))
+        .and_then(|r| r.checked_add(estado.checked_mul(inner)?))
+        .ok_or_else(|| anyhow::anyhow!(tr("erros.alojamentoEstouro", &[])))?;
+    Ok(MemoriaRecurrente {
+        recorrentes,
+        bytes_por_camada: elementos
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!(tr("erros.alojamentoEstouro", &[])))?,
+    })
+}
+
+/// Bytes de estado recorrente que a carga abre: nada quando o arquivo é denso.
+pub(crate) fn estado_recorrente(
+    metadata: &HashMap<String, gguf_file::Value>,
+    prefixo: &str,
+    camadas: usize,
+) -> Result<u64> {
+    let memoria = memoria_recorrente(metadata, prefixo, camadas)?;
+    let quantas = memoria.recorrentes.iter().filter(|recorrente| **recorrente).count() as u64;
+    checked_or_estouro(memoria.bytes_por_camada.checked_mul(quantas))
 }
 
 /// A geometria de cache de um cabeçalho, camada a camada.
@@ -313,32 +412,40 @@ pub(crate) fn camadas_de_cache(
     // As últimas `shared_kv_layers` camadas não abrem cache próprio.
     let compartilhadas = escalar(metadata, &chave("attention.shared_kv_layers")).unwrap_or(0) as usize;
     let primeira_de_saida = camadas.saturating_sub(compartilhadas);
+    let recorrentes = memoria_recorrente(metadata, prefixo, camadas)?.recorrentes;
     Ok((0..camadas)
         .map(|indice| CamadaKv {
             cabecas: cabecas_kv[indice],
             k: if deslizante[indice] { k_deslizante } else { k_cheia },
             v: if deslizante[indice] { v_deslizante } else { v_cheia },
             propria: indice < primeira_de_saida,
+            recorrente: recorrentes[indice],
         })
         .collect())
 }
 
-/// O custo de KV por token: a soma do que cada camada aloja, vezes os 2 bytes do
-/// f16 com que a biblioteca escreve K e V por padrão (`type_k`/`type_v` em
-/// `llama_context_default_params`, `llama-context.cpp:4415`).
+/// O custo de KV por token: a soma do que cada camada de atenção aloja, vezes os
+/// 2 bytes do f16 com que a biblioteca escreve K e V por padrão (`type_k`/`type_v`
+/// em `llama_context_default_params`, `llama-context.cpp:4415`).
 ///
-/// As células entram aqui como uma contagem por token porque o aplicativo deixa
-/// `swa_full` no padrão da biblioteca — `true` — e com ele uma camada de janela
-/// deslizante reserva a janela inteira, como a de atenção cheia. É este o número
-/// que a tela mostra e o veredito obedece; mudar aquele padrão é o que faria a
-/// janela deslizante custar menos, e isso é uma decisão de produto, não de conta.
+/// Ficam fora desta soma as camadas que não abrem cache: a que lê o cache de
+/// outra (`shared_kv_layers`) e a de atenção linear, que não tem K nem V — no
+/// `Qwen3.5-35B-A3B` são 30 das 40, e é `llama-memory-hybrid.cpp` quem filtra: o
+/// `llama_kv_cache` recebe `filter_attn = !is_recr(il)` e o estado dessas camadas
+/// vai para o `llama_memory_recurrent`, que é o `estado_recorrente` acima. Cobrar
+/// KV delas era o que fazia o número da tela sair 4× acima do que a placa abre.
+///
+/// As células de quem tem janela deslizante continuam sendo a janela inteira,
+/// porque o aplicativo deixa `swa_full` no padrão da biblioteca — `true`. É este
+/// o número que a tela mostra e o veredito obedece; mudar aquele padrão é decisão
+/// de produto, não de conta.
 ///
 /// Cada produto é `checked`: um cabeçalho fabricado que embrulhasse viraria um
 /// KV barato de mentira, e a placa juraria caber o modelo inteiro.
 fn taxa_kv(camadas: &[CamadaKv]) -> Result<u64> {
     const BYTES_POR_ELEMENTO: u64 = 2;
     let mut total = 0u64;
-    for camada in camadas.iter().filter(|c| c.propria) {
+    for camada in camadas.iter().filter(|c| c.propria && !c.recorrente) {
         let elementos = camada
             .k
             .checked_add(camada.v)
@@ -454,15 +561,16 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         .fold(0u64, |acum, bytes| acum.saturating_add(*bytes))
         .saturating_add(fixo);
     let (template, eos, paradas) = vocabulario(md);
-    // O KV por token é a soma do que cada camada aloja, camada a camada, com as
-    // chaves e os padrões do motor — `camadas_de_cache` acima. Numa arquitetura
-    // híbrida (parte das camadas com estado recorrente em vez de atenção, como
-    // `qwen35` declara com `full_attention_interval`) o número continua teto, não
-    // conta exata: o estado recorrente dessas camadas existe, é constante por
-    // sequência, e não está aqui; no lugar dele entra o que a camada pagaria se
-    // fosse de atenção. Fica conservador por construção, e o que confere o número
-    // é o delta real de VRAM que a carga produz — `engine-probe alojar:`.
+    // O KV por token é a soma do que cada camada de atenção aloja, camada a
+    // camada, com as chaves e os padrões do motor — `camadas_de_cache` acima. As
+    // camadas de atenção linear ficam de fora dessa soma por um motivo lido no
+    // fonte: elas não abrem cache de K nem de V (`llama-memory-hybrid.cpp`, com
+    // `filter_attn = !is_recr(il)`), e o que guardem é o estado fixo que
+    // `estado_recorrente` conta logo abaixo. Um arquivo híbrido cujo estado
+    // faltasse na conta sairia barato demais — é desta direção que o teto
+    // anterior protegia, e é por isso que os dois números andam juntos aqui.
     let kv_por_token = taxa_kv(&camadas_de_cache(md, &prefixo, camadas)?)?;
+    let estado_recorrente = estado_recorrente(md, &prefixo, camadas)?;
     Ok(Ficha {
         arquivo: caminho.display().to_string(),
         arquitetura,
@@ -471,6 +579,7 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
         camada,
         fixo,
         kv_por_token,
+        estado_recorrente,
         janela_maxima: numero(md, &chave("context_length")).unwrap_or(0) as usize,
         template,
         eos,
@@ -487,11 +596,14 @@ pub fn fichar(caminho: &Path) -> Result<Ficha> {
     tag = "tipo"
 )]
 pub enum Alojamento {
-    /// Cabe inteiro: pesos, KV da janela e folga dentro da VRAM livre medida.
+    /// Cabe inteiro: pesos, KV da janela, estado recorrente e folga dentro da
+    /// VRAM livre medida.
     Inteira {
         /// Bytes de peso que vão para a placa.
         pesos: u64,
         kv: u64,
+        /// Bytes do estado das camadas de atenção linear — 0 num modelo denso.
+        estado: u64,
         livre: u64,
     },
     /// Não cabe: `camadas` de `total` vão para a placa e o resto fica em RAM. É
@@ -501,10 +613,11 @@ pub enum Alojamento {
         total: usize,
         na_placa: u64,
         em_ram: u64,
+        estado: u64,
         livre: u64,
     },
     /// Sem placa nesta máquina: tudo fica do lado do sistema.
-    SoSistema { pesos: u64, kv: u64 },
+    SoSistema { pesos: u64, kv: u64, estado: u64 },
 }
 
 /// O veredito para uma janela pedida. `janela` é o que o aplicativo vai pedir,
@@ -519,16 +632,27 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
         return Alojamento::SoSistema {
             pesos: ficha.pesos_total,
             kv: ficha.kv_por_token.saturating_mul(celulas_da_janela(janela) as u64),
+            estado: ficha.estado_recorrente,
         };
     };
     let kv = ficha.kv_por_token.saturating_mul(celulas_da_janela(janela) as u64);
-    if ficha.pesos_total.saturating_add(kv).saturating_add(FOLGA_DE_COMPUTACAO) <= cap.livre {
-        return Alojamento::Inteira { pesos: ficha.pesos_total, kv, livre: cap.livre };
+    let estado = ficha.estado_recorrente;
+    if ficha
+        .pesos_total
+        .saturating_add(kv)
+        .saturating_add(estado)
+        .saturating_add(FOLGA_DE_COMPUTACAO)
+        <= cap.livre
+    {
+        return Alojamento::Inteira { pesos: ficha.pesos_total, kv, estado, livre: cap.livre };
     }
     // O orçamento da placa, tirado o que ela é obrigada a guardar para si: o KV
-    // da janela e a folga do grafo. As camadas entram de cima para baixo, que é
-    // a ordem em que a biblioteca empilha quando falta memória.
-    let orcamento = cap.livre.saturating_sub(kv.saturating_add(FOLGA_DE_COMPUTACAO));
+    // da janela, o estado dos que não têm janela e a folga do grafo. As camadas
+    // entram de cima para baixo, que é a ordem em que a biblioteca empilha quando
+    // falta memória.
+    let orcamento = cap
+        .livre
+        .saturating_sub(kv.saturating_add(estado).saturating_add(FOLGA_DE_COMPUTACAO));
     let mut usados = 0u64;
     let mut postas = 0usize;
     for bytes in ficha.camada.iter().rev() {
@@ -543,6 +667,7 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
         total: ficha.camadas,
         na_placa: usados,
         em_ram: ficha.pesos_total.saturating_sub(usados),
+        estado,
         livre: cap.livre,
     }
 }
@@ -617,6 +742,10 @@ mod testes {
             camada: vec![20 * 1024 * 1024; 40],
             fixo: 2136 * 1024 * 1024 - 40 * 20 * 1024 * 1024,
             kv_por_token: 2 * 40 * 8 * 64 * 2,
+            // Granite é denso: nenhuma camada é de atenção linear, então o
+            // estado recorrente é zero — e é assim que ele deve aparecer num
+            // cabeçalho sem as chaves `ssm.*`.
+            estado_recorrente: 0,
             janela_maxima: 131072,
             template: None,
             eos: vec![100257],
@@ -779,9 +908,12 @@ mod testes {
     fn sem_placa_a_resposta_e_sistema_e_sem_chute_de_vram() {
         let ficha = ficha_granite();
         match alojar(&ficha, None, 4096) {
-            Alojamento::SoSistema { pesos, kv } => {
+            Alojamento::SoSistema { pesos, kv, estado } => {
                 assert_eq!(pesos, ficha.pesos_total);
                 assert_eq!(kv, ficha.kv_por_token * 4096);
+                // Granite é denso: o estado é a conta que o arquivo híbrido
+                // acrescenta, e num denso ele tem de ser zero, não um chute.
+                assert_eq!(estado, 0);
             }
             other => panic!("sem placa só existe o caso de sistema, veio {other:?}"),
         }
@@ -849,8 +981,8 @@ mod testes {
     fn as_tres_formas_do_veredito_sao_camelcase_no_wire() {
         let json = |a: &Alojamento| serde_json::to_string(a).unwrap();
         assert_eq!(
-            json(&Alojamento::Inteira { pesos: 2240, kv: 335, livre: 15_360 }),
-            r#"{"tipo":"inteira","pesos":2240,"kv":335,"livre":15360}"#
+            json(&Alojamento::Inteira { pesos: 2240, kv: 335, estado: 613, livre: 15_360 }),
+            r#"{"tipo":"inteira","pesos":2240,"kv":335,"estado":613,"livre":15360}"#
         );
         assert_eq!(
             json(&Alojamento::Dividida {
@@ -858,13 +990,14 @@ mod testes {
                 total: 40,
                 na_placa: 3132,
                 em_ram: 1967,
+                estado: 613,
                 livre: 4096,
             }),
-            r#"{"tipo":"dividida","camadas":27,"total":40,"naPlaca":3132,"emRam":1967,"livre":4096}"#
+            r#"{"tipo":"dividida","camadas":27,"total":40,"naPlaca":3132,"emRam":1967,"estado":613,"livre":4096}"#
         );
         assert_eq!(
-            json(&Alojamento::SoSistema { pesos: 2240, kv: 335 }),
-            r#"{"tipo":"soSistema","pesos":2240,"kv":335}"#
+            json(&Alojamento::SoSistema { pesos: 2240, kv: 335, estado: 613 }),
+            r#"{"tipo":"soSistema","pesos":2240,"kv":335,"estado":613}"#
         );
     }
 
@@ -967,8 +1100,8 @@ mod testes {
     fn um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira() {
         // O defeito: `kv_por_token * janela` embrulha em u64 num release, o KV
         // parece zero e a placa juraria caber um modelo que nunca caberia. A
-        // conta é a linha 304 do `alojar`, exercida direto, com uma ficha armada
-        // à mão para o estouro (a `fichar` real já recusaria este cabeçalho).
+        // conta é o `saturating_mul` de `alojar`, exercida direto, com uma ficha
+        // armada à mão para o estouro (a `fichar` real já recusaria este cabeçalho).
         let impossivel = Ficha {
             arquivo: "impossivel.gguf".to_string(),
             arquitetura: "granite".to_string(),
@@ -978,6 +1111,7 @@ mod testes {
             fixo: 2136 * 1024 * 1024 - 40 * 20 * 1024 * 1024,
             // 1 << 63 vezes uma janela de 2 = 1 << 64: embrulha em zero.
             kv_por_token: 1u64 << 63,
+            estado_recorrente: 0,
             janela_maxima: 131072,
             template: None,
             eos: vec![100257],
@@ -1166,6 +1300,29 @@ mod testes {
         ]
     }
 
+    /// `Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`, lido do cabeçalho do próprio arquivo
+    /// (Range sobre o LFS, 52 pares): o híbrido de 40 camadas em que só 10 têm
+    /// atenção — as outras 30 são gated delta net, marcadas pelo período 4, não
+    /// por um array. É o caso que a conta antiga pagava cache por todas.
+    fn qwen35a3b() -> Vec<(&'static str, Geometria)> {
+        vec![
+            ("general.architecture", Geometria::Texto("qwen35moe")),
+            ("qwen35moe.block_count", Geometria::Numero(40)),
+            ("qwen35moe.embedding_length", Geometria::Numero(2048)),
+            ("qwen35moe.context_length", Geometria::Numero(262_144)),
+            ("qwen35moe.attention.head_count", Geometria::Numero(16)),
+            ("qwen35moe.attention.head_count_kv", Geometria::Numero(2)),
+            ("qwen35moe.attention.key_length", Geometria::Numero(256)),
+            ("qwen35moe.attention.value_length", Geometria::Numero(256)),
+            ("qwen35moe.full_attention_interval", Geometria::Numero(4)),
+            ("qwen35moe.ssm.conv_kernel", Geometria::Numero(4)),
+            ("qwen35moe.ssm.state_size", Geometria::Numero(128)),
+            ("qwen35moe.ssm.group_count", Geometria::Numero(16)),
+            ("qwen35moe.ssm.time_step_rank", Geometria::Numero(32)),
+            ("qwen35moe.ssm.inner_size", Geometria::Numero(4096)),
+        ]
+    }
+
     #[test]
     fn o_gemma4_paga_cada_camada_pelo_que_a_camada_aloja() {
         let camadas = camadas_de_cache(&mapa_de(&gemma4()), "gemma4.", 48).unwrap();
@@ -1198,6 +1355,194 @@ mod testes {
         assert_eq!(taxa, 81_920);
         assert_eq!(taxa * celulas_da_janela(4096) as u64, 335_544_320);
         assert_eq!(taxa * 4096 / 1048576, 320);
+    }
+
+    /// O defeito que esta conta fecha: as camadas de atenção linear não abrem
+    /// KV cache nenhum — `llama-memory-hybrid.cpp` entrega ao `llama_kv_cache` o
+    /// `filter_attn = !is_recr(il)` — e cobrá-las como se tivessem K e V fazia a
+    /// placa jurar 4× mais cache do que ela reserva.
+    #[test]
+    fn as_camadas_lineares_nao_pagam_cache_e_o_estado_ocupa_o_lugar_delas() {
+        let md = mapa_de(&qwen35a3b());
+        let camadas = camadas_de_cache(&md, "qwen35moe.", 40).unwrap();
+        assert_eq!(camadas.iter().filter(|c| c.recorrente).count(), 30);
+        // A última camada de cada grupo de 4 é a única com atenção: 3, 7, 11 …
+        for (il, camada) in camadas.iter().enumerate() {
+            assert_eq!(camada.recorrente, (il + 1) % 4 != 0, "camada {il}");
+        }
+        let taxa = taxa_kv(&camadas).unwrap();
+        assert_eq!(taxa, 20_480);
+        // Cobrar K e V também das 30 lineares dava 81.920 por token — o quádruplo
+        // exato, que é o número que a tela mostrava e o motivo pelo qual camadas
+        // que a placa segura eram mandadas para a RAM.
+        let se_todas_pagassem: u64 = camadas
+            .iter()
+            .filter(|c| c.propria)
+            .map(|c| (c.k + c.v) * c.cabecas * 2)
+            .sum();
+        assert_eq!(se_todas_pagassem, 81_920);
+        assert_eq!(taxa * 4, se_todas_pagassem);
+        // O estado é o que a biblioteca abre no lugar do cache: (conv-1)×(inner +
+        // 2×grupo×estado) + estado×inner, em f32 — 2.195.456 bytes por camada.
+        let memoria = memoria_recorrente(&md, "qwen35moe.", 40).unwrap();
+        assert_eq!(memoria.bytes_por_camada, 2_195_456);
+        assert_eq!(estado_recorrente(&md, "qwen35moe.", 40).unwrap(), 65_863_680);
+    }
+
+    #[test]
+    fn o_estado_recorrente_nao_cresce_com_a_janela_e_muda_o_veredito() {
+        let md = mapa_de(&qwen35a3b());
+        let estado = estado_recorrente(&md, "qwen35moe.", 40).unwrap();
+        let ficha = Ficha {
+            arquivo: "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf".to_string(),
+            arquitetura: "qwen35moe".to_string(),
+            camadas: 40,
+            pesos_total: 12 * 1024 * 1024 * 1024,
+            camada: vec![12 * 1024 * 1024 * 1024 / 40; 40],
+            fixo: 0,
+            kv_por_token: taxa_kv(&camadas_de_cache(&md, "qwen35moe.", 40).unwrap()).unwrap(),
+            estado_recorrente: estado,
+            janela_maxima: 262_144,
+            template: None,
+            eos: vec![],
+            paradas: vec![],
+        };
+        // A placa justa para os pesos, o KV de 4096 e a folga — e nada de estado.
+        let kv = ficha.kv_por_token * celulas_da_janela(4096) as u64;
+        let justa = Capacidade {
+            placa: "AMD Radeon RX 9060 XT".to_string(),
+            livre: ficha.pesos_total + kv + FOLGA_DE_COMPUTACAO,
+            total: 16 * 1024 * 1024 * 1024,
+        };
+        // Sem estado, esta placa é o caso inteiro; com ele, falta um grão e o
+        // veredito desce para dividido. É assim que o número entra na decisão em
+        // vez de só enfeitar a tela.
+        let denso = Ficha { estado_recorrente: 0, ..ficha.clone() };
+        assert!(matches!(
+            alojar(&denso, Some(&justa), 4096),
+            Alojamento::Inteira { .. }
+        ));
+        match alojar(&ficha, Some(&justa), 4096) {
+            Alojamento::Dividida { estado, .. } => assert_eq!(estado, 65_863_680),
+            other => panic!("com estado, a placa justa não cabe inteira: {other:?}"),
+        }
+        // E o estado é o mesmo de 4096 a 131072: reserva fixa por sequência, não
+        // proporcional à janela — é por isso que ele não entra na taxa por token.
+        let folgada = Capacidade {
+            livre: ficha.pesos_total
+                + ficha.kv_por_token * celulas_da_janela(131_072) as u64
+                + estado
+                + FOLGA_DE_COMPUTACAO,
+            ..justa
+        };
+        for janela in [4096, 32_768, 131_072] {
+            match alojar(&ficha, Some(&folgada), janela) {
+                Alojamento::Inteira { estado, .. } => assert_eq!(estado, 65_863_680, "janela {janela}"),
+                other => panic!("com a placa folgada tudo cabe inteira, veio {other:?}"),
+            }
+        }
+    }
+
+    /// `Qwen3.5-4B-Q4_K_M.gguf`, a entrada que já está no catálogo: 32 camadas
+    /// com cabeças de KV 4 e o mesmo gated delta net do A3B, lidos do cabeçalho.
+    fn qwen35_4b() -> Vec<(&'static str, Geometria)> {
+        vec![
+            ("general.architecture", Geometria::Texto("qwen35")),
+            ("qwen35.block_count", Geometria::Numero(32)),
+            ("qwen35.embedding_length", Geometria::Numero(2560)),
+            ("qwen35.context_length", Geometria::Numero(262_144)),
+            ("qwen35.attention.head_count", Geometria::Numero(16)),
+            ("qwen35.attention.head_count_kv", Geometria::Numero(4)),
+            ("qwen35.attention.key_length", Geometria::Numero(256)),
+            ("qwen35.attention.value_length", Geometria::Numero(256)),
+            ("qwen35.full_attention_interval", Geometria::Numero(4)),
+            ("qwen35.ssm.conv_kernel", Geometria::Numero(4)),
+            ("qwen35.ssm.state_size", Geometria::Numero(128)),
+            ("qwen35.ssm.group_count", Geometria::Numero(16)),
+            ("qwen35.ssm.time_step_rank", Geometria::Numero(32)),
+            ("qwen35.ssm.inner_size", Geometria::Numero(4096)),
+        ]
+    }
+
+    #[test]
+    fn a_um_hibrido_de_32_camadas_o_estado_sobe_com_elas() {
+        let md = mapa_de(&qwen35_4b());
+        let camadas = camadas_de_cache(&md, "qwen35.", 32).unwrap();
+        assert_eq!(camadas.iter().filter(|c| !c.recorrente).count(), 8);
+        // A linha da tabela do catálogo: 32.768 por token, e não os 131.072 que
+        // a conta cobrava pelas 32 camadas inteiras.
+        assert_eq!(taxa_kv(&camadas).unwrap(), 32_768);
+        // O mesmo gated delta net do A3B: 2.195.456 bytes por camada, por 24
+        // delas = 50,25 MiB de estado fixo por sequência.
+        assert_eq!(estado_recorrente(&md, "qwen35.", 32).unwrap(), 52_690_944);
+    }
+
+    #[test]
+    fn a_chave_de_camadas_recorrentes_manda_no_periodo() {
+        // O motor consulta `attention.recurrent_layers` primeiro; tendo-a, o
+        // período não é lido (`qwen35.cpp:17-22`). O arquivo do A3B não traz a
+        // chave, mas um exportador que traga não pode ser aproximado pelo 4.
+        let mut md = mapa_de(&qwen35a3b());
+        md.insert(
+            "qwen35moe.attention.recurrent_layers".to_string(),
+            gguf_file::Value::Array((0..40).map(|il| gguf_file::Value::Bool(il == 0)).collect()),
+        );
+        let camadas = camadas_de_cache(&md, "qwen35moe.", 40).unwrap();
+        assert_eq!(camadas.iter().filter(|c| c.recorrente).count(), 1);
+        assert_eq!(taxa_kv(&camadas).unwrap(), 39 * (256 + 256) * 2 * 2);
+        assert_eq!(estado_recorrente(&md, "qwen35moe.", 40).unwrap(), 2_195_456);
+    }
+
+    #[test]
+    fn sem_a_chave_de_periodo_o_padrao_do_motor_e_quatro() {
+        let mut md = mapa_de(&qwen35a3b());
+        md.remove("qwen35moe.full_attention_interval");
+        // 4 é o padrão do próprio motor, então o A3B sem a chave marca as mesmas
+        // 30 camadas — não é um chute nosso, é a linha 18 de `qwen35.cpp`.
+        let memoria = memoria_recorrente(&md, "qwen35moe.", 40).unwrap();
+        assert_eq!(memoria.recorrentes.iter().filter(|r| **r).count(), 30);
+        // Com 8 camadas o mesmo período dá 6 lineares e 2 de cache.
+        let oito = memoria_recorrente(&md, "qwen35moe.", 8).unwrap();
+        assert_eq!(
+            oito.recorrentes,
+            vec![true, true, true, false, true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn um_arquivo_denso_nao_abre_estado_recorrente() {
+        // A regra é lida do cabeçalho, não de uma lista de arquiteturas: sem as
+        // chaves do gated delta net, nenhuma camada deixa de pagar cache.
+        let md = mapa_de(&granite());
+        assert_eq!(estado_recorrente(&md, "granite.", 40).unwrap(), 0);
+        let camadas = camadas_de_cache(&md, "granite.", 40).unwrap();
+        assert!(camadas.iter().all(|c| !c.recorrente));
+        assert_eq!(taxa_kv(&camadas).unwrap(), 81_920);
+        // Metade das chaves não é híbrido: o motor nem carregaria o arquivo, e a
+        // conta não pode passar a cobrar estado de uma camada que ele não declara.
+        let sem_inner = {
+            let mut md = mapa_de(&qwen35a3b());
+            md.remove("qwen35moe.ssm.inner_size");
+            md
+        };
+        assert_eq!(estado_recorrente(&sem_inner, "qwen35moe.", 40).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_ficha_hibrida_sai_do_cabecalho_escrito_e_entra_na_conta() {
+        // O caminho inteiro: os bytes são GGUF v3 de verdade, o parser é o do
+        // candle (o da carga), e a ficha que sai deles é a que o veredito obedece.
+        let dir = std::env::temp_dir().join(format!("aether-aloj-hibrido-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caminho = dir.join("qwen35moe.gguf");
+        escreve_gguf(&caminho, &qwen35a3b());
+        let ficha = fichar(&caminho).expect("um cabeçalho híbrido deve ser medido");
+        assert_eq!(ficha.camadas, 40);
+        assert_eq!(ficha.janela_maxima, 262_144);
+        assert_eq!(ficha.kv_por_token, 20_480);
+        assert_eq!(ficha.estado_recorrente, 65_863_680);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
