@@ -551,10 +551,16 @@ mod tests {
 
     /// Placa sem orçamento para nenhuma camada do modelo grande: ele não perde
     /// só a qualidade, perde o motivo. Ficar inteiro na RAM é paging em relação
-    /// a quem usa a placa, e a regra dele é o lugar mais rápido.
+    /// a quem usa a placa, e a regra dele é o lugar mais rápido. Os 1024 MiB
+    /// livres não são um número solto: com a folga do grafo cobrada por janela
+    /// — 522 MiB em 4096, o maior piso medido (518) mais os 4 MiB que a própria
+    /// biblioteca soma por célula — sobram 182 MiB de orçamento para o 3B, que
+    /// paga 320 MiB de KV: nove das suas quarenta postas de 20 MiB cabem ali. O
+    /// 8B paga 640 MiB de KV na mesma janela e os mesmos 522 de folga antes da
+    /// primeira camada, e não sobra nenhuma.
     #[test]
     fn sem_orcamento_na_placa_para_o_grande_fica_com_o_que_a_usa() {
-        let hardware = hardware_na_placa(32, 700);
+        let hardware = hardware_na_placa(32, 1024);
         assert_eq!(posto(&par()[1], &hardware, 4096), (2, true));
         assert_eq!(posto(&par()[0], &hardware, 4096), (1, true));
         let choice = choose(&pedido(4096), hardware, &par()).unwrap();

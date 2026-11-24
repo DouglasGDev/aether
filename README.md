@@ -66,8 +66,13 @@ por número escrito à mão) e o `401` de quem chega sem token.
 Vulkan é a porta única para NVIDIA, AMD e Intel — não há SDK de fabricante no
 meio. Antes de carregar qualquer modelo, `src-tauri/src/ai/alojamento.rs` lê a VRAM livre
 e decide entre carga inteira na placa, camada a camada dividida com a RAM, ou só
-sistema; o veredito vira `n_gpu_layers` e é conferido contra o delta real de
-VRAM que a carga produz. Num arquivo híbrido — Qwen3.5, Ornith — a conta lê o
+sistema; o veredito vira `n_gpu_layers`, e cada um dos seus termos — pesos,
+cache da janela, estado recorrente e a folga que o grafo da biblioteca reserva —
+é conferido contra o que o próprio llama.cpp escreve ao carregar, tensor a
+tensor. O delta de VRAM da carga continua impresso na sonda, mas não entra como
+prova: nesta máquina ele já valeu 3.808 MiB para o processo que carregava e
+15.445 MiB para um segundo processo olhando a mesma placa no mesmo segundo. Num
+arquivo híbrido — Qwen3.5, Ornith — a conta lê o
 cabeçalho camada a camada: as camadas de atenção linear não pagam cache por
 token, pagam um estado recorrente fixo por sequência, e é esse estado que entra
 no orçamento da placa junto com os pesos.

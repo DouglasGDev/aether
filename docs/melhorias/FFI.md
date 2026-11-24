@@ -82,7 +82,7 @@ lê o cabeçalho do GGUF do catálogo que está em disco
 caminho montado por `catalog::find_embeddings` + `catalog::model_dir`, não
 escrito à mão), procura **na conta** o menor `livre` que ainda dá `Inteira` (a
 busca é binária porque `alojar` é monotônico no livre; o número que ela devolve
-inclui a `FOLGA_DE_COMPUTACAO` que é privada a `alojamento.rs`, então nada aqui é
+inclui a `folga_de_computacao` que `alojamento.rs` cobra do grafo, então nada aqui é
 aritmética de comentário) e confere os dois lados do corte. Saída medida:
 
 PENDENTE — colar `cargo test --lib ggml::tests::o_arquivo_real -- --nocapture`

@@ -58,7 +58,7 @@ está nos dois idiomas).
 O defeito: `fichar` multiplicava os metadados u32/u64 do cabeçalho GGUF sem
 checagem (`kv_por_token = 2 * camadas * cabeças_kv * dimensão * 2`; a soma dos
 pesos por `sum::<u64>()`), e `alojar` multiplicava `kv_por_token * janela` e
-somava `pesos + kv + FOLGA` do mesmo jeito. Num build de release o produto
+somava `pesos + kv + folga` do mesmo jeito. Num build de release o produto
 embrulha em u64, o KV parece pequeno e a placa jura `Inteira` para um modelo que
 nunca caberia — o OOM vem depois, na carga real. Em debug o mesmo caminho panic.
 
@@ -67,21 +67,21 @@ nunca caberia — o OOM vem depois, na carga real. Em debug o mesmo caminho pani
   vez de embrulhar para um número pequeno. (A conta morava em
   `alojamento::bytes_do_tensor`, e passou a morar no leitor quando a #111 trocou
   o parser.)
-- `alojamento.rs:490` `por_camada` soma cada tensor com `saturating_add`; a
-  `pesos_total` de `fichar` (`:530`) é um `fold` saturante — o teto honesto para
+- `alojamento.rs:522` `por_camada` soma cada tensor com `saturating_add`; a
+  `pesos_total` de `fichar` (`:562`) é um `fold` saturante — o teto honesto para
   "estes bytes não cabem em lugar nenhum".
-- `alojamento.rs:447` `taxa_kv` é a cadeia `checked_mul` que recusa o arquivo no
+- `alojamento.rs:479` `taxa_kv` é a cadeia `checked_mul` que recusa o arquivo no
   estouro com `erros.alojamentoEstouro` (motivo real, não zero); `fichar` a chama
-  em `:543`, depois que a conta passou a ser soma camada a camada.
-- `alojamento.rs:597` `alojar` é todo saturante (`saturating_mul`/`_add`/`_sub`):
+  em `:575`, depois que a conta passou a ser soma camada a camada.
+- `alojamento.rs:629` `alojar` é todo saturante (`saturating_mul`/`_add`/`_sub`):
   mesmo uma `Ficha` armada à mão não arranca um `Inteira` falso.
 
 Vermelho-primeiro (testes em alojamento.rs):
-- um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira (sintoma, linha 1148):
+- um_kv_que_estoura_a_conta_jamais_diz_que_cabe_inteira (sintoma, linha 1183):
   ficha com `kv_por_token = 1<<63` e janela 2 → veredito nunca `Inteira`. Com a
   conta original embrulhada, `cargo test` panica em `attempt to multiply with
   overflow` nessa linha (medido).
-- a_ficha_recusa_geometria_que_estoura_a_conta (fronteira, linha 1166): um GGUF
+- a_ficha_recusa_geometria_que_estoura_a_conta (fronteira, linha 1249): um GGUF
   mínimo com `attention.head_count_kv = u32::MAX` é recusado por estouro. Com a
   cadeia `kv_por_token` original, o mesmo panic aparece dentro de `fichar`.
 

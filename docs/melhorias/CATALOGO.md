@@ -190,7 +190,7 @@ A regra, lida do b12387 antes de virar conta:
 
 O que mudou em código:
 
-- `CamadaKv` ganhou `recorrente` (`alojamento.rs:291`) e `taxa_kv` (`:447`) soma
+- `CamadaKv` ganhou `recorrente` (`alojamento.rs:323`) e `taxa_kv` (`:479`) soma
   só quem é `propria && !recorrente` — as 30 lineares saem do número por token.
 - `memoria_recorrente` (`:327`) lê as chaves `ssm.*` e o padrão das camadas, com
   cada produto `checked`; `estado_recorrente` (`:372`) multiplica pelo número de
@@ -212,7 +212,7 @@ O que mudou em código:
   era a omissão anterior a esta passagem, e foi fechada junto: `modelos.placaSistema`
   agora diz os dois números, a mesma conta que `roteador.noSistema` sempre escreveu.
 - `engine_probe alojar:` passou a imprimir os dois juntos
-  (`bin/engine_probe.rs:249-253`) e a contar o estado no esperado do delta de
+  (`bin/engine_probe.rs:268-272`) e a contar o estado no esperado do delta de
   VRAM (`:309-314`), que é a metade que só a placa fecha.
 
 Os números que a conta agora devolve, cada um conferido em teste:
@@ -411,7 +411,7 @@ o que não mediu antes (#36), a regra passou a ser o portão:
 - `granites_sao_executaveis_pelo_caminho_de_cpu` (`catalog.rs:846`) — a parte que
   ainda é sobre o caminho de CPU, que só existe para o granite e escolhe pelo
   nome da quant, preservada;
-- `tipo_sem_bloco_medido_nao_vira_ficha_inventada` (`alojamento.rs:1120`) — o
+- `tipo_sem_bloco_medido_nao_vira_ficha_inventada` (`alojamento.rs:1155`) — o
   GGUF sintético de um tensor só, escrito na #109 como `tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada`
   e reescrito na #111: com o tipo 8 a ficha sai e conta os 68 bytes reais
   (`q8_0`, 64 elementos = 2 blocos de 34), com o tipo 16 conta 66 (`iq2_xxs` —
@@ -607,7 +607,7 @@ primeiro tipo sem conta, nomeando o tensor e o número lido — texto em
 mesma conta. `ALINHAMENTO_PADRAO` é 32 (`:60`). O arquivo não precisa estar
 inteiro na mão de ninguém: nada aqui lê a região de dados.
 
-O alojamento passou a usar isto: `fichar` (`alojamento.rs:514`) abre o cabeçalho
+O alojamento passou a usar isto: `fichar` (`alojamento.rs:546`) abre o cabeçalho
 por `cabecalho::ler` (`:515`) e `por_camada` (`:490`) recebe o `Cabecalho` do
 leitor. O candle continua no caminho de CPU do granite, que é outra coisa — carregar
 pesos, não medi-los.
@@ -722,33 +722,219 @@ passaram, 0 falharam, 5,53 s**, `--lib alojamento` → **36 passaram, 0 falharam
 Nenhum `.tsx` foi tocado, e o aplicativo não foi aberto: as onze entradas novas
 chegam à tela pelos dados do catálogo, pelo mesmo caminho das outras.
 
+## FEITO — #112: a folga do grafo saiu do `sched_reserve`, e o degrau que a substituiria foi retirado
+
+### O que estava cobrando a menos
+
+`const FOLGA_DE_COMPUTACAO: u64 = 220 * 1024 * 1024;` era um número só para toda
+arquitetura e toda janela, e ele era — isso está no histórico — o
+`sched_reserve: Vulkan0 compute buffer size` de **uma** carga: granito 4.2-3B
+Q4_K_M em 4096, onde a biblioteca escreveu 220,02 MiB. Na mesma janela, o
+ornith-1.5-9B registrou 521,02 MiB. Cobrar 220 onde a placa guardou 521 é a
+direção de erro que este módulo não pode cometer: o veredito promete uma placa
+mais gorda do que ela é, e a pessoa descobre a verdade no OOM, não na tela.
+
+### As treze cargas que viraram a conta
+
+Duas arquiteturas, sete janelas, cada número lido do
+`sched_reserve:    Vulkan0 compute buffer size` que a própria biblioteca escreve
+ao carregar, com a placa ligada (RX 9060 XT, driver AMD, flash attention):
+
+| janela | granite-4.2-3b Q4_K_M | ornith-1.5-9b Q4_K_M |
+| --- | --- | --- |
+| 4.096 | 220,02 MiB | 521,02 MiB |
+| 32.768 | 248,02 MiB | 549,02 MiB |
+| 49.152 | 264,02 MiB | 565,02 MiB |
+| 61.440 | 276,02 MiB | 577,02 MiB |
+| 65.536 | 280,02 MiB | 581,02 MiB |
+| 131.072 | 344,02 MiB | 645,02 MiB |
+| 262.144 | — | 773,02 MiB |
+
+A segunda linha de cada carga (`sched_reserve: Vulkan_Host compute buffer size`:
+24,02 no granito de 4096, 36,03 no ornith, 84,02 e 288,03 nas janelas grandes)
+não é a placa: `placas:` mostra o dispositivo host como `tipo=0` com
+`total=32687 MiB`, que é a RAM da máquina, não os 16.304 MiB da placa. Ela fica
+fora da conta por ser RAM, não por descuido.
+
+Os dois crescem **exatos 1.024 bytes por célula de janela**: `216,02 + janela /
+1024` fecha as seis linhas do granito e `517,02 + janela / 1024` fecha as sete do
+ornith, com diferença zero nos treze pontos. Ou seja: a parte proporcional está
+medida, não estimada. O piso, não — ele é do grafo de cada arquitetura (a híbrida
+paga o dobro, porque as camadas recorrentes atravessam o grafo com estados que a
+densa não tem), e nada no cabeçalho autoriza adivinhar o piso de um arquivo que
+ainda não rodou.
+
+### O que `folga_de_computacao` cobra
+
+`PISO_DE_COMPUTACAO = 518 MiB` — o **maior piso medido, arredondado para cima**,
+não o piso daquele arquivo — mais `CRESCIMENTO_POR_CELULA = 1024` bytes vezes
+`celulas_da_janela`, o mesmo arredondamento em múltiplos de 256 que o KV paga.
+A função está em `alojamento.rs:75` e entra nos dois lados do veredito: o
+predicado de `Inteira` (`:644-649`) e o `orcamento` que decide quantas camadas
+sobem (`:657-659`). Cobrir o piso menor deixa folga sobrando; cobrir o maior a
+menos seria a promessa falsa de cima.
+
+O gate que prende isso é `a_folga_cobre_cada_buffer_de_computacao_medido_na_placa`
+(`alojamento.rs:1766`), sobre a tabela `COMPUTACAO_MEDIDA` (`:1749`) com os
+treze pontos. Ele aperta as duas pontas: `cobrada > medida` (cobrar a menos é o
+erro proibido) **e** `cobrada − medida ≤ 302` MiB — a diferença entre os dois
+pisos medidos (517,02 − 216,02 = 301) mais o MiB do arredondamento, porque
+folga que passa disso virou imposto e encolhe a janela que a pessoa podia ter. A
+segunda metade do teste varre os trinta e seis pares possíveis entre as treze
+cargas da mesma arquitetura e exige que a diferença registrada seja exatamente
+Δcélulas / 1024.
+
+**Vermelho medido por mutação**, cada uma revertida e conferida no diff:
+
+1. `PISO_DE_COMPUTACAO` 518 → 220 (o número velho): o gate cai em
+   *`ornith-1.5-9b em 4096: a conta cobrou 224 MiB e a placa registrou 521`*. É
+   exatamente o defeito que existia antes desta passagem, agora pego por teste.
+2. `CRESCIMENTO_POR_CELULA` 1024 → 512: cai em
+   *`ornith-1.5-9b em 4096: a conta cobrou 520 MiB e a placa registrou 521`* —
+   um MiB a menos, e é para pegar um MiB que o `cobrada > medida` existe. A
+   sobra dessa mutação cresce com a janela: em 262.144 a conta seria 646 contra
+   os 773 registrados.
+
+### O que a mesma carga confirmou sem mudar uma linha de conta
+
+- **KV exato nas duas arquiteturas.** Previsto 320,00 MiB em 4096 →
+  `llama_kv_cache: size = 320.00 MiB ( 4096 cells, 40 layers, 1/1 seqs)`; previsto
+  128,00 → `128.00 MiB ( 4096 cells, 8 layers)`; o granito em 65.536 prevê
+  5.120,00 e a biblioteca escreve `Vulkan0 KV buffer size = 5120.00 MiB`; o
+  ornith em 131.072 prevê 4.096 e a biblioteca escreve `4096.00 MiB (131072
+  cells, 8 layers)`. Quatro cargas conferidas, célula a célula, duas por
+  arquitetura.
+- **O estado recorrente estava certo.** O previsto da fórmula era 52,34 MiB; a
+  carga do ornith escreveu `llama_memory_recurrent: size = 50.25 MiB ( 1 cells,
+  32 layers, 1 seqs 0 rs_seq), R (f32) 2.25, S (f32) 48.00, P 0.00`. Cobramos
+  2,09 MiB a mais — a direção segura — e a composição (R + S, P zero, 32 camadas,
+  uma célula) é a que o módulo assume.
+- **Pesos: um exato, um com sobra.** Granito: `1.998,84 (Vulkan0) + 137,81
+  (CPU_Mapped) = 2.136,65`, o mesmo que a ficha prevê. Ornith: a ficha prevê
+  5.501,86 e a biblioteca nomeia `4.812,25 + 545,62 = 5.357,87` — 143,99 MiB
+  cobrados a mais, causa não medida. É conservador, e por isso ficou registrado
+  em vez de ser arredondado para baixo.
+- **A biblioteca confere o próprio buffer.** No fim de cada carga:
+  `~llama_context: Vulkan0 compute buffer size is 220.0156 MiB, matches
+  expectation of 220.0156 MiB` (e 521,0215 no ornith). O número da descarga é o
+  da carga, e o do granito é exatamente o que a constante cobrava de **todos**
+  os arquivos — inclusive dos que registram 521, 581 e 773 MiB.
+
+### O degrau foi retirado por medida, não por gosto
+
+A passagem anterior tinha trocado a folga por um "degrau" de ~4,3 GiB, e o
+argumento era o delta de `VRAM cedida`. Ele não se sustenta. Para **uma** carga
+viva de granito em 65536 — a biblioteca nomeando 1.998,84 + 5.120,00 + 280,02 =
+**7.398,86 MiB** na placa —, o `livre` que a ggml respondeu foi:
+
+| quem leu | quando | `livre` |
+| --- | --- | --- |
+| o processo que carregava | logo depois da carga | 3.710,22 MiB |
+| outro processo carregando o mesmo arquivo | mesma janela, outra corrida | 3.808,06 MiB |
+| um segundo processo, amostra 1 | dentro da vida da carga | 15.445 MiB |
+| um segundo processo, amostra 2 | 1,2 s depois | 11.231 MiB |
+| um segundo processo, amostra 3 | 1,2 s depois | 15.445 MiB |
+
+Cinco números para um estado só da placa, e dois deles são exatamente o piso da
+placa ociosa (15.445,62 MiB). As três amostras têm carimbo de relógio e caem
+dentro da janela de vida do processo que carregava, então não é amostra feita com
+a placa já vazia. Consequência direta: **o delta de `VRAM cedida` não é
+atribuível**, e nada que se construa sobre ele — inclusive um degrau de 4,3 GiB —
+pode ser chamado de medida. A sonda continua imprimindo o delta, mas ao lado das
+duas leituras que o produzem (`livre {} → {}`), para que ele se descreva sozinho
+como o que é: uma diferença entre duas contas do estado da placa inteira, e não
+uma medição do nosso processo. Está registrado no doc-comment de `alojamento()`
+(`bin/engine_probe.rs:234-247`).
+
+Há um corolário que ainda não tem instrumento: o `livre` que o **aplicativo** vê
+antes de carregar é essa mesma leitura, feita por um processo que ainda não alocou
+nada. Ele vale para o nosso orçamento, não para a placa compartilhada — um
+terceiro programa usando 8 GiB não aparece no veredito. Isto é #114.
+
+### O que esta passagem NÃO fechou: o grafo de uma carga dividida
+
+Seis cargas com `despacho` forçado pela sonda (`alojar:262144|20` — o número
+depois da barra impõe as camadas sem tocar no veredito, único jeito de ver um
+dividido numa placa onde ele não dividiria sozinho):
+
+| arquivo | janela | camadas forçadas | `Vulkan0 compute buffer` | `splits` |
+| --- | --- | --- | --- | --- |
+| ornith-1.5-9b | 262.144 | 20 | 1.858,00 MiB | 239 / 24 |
+| ornith-1.5-9b | 262.144 | 10 | 1.858,00 MiB | 404 / 38 |
+| ornith-1.5-9b | 262.144 | 0 | 1.858,00 MiB | 540 / 49 |
+| ornith-1.5-9b | 32.768 | 10 | 517,00 MiB | 404 / 38 |
+| granite-4.2-3b | 65.536 | 20 | 222,00 MiB | 233 / 2 |
+| granite-4.2-3b | 65.536 | 0 | 416,98 MiB | 444 / 1 |
+
+Não há regra aqui: o ornith de 262.144 registra o mesmo buffer com 20, 10 ou
+zero camadas na placa, o granito de 65.536 registra **menos** dividido (222,00)
+que inteiro (280,02) e **mais** com tudo na RAM (416,98) que com as camadas na
+placa, e a coluna que se move junto é `splits` — a biblioteca dimensiona o grafo
+pelo recorte entre dispositivos, não pela janela. `max_nodes` é 13.664 em cada
+carga do ornith e 2.904 em cada carga do granito — os dezenove logs da sonda,
+inteira ou dividida —, então ele também não é a variável que falta.
+
+Isso fica de fora da conta nova, e o custo é dito com o número: um ornith
+dividido em 262.144 registra 1.858 MiB de grafo enquanto
+`folga_de_computacao` cobra 774 MiB para as 262.144 células daquela janela
+(518 + 256) — **1.084 MiB cobrados a menos**, a direção errada. Não virou regra
+porque seis pontos não fazem uma, e porque a coluna do `splits` mostra que a
+variável que falta não está no cabeçalho. É #113, e a chave para medi-lo já
+existe na sonda.
+
+### Gates desta passagem
+
+`cd src-tauri && cargo test --lib` → **617 passaram, 0 falharam, 11 ignored,
+finished in 6,34 s**; recortado, `--lib alojamento` → **37 passaram, 0 falharam,
+0,01 s**, `--lib router` → **21 passaram, 0 falharam, 0,01 s**; `cargo check
+--all-targets` → **Finished em 3,38 s, zero avisos**; `npm run build` → **OK, `✓
+built in 171 ms`**, maior bloco `react` a 210,53 kB. Nenhum `.tsx` foi tocado e o
+aplicativo não foi aberto: tudo que esta passagem mudou sai de uma conta e de uma
+sonda de linha de comando. As cargas que produzem os treze pontos são da sonda,
+rodadas serialmente com o aplicativo fechado.
+
+O único vermelho que a passagem produziu no caminho foi honesto, e é por isso que
+vale registrar: `router.rs` tinha um fixture com 700 MiB livres na placa para
+dizer "sem orçamento para o modelo grande". Com a folga real de 522 MiB em 4096,
+aquele número não descrevia mais nenhuma placa possível — o teste passou a
+reprovar o próprio fixture. Ele foi re-derivado para 1024 MiB, e a conta está no
+comentário: 1024 − 320 de KV − 522 de folga = 182 MiB de orçamento, e nove das
+quarenta postas de 20 MiB do 3B cabem ali; o 8B paga 640 MiB de KV e a mesma
+folga antes da primeira camada, e não sobra nenhuma. A asserção `(1, true)` /
+`(2, true)` não mudou.
+
 ## O que esta frente NÃO mediu, e é exatamente por isso que está registrado
 
-Nada aqui rodou. O que falta é placa, e placa é o portão que a instrução de
-não abrir o app mantém fechado:
+Nada da **frente do catálogo** rodou; o que rodou desde então é a carga de
+medição da #112, e onde ela mudou o veredito sobre um item, o item foi reescrito
+e diz o que ainda falta. O portão continua sendo o mesmo: placa com aplicativo
+aberto, que a instrução de não abrir o app mantém fechado.
 
-1. **Alojamento real.** Os `bytes` são o tamanho do arquivo, e o veredito de
-   quantas camadas sobem sai de `alojamento::alojar` (`:597`) com a VRAM livre
-   medida na hora. Nenhum dos GGUFs novos passou pela placa, e a série agora tem
-   catorze arquivos oferecidos: oito têm pesos abaixo dos 16 GiB da placa desta
-   máquina (9,93 a 15,46 GiB), e para esses `Inteira` é uma possibilidade que
-   depende da janela pedida e da VRAM livre medida na hora — nenhum número saiu
-   do aplicativo. Os outros seis começam acima do teto da placa só de pesos
-   (16,29 a 26,87 GiB), então o veredito esperado deles é `Dividida`, e a frase
-   que a tela diz com `camadas`, `na_placa` e
-   `em_ram` nunca foi vista saindo do aplicativo. É #39 que fecha isso. O que #106
-   e #107 fecharam foi a conta: `camadas_de_cache` (`:388`) e `taxa_kv` (`:447`)
-   leem `head_count_kv`, `sliding_window_pattern`, `key_length_swa` e
-   `shared_kv_layers` como o b12387 os lê, `memoria_recorrente` (`:327`) e
-   `estado_recorrente` (`:372`) leem o gated delta net, e os 344.064 do Gemma 4
+1. **Alojamento real dos arquivos novos.** Os `bytes` são o tamanho do arquivo,
+   e o veredito de quantas camadas sobem sai de `alojamento::alojar` (`:629`) com
+   a VRAM livre medida na hora. Nenhum dos GGUFs novos passou pela placa, e a
+   série agora tem catorze arquivos oferecidos: oito têm pesos abaixo dos 16 GiB
+   da placa desta máquina (9,93 a 15,46 GiB), e para esses `Inteira` é uma
+   possibilidade que depende da janela pedida e da VRAM livre medida na hora —
+   nenhum número saiu do aplicativo. Os outros seis começam acima do teto da
+   placa só de pesos (16,29 a 26,87 GiB), então o veredito esperado deles é
+   `Dividida`, e a frase que a tela diz com `camadas`, `na_placa` e `em_ram`
+   nunca foi vista saindo do aplicativo. É #39 que fecha isso. O que #106 e #107
+   fecharam foi a conta: `camadas_de_cache` (`:420`) e `taxa_kv` (`:479`) leem
+   `head_count_kv`, `sliding_window_pattern`, `key_length_swa` e
+   `shared_kv_layers` como o b12387 os lê, `memoria_recorrente` (`:359`) e
+   `estado_recorrente` (`:404`) leem o gated delta net, e os 344.064 do Gemma 4
    como os 20.480 do A3B são aritmética conferida em teste, não medida em carga.
-   O que continua **não medido** é o estado recorrente em carga: os 62,83 MiB do
-   A3B e os 50,25 MiB do 4B saem da fórmula do `llama_memory_recurrent` aplicada
-   ao cabeçalho, e o que os confirma é `engine_probe alojar:` com o peso em disco
-   — a sonda imprime os dois (`bin/engine_probe.rs:249-253`) e o delta real de
-   VRAM ao lado do previsto (`:309-314`). Um estado que a carga abrir menor que
-   isto não é erro de conta, é a biblioteca tendo mudado a regra: é ela que a
-   sonda tem de pegar.
+   **O estado recorrente em carga deixou de ser um deles:** a #112 carregou o
+   híbrido que existe em disco e a biblioteca escreveu
+   `llama_memory_recurrent: size = 50.25 MiB ( 1 cells, 32 layers, 1 seqs 0
+   rs_seq), R (f32) 2.25, S (f32) 48.00, P 0.00` contra os 52,34 MiB previstos —
+   a composição, as camadas e a célula batem, e a conta cobra 2,09 MiB acima. O
+   que continua não medido é o estado dos arquivos que não estão em disco (os 62,83
+   MiB previstos do A3B) e o de uma carga dividida, onde a biblioteca reparte o
+   RS entre `CPU` e `Vulkan0` (`37,69 + 12,56` no ornith de 32.768 com 10
+   camadas) e o veredito hoje não modela esse corte. A sonda imprime previsto e
+   registrado lado a lado (`bin/engine_probe.rs:268-272` e `:293-315`).
 2. **A qualidade do texto e o custo por rodada** (tokens de entrada e saída,
    t/s) — medição de turno, placa, aplicativo aberto.
 3. **Chamada de ferramenta no Gemma 4.** O laço do Aether não lê a gramática do
@@ -781,11 +967,27 @@ não abrir o app mantém fechado:
    e os dois `iq1` (50 e 56) vieram da sonda fora dos onze, já que nenhum arquivo
    daqui os usa. O que faltava era o parser, não a medida: os onze estão oferecidos,
    com ficha e veredito. Ver `## FEITO — #110 e #111`.
+6. **O grafo de uma carga dividida não tem regra.** Seis cargas forçadas pela
+   sonda (`alojar:<janela>|<camadas>`) registram 1.858,00 MiB para o híbrido em
+   262.144 com 20, 10 ou zero camadas na placa, 517,00 MiB para o mesmo híbrido em
+   32.768 com 10, e 222,00 / 416,98 MiB para o granito em 65.536 com 20 / zero —
+   contra 280,02 da mesma carga inteira. A coluna que acompanha é `splits`, não a
+   janela. Enquanto isso, `folga_de_computacao` cobra 774 MiB naquele híbrido de
+   262.144: **1.084 MiB a menos**, a direção proibida. É #113.
+7. **A folga que o veredito vê é a do nosso processo.** O `livre` que
+   `capacidade()` devolve é a leitura que a ggml faz antes de o nosso processo
+   alocar qualquer coisa, e a medida da #112 mostra que ela não enxerga o resto da
+   máquina: com 7.398,86 MiB nomeados por uma carga viva, um segundo processo
+   amostrou 15.445, 11.231 e 15.445 MiB livres — duas vezes o piso da placa
+   ociosa. Num desktop com navegador e jogo abertos, o veredito `Inteira` quer
+   dizer "cabe no orçamento que a placa nos dá", não "cabe no que sobrou para
+   todos". Isto é #114, e enquanto não houver instrumento ele vale para toda tela
+   que mostra VRAM livre.
 
 ## Gates da frente do catálogo
 
 Medidos antes da passagem #106; os números atuais estão nos gates das passagens
-acima (#107, #108, #109 e #110/#111).
+acima (#107, #108, #109, #110/#111 e #112).
 
 ```
 cd src-tauri && cargo test --lib        → 567 passaram, 0 falharam, 11 ignored, finished in 5,92 s
@@ -820,7 +1022,7 @@ removidas.
    `MXFP4_MOE` fecha com `diff 0`. O aplicativo passou a ter um leitor próprio
    (`ai/cabecalho.rs`), e o que era "um jeito só de ler um GGUF" — o
    `gguf_file::Content::read` do candle atrás de `alojamento::fichar`
-   (`alojamento.rs:514`) — hoje é o caminho de medição nosso; o codificador
+   (`alojamento.rs:546`) — hoje é o caminho de medição nosso; o codificador
    continua passando por `fichar` antes de carregar pesos (`ggml/mod.rs:603`),
    então ele também passou a ler os tipos IQ. A frase honesta na tela deixou de
    ser hipotética: `cabecalhoTipoSemConta` nomeia o tensor e o número lido, e é

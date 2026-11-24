@@ -95,11 +95,18 @@ fn main() -> anyhow::Result<()> {
     // O veredito de alojamento previsto, contra o delta de VRAM que a carga real
     // produz. `alojar:` traz as janelas separadas por vírgula.
     if let Some(list) = prompt.strip_prefix("alojar:") {
-        let janelas: Vec<usize> = list
+        // `alojar:4096,131072|20` força o despacho de 20 camadas na carga real,
+        // sem tocar no veredito. É o único jeito de medir o grafo de uma carga
+        // dividida numa placa onde ela não dividiria sozinha.
+        let (janelas, forcadas) = match list.split_once('|') {
+            Some((j, c)) => (j, c.trim().parse::<usize>().ok()),
+            None => (list, None),
+        };
+        let janelas: Vec<usize> = janelas
             .split(',')
             .filter_map(|v| v.trim().parse().ok())
             .collect();
-        return alojamento(&dir, &weights, &janelas);
+        return alojamento(&dir, &weights, &janelas, forcadas);
     }
 
     println!("carregando {weights} (janela {context})...");
@@ -225,11 +232,23 @@ fn mib(bytes: u64) -> String {
 }
 
 /// A sonda do alojamento: o veredito previsto do arquivo + da placa, e o delta
-/// real de VRAM que a carga produz. Sem o delta, a previsão seria só uma conta
-/// bonita; é a comparação que diz se o módulo mede o que a biblioteca faz.
-fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result<()> {
+/// de VRAM que a carga produz. O delta é uma diferença entre duas leituras do
+/// `livre` que a ggml responde, e a medida de hoje diz que ele não é um
+/// livro-caixa da placa. Com uma carga de granito em 65536 viva — a biblioteca
+/// nomeando 1.998,84 de pesos + 5.120,00 de KV + 280,02 de grafo = 7.398,86 MiB
+/// na Vulkan0 — o `livre` registrado foi 3.710,22 MiB num processo e 3.808,06
+/// MiB noutro, e três amostras tiradas de um segundo processo, dentro da janela
+/// de vida da mesma carga, deram 15.445, 11.231 e 15.445 MiB. Cinco números
+/// para um estado só da placa, e dois deles são exatamente o piso da placa
+/// ociosa. O que a sonda confere, então, é a conta tensor a tensor
+/// (`load_tensors`, `llama_kv_cache`, `llama_memory_recurrent`, `sched_reserve`),
+/// não o delta. `forcadas` é o despacho imposto à carga, sem tocar no veredito:
+/// serve para medir o grafo de uma carga dividida numa placa onde ela não
+/// dividiria sozinha.
+fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize], forcadas: Option<usize>) -> anyhow::Result<()> {
     use aether_lib::ai::alojamento::{
-        Alojamento, alojar, capacidade, celulas_da_janela, despacho, fichar, media_da_camada,
+        Alojamento, alojar, capacidade, celulas_da_janela, despacho, fichar, folga_de_computacao,
+        media_da_camada,
     };
     use aether_lib::ai::ggml;
 
@@ -266,19 +285,24 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
 
     for janela in janelas {
         let veredito = alojar(&ficha, cap.as_ref(), *janela);
+        // A folga entra na conta do veredito, então entra na linha: sem ela a
+        // sonda mostraria uma soma menor que a que a placa foi obrigada a guardar.
+        let folga = folga_de_computacao(celulas_da_janela(*janela) as u64);
         match veredito {
             Alojamento::Inteira { pesos, kv, estado, livre } => println!(
-                "  janela {janela}: INTEIRA na placa (pesos {} + kv {} + estado {} = {} de {} livres)",
+                "  janela {janela}: INTEIRA na placa (pesos {} + kv {} + estado {} + folga {} = {} de {} livres)",
                 mib(pesos),
                 mib(kv),
                 mib(estado),
-                mib(pesos + kv + estado),
+                mib(folga),
+                mib(pesos + kv + estado + folga),
                 mib(livre)
             ),
             Alojamento::Dividida { camadas, total, na_placa, em_ram, estado, livre } => println!(
-                "  janela {janela}: DIVIDIDA — {camadas}/{total} camadas na placa ({}, estado {} em f32), resto em RAM ({}) | livre {}",
+                "  janela {janela}: DIVIDIDA — {camadas}/{total} camadas na placa ({}, estado {} em f32, folga {}), resto em RAM ({}) | livre {}",
                 mib(na_placa),
                 mib(estado),
+                mib(folga),
                 mib(em_ram),
                 mib(livre)
             ),
@@ -302,14 +326,24 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
         return Ok(());
     };
     let veredito = alojar(&ficha, cap.as_ref(), context);
-    let camadas = despacho(&veredito);
+    let camadas = match forcadas {
+        Some(n) => {
+            println!(
+                "despacho forçado pela sonda: {n} camadas (o veredito desta janela dizia {})",
+                despacho(&veredito)
+            );
+            n as i32
+        }
+        None => despacho(&veredito),
+    };
     let kv = ficha.kv_por_token * celulas_da_janela(context) as u64;
     // O estado recorrente é reserva fixa da placa, não proporcional à janela:
     // entra no esperado do delta mesmo quando o modelo divide as camadas.
     let estado = ficha.estado_recorrente;
+    let folga = folga_de_computacao(celulas_da_janela(context) as u64);
     let na_placa = match veredito {
-        Alojamento::Inteira { pesos, .. } => pesos + kv + estado,
-        Alojamento::Dividida { na_placa, .. } => na_placa + kv + estado,
+        Alojamento::Inteira { pesos, .. } => pesos + kv + estado + folga,
+        Alojamento::Dividida { na_placa, .. } => na_placa + kv + estado + folga,
         Alojamento::SoSistema { .. } => 0,
     };
     let inicio = Instant::now();
@@ -317,16 +351,25 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize]) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("carga falhou: {e}"))?;
     // A segunda leitura é a metade medida do delta. Repetir o valor de antes
     // quando a placa não respondeu produziria um "0 MiB cedidos" que parece uma
-    // medição e é a ausência dela.
-    let cedido = vram_livre(&pastas).map(|(_, depois)| antes.saturating_sub(depois));
+    // medição e é a ausência dela. O `depois` vai impresso junto porque o delta
+    // é uma diferença de duas leituras do estado da placa inteira, não uma
+    // medição do nosso processo: sem o piso à vista, um `cedido` maior que o
+    // previsto parece uma conta nossa quando é a placa cheia de outra coisa.
+    let depois = vram_livre(&pastas).map(|(_, depois)| depois);
+    let cedido = depois.map(|depois| antes.saturating_sub(depois));
     println!(
-        "carga real em {:.2}s: janela={} dispositivo={} despacho={} camadas | VRAM cedida {} | previsto na placa {} | diferença {}",
+        "carga real em {:.2}s: janela={} dispositivo={} despacho={} camadas | VRAM cedida {} (livre {} → {}) | previsto na placa {} com folga | diferença {}",
         inicio.elapsed().as_secs_f64(),
         motor.janela,
         motor.dispositivo,
         camadas,
         match cedido {
             Some(cedido) => mib(cedido),
+            None => "não medida".to_string(),
+        },
+        mib(antes),
+        match depois {
+            Some(depois) => mib(depois),
             None => "não medida".to_string(),
         },
         mib(na_placa),

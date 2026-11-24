@@ -37,12 +37,44 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// O que a biblioteca reserva além dos pesos e do KV: os buffers de computação
-/// do grafo, por onde passam os ativos. Medido na granite-4.2-3b em janela de
-/// 4096 com flash attention: `sched_reserve: Vulkan0 compute buffer size =
-/// 220.02 MiB`. É o único número daqui que não vem do arquivo do modelo — ele
-/// depende do grafo, então vale como folga, não como medida daquele modelo.
-const FOLGA_DE_COMPUTACAO: u64 = 220 * 1024 * 1024;
+/// O que a biblioteca reserva além dos pesos, do KV e do estado: os buffers de
+/// computação do grafo, por onde passam os ativos. Não é um chute — é o
+/// `sched_reserve: Vulkan0 compute buffer size` que a própria biblioteca escreve
+/// ao carregar, lido em treze cargas desta placa (RX 9060 XT, driver AMD, flash
+/// attention ligada), com dois arquivos e sete janelas:
+///
+/// | janela | granite-4.2-3b Q4_K_M | ornith-1.5-9b Q4_K_M |
+/// | --- | --- | --- |
+/// | 4.096 | 220,02 MiB | 521,02 MiB |
+/// | 32.768 | 248,02 MiB | 549,02 MiB |
+/// | 49.152 | 264,02 MiB | 565,02 MiB |
+/// | 61.440 | 276,02 MiB | 577,02 MiB |
+/// | 65.536 | 280,02 MiB | 581,02 MiB |
+/// | 131.072 | 344,02 MiB | 645,02 MiB |
+/// | 262.144 | — | 773,02 MiB |
+///
+/// Os dois crescem exatos 1.024 bytes por célula de janela: `216,02 + janela /
+/// 1024` fecha as seis linhas da densa e `517,02 + janela / 1024` fecha as sete
+/// da híbrida, com diferença zero em todas — a parte proporcional é medida, não
+/// estimada. O piso, porém, é do grafo de cada arquitetura (a híbrida paga o
+/// dobro: as camadas recorrentes atravessam o grafo com estados que a densa não
+/// tem), e nada no cabeçalho autoriza adivinhar o piso de um arquivo que ainda
+/// não rodou. O que esta função cobra é o **maior piso medido, arredondado para
+/// cima**, nunca o piso daquele arquivo: cobrir o piso menor deixa folga
+/// sobrando, cobrir o maior a menos seria prometer à pessoa uma placa mais gorda
+/// do que ela é — o erro que este módulo não pode cometer.
+const PISO_DE_COMPUTACAO: u64 = 518 * 1024 * 1024;
+
+/// Os 1.024 bytes por célula de janela que os treze pontos acima medem nos dois
+/// arquivos, no mesmo arredondamento de célula que o KV paga.
+const CRESCIMENTO_POR_CELULA: u64 = 1024;
+
+/// A folga do grafo para uma janela já arredondada em células — a mesma
+/// [`celulas_da_janela`] que a conta do KV usa, para que as duas cresçam com o
+/// que a biblioteca realmente aloca, não com o número que a pessoa digitou.
+pub fn folga_de_computacao(celulas: u64) -> u64 {
+    PISO_DE_COMPUTACAO.saturating_add(CRESCIMENTO_POR_CELULA.saturating_mul(celulas))
+}
 
 /// A placa que a ggml escolheria agora, com o que ela tem de livre neste
 /// instante. `None` é a resposta honesta de "esta máquina não tem placa".
@@ -608,11 +640,12 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
     };
     let kv = ficha.kv_por_token.saturating_mul(celulas_da_janela(janela) as u64);
     let estado = ficha.estado_recorrente;
+    let folga = folga_de_computacao(celulas_da_janela(janela) as u64);
     if ficha
         .pesos_total
         .saturating_add(kv)
         .saturating_add(estado)
-        .saturating_add(FOLGA_DE_COMPUTACAO)
+        .saturating_add(folga)
         <= cap.livre
     {
         return Alojamento::Inteira { pesos: ficha.pesos_total, kv, estado, livre: cap.livre };
@@ -623,7 +656,7 @@ pub fn alojar(ficha: &Ficha, capacidade: Option<&Capacidade>, janela: usize) -> 
     // falta memória.
     let orcamento = cap
         .livre
-        .saturating_sub(kv.saturating_add(estado).saturating_add(FOLGA_DE_COMPUTACAO));
+        .saturating_sub(kv.saturating_add(estado).saturating_add(folga));
     let mut usados = 0u64;
     let mut postas = 0usize;
     for bytes in ficha.camada.iter().rev() {
@@ -804,7 +837,7 @@ mod testes {
         let ficha = ficha_granite();
         // Orçamento que comporta exatamente dez camadas depois do KV e da folga.
         let livre = ficha.kv_por_token * 4096
-            + FOLGA_DE_COMPUTACAO
+            + folga_de_computacao(celulas_da_janela(4096) as u64)
             + 10 * 20 * 1024 * 1024;
         match alojar(&ficha, Some(&Capacidade {
             placa: "AMD Radeon RX 9060 XT".to_string(),
@@ -835,7 +868,9 @@ mod testes {
         // E no meio da faixa, o despacho é exatamente a contagem do veredito.
         let dividida = alojar(&ficha, Some(&Capacidade {
             placa: "AMD Radeon RX 9060 XT".to_string(),
-            livre: ficha.kv_por_token * 4096 + FOLGA_DE_COMPUTACAO + 10 * 20 * 1024 * 1024,
+            livre: ficha.kv_por_token * 4096
+                + folga_de_computacao(celulas_da_janela(4096) as u64)
+                + 10 * 20 * 1024 * 1024,
             total: 16 * 1024 * 1024 * 1024,
         }), 4096);
         assert_eq!(despacho(&dividida), 10);
@@ -1459,7 +1494,7 @@ mod testes {
         let kv = ficha.kv_por_token * celulas_da_janela(4096) as u64;
         let justa = Capacidade {
             placa: "AMD Radeon RX 9060 XT".to_string(),
-            livre: ficha.pesos_total + kv + FOLGA_DE_COMPUTACAO,
+            livre: ficha.pesos_total + kv + folga_de_computacao(celulas_da_janela(4096) as u64),
             total: 16 * 1024 * 1024 * 1024,
         };
         // Sem estado, esta placa é o caso inteiro; com ele, falta um grão e o
@@ -1480,7 +1515,7 @@ mod testes {
             livre: ficha.pesos_total
                 + ficha.kv_por_token * celulas_da_janela(131_072) as u64
                 + estado
-                + FOLGA_DE_COMPUTACAO,
+                + folga_de_computacao(celulas_da_janela(131_072) as u64),
             ..justa
         };
         for janela in [4096, 32_768, 131_072] {
@@ -1704,5 +1739,65 @@ mod testes {
         assert_eq!(celulas_da_janela(4000), 4096);
         assert_eq!(celulas_da_janela(4096), 4096);
         assert_eq!(celulas_da_janela(65_536), 65_536);
+    }
+
+    /// O `sched_reserve: Vulkan0 compute buffer size` de treze cargas medidas
+    /// com a placa ligada (RX 9060 XT, driver AMD, flash attention), em MiB
+    /// inteiros truncados dos 0,02 que a biblioteca escreve. É a única origem
+    /// dos números que `folga_de_computacao` cobra: cair em vermelho aqui
+    /// significa que o grafo mudou e alguém tem de voltar a medir.
+    const COMPUTACAO_MEDIDA: &[(&str, usize, u64)] = &[
+        ("granite-4.2-3b", 4_096, 220),
+        ("granite-4.2-3b", 32_768, 248),
+        ("granite-4.2-3b", 49_152, 264),
+        ("granite-4.2-3b", 61_440, 276),
+        ("granite-4.2-3b", 65_536, 280),
+        ("granite-4.2-3b", 131_072, 344),
+        ("ornith-1.5-9b", 4_096, 521),
+        ("ornith-1.5-9b", 32_768, 549),
+        ("ornith-1.5-9b", 49_152, 565),
+        ("ornith-1.5-9b", 61_440, 577),
+        ("ornith-1.5-9b", 65_536, 581),
+        ("ornith-1.5-9b", 131_072, 645),
+        ("ornith-1.5-9b", 262_144, 773),
+    ];
+
+    #[test]
+    fn a_folga_cobre_cada_buffer_de_computacao_medido_na_placa() {
+        // Cobrar a menos é prometer folga que a placa não tem; cobrar a mais
+        // sem motivo é encolher a janela que a pessoa podia ter. As duas pontas
+        // ficam presas aqui, com a medida como régua.
+        for (arquivo, janela, medida) in COMPUTACAO_MEDIDA {
+            let cobrada = folga_de_computacao(celulas_da_janela(*janela) as u64) / 1048576;
+            assert!(
+                cobrada > *medida,
+                "{arquivo} em {janela}: a conta cobrou {cobrada} MiB e a placa registrou {medida}"
+            );
+            // O teto da sobra é a diferença entre os dois pisos medidos
+            // (517,02 − 216,02 = 301 MiB) mais o MiB do arredondamento para
+            // cima. Passar disso é a folga tendo virado imposto.
+            assert!(
+                cobrada - medida <= 302,
+                "{arquivo} em {janela}: cobrada {cobrada} MiB contra {medida} MiB medidos"
+            );
+        }
+        // E a parte proporcional é do tamanho que foi medido: entre duas janelas
+        // da mesma arquitetura, o que a biblioteca registrou cresce exatamente
+        // 1.024 bytes por célula — os trinta e seis pares possíveis entre as
+        // treze cargas, sem uma exceção.
+        for (arquivo, janela, medida) in COMPUTACAO_MEDIDA {
+            for (outra, outra_janela, outra_medida) in COMPUTACAO_MEDIDA {
+                if arquivo != outra || outra_janela <= janela {
+                    continue;
+                }
+                let celulas = celulas_da_janela(*outra_janela) as u64
+                    - celulas_da_janela(*janela) as u64;
+                assert_eq!(
+                    *outra_medida - medida,
+                    celulas / 1024,
+                    "{arquivo}: entre {janela} e {outra_janela} a placa não cresceu 1 KiB por célula"
+                );
+            }
+        }
     }
 }
