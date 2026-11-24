@@ -208,8 +208,9 @@ O que mudou em código:
   `roteador.naPlacaEstado`, `roteador.noSistemaEstado`. Um arquivo denso segue
   lendo a frase de sempre — número zero não é medida, é ruído. Na frase nova do
   caso sem placa o cache também entrou: o `Alojamento::SoSistema` já devolviam
-  `kv` e a tela de modelos nunca o mostrou, nem no híbrido nem no denso — o que
-  fica aberto está nos follow-ups, como omissão antiga e não como conta nova.
+  `kv` e a tela de modelos nunca o mostrou, nem no híbrido nem no denso. A densa
+  era a omissão anterior a esta passagem, e foi fechada junto: `modelos.placaSistema`
+  agora diz os dois números, a mesma conta que `roteador.noSistema` sempre escreveu.
 - `engine_probe alojar:` passou a imprimir os dois juntos
   (`bin/engine_probe.rs:249-253`) e a contar o estado no esperado do delta de
   VRAM (`:309-313`), que é a metade que só a placa fecha.
@@ -358,9 +359,3 @@ revertidas; o diff do arquivo fecha em 133 linhas adicionadas e 7 removidas.
    famílias do catálogo conseguem entregar uma chamada no formato que o laço
    parseia, e dizer isso na tela em vez de deixar a pessoa descobrir no meio de
    um turno.
-5. **`modelos.placaSistema` continua sem dizer o cache** — o
-   `Alojamento::SoSistema` devolve `pesos`, `kv` e `estado`, e a frase do arquivo
-   denso na tela de modelos só mostra `pesos`, embora o `kv` da janela também
-   morde na RAM (#107 pôs o cache na frase nova do híbrido; a antiga é anterior e
-   ficou como estava). É uma frase para ajustar, não uma conta para refazer, e o
-   mesmo `previsao` de `display.ts` fecha os dois.

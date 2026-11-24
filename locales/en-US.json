@@ -242,7 +242,7 @@
     "placaInteira": "{pesos} of weights and {kv} of cache entirely on the card",
     "placaInteiraEstado": "{pesos} of weights, {kv} of cache and {estado} of recurrent state, all of it on the card",
     "placaDividida": "{camadas} of {total} layers on the card, {emRam} in RAM",
-    "placaSistema": "{pesos} in system memory",
+    "placaSistema": "{pesos} of weights and {kv} of cache in system memory",
     "placaSistemaEstado": "{pesos} of weights, {kv} of cache and {estado} of recurrent state in system memory",
     "vramCedida": "{cedido} of VRAM taken by the load",
     "excluir": "Delete {nome}",

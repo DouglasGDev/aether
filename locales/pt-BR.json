@@ -242,7 +242,7 @@
     "placaInteira": "{pesos} de pesos e {kv} de cache inteiros na placa",
     "placaInteiraEstado": "{pesos} de pesos, {kv} de cache e {estado} de estado recorrente inteiros na placa",
     "placaDividida": "{camadas} de {total} camadas na placa, {emRam} na RAM",
-    "placaSistema": "{pesos} na memória do sistema",
+    "placaSistema": "{pesos} de pesos e {kv} de cache na memória do sistema",
     "placaSistemaEstado": "{pesos} de pesos, {kv} de cache e {estado} de estado recorrente na memória do sistema",
     "vramCedida": "{cedido} de VRAM levados pela carga",
     "excluir": "Excluir {nome}",
