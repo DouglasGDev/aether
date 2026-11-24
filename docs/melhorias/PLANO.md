@@ -842,6 +842,23 @@ nenhum aplicativo aberto — a instrução do dono continua.
   de memória) dois arquivos IBM saíam curtos, 163.840 e 409.600 bytes; a 210
   batem os 52. O `alojamento.rs` nunca esteve errado — ele usa `block_size()` e
   `type_size()` da biblioteca: a tabela é prova de entendimento, não de código.
+- **A segunda rodada da mesma conta me pegou em duas linhas escritas da primeira
+  tabela de instrumento, e uma delas era invisível à soma.** `iq1_s` é 256 × **50**,
+  não 52: em `Qwen3-30B-A3B-UD-IQ1_S.gguf` nenhum tensor `iq1_s` é o último em
+  offset, então as duas linhas reproduzem o mesmo tamanho publicado — só as
+  janelas offset-a-offset distinguem, e 58 delas reprovaram a 52 (em
+  `blk.0.ffn_gate_exps.weight`, 786.432 blocos ocupam 39.321.600 bytes, e a linha
+  errada pediria 40.894.464). O `mxfp4` (tipo 39) é 4,25 bits por elemento, não
+  4,5 — 32 × 17, e o `MXFP4_MOE` fecha sozinho com ele. Com a tabela corrigida os
+  **69 arquivos lidos somam diff 0**, 34.829 janelas conferidas, 0 violações, e os
+  52 continuaram batendo. Dois tipos (`iq1_s`, `iq1_m`) não aparecem em nenhum
+  dos 69 e tiveram de ser provados por um arquivo de fora, escolhido como sonda;
+  `q8_1` e `q8_k` seguem sem arquivo, e acima do 39 não apareceu nada — os números
+  que apareceram em sondas de fork (133, 139, 140) não são do motor que o
+  aplicativo carrega. Ficou registrada também a fronteira fina do método: a
+  janela fixa bytes por elemento **exatamente**, mas a granularidade do bloco não
+  é observável (`32 × 17` e `256 × 136` dão a mesma conta), então a coluna
+  `elementos × bytes` do doc é convenção do ggml sobre um bpw medido.
 - **O que o portão recusa fica fora, com o motivo na tela do doc.** Onze dos 23
   arquivos do repositório têm IQ ou MXFP4, e três deles caberiam numa placa de 16
   GiB (`UD-IQ2_XXS` 10.656.955.008, `UD-Q2_K_XL` 12.156.754.560, `Q3_K_S`

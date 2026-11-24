@@ -401,7 +401,7 @@ pub fn apoio_sha256(spec: &ModelSpec, arquivo: &str) -> Option<&'static str> {
 /// tensores daquele arquivo **são**, lidos tensor a tensor do cabeçalho real
 /// (`Range: bytes=0-16777215` no `resolve/main`, em 2026-11-20 para os 46
 /// arquivos que já estavam aqui e em 2026-11-24 para os do 35B A3B; o
-/// instrumento é `scratch/censo.mjs` e a saída completa está em
+/// instrumento, a tabela de blocos provada e a saída completa estão em
 /// `docs/melhorias/CATALOGO.md`).
 ///
 /// A tabela existe porque a etiqueta do nome não é um tipo, e o

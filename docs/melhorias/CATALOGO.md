@@ -155,7 +155,7 @@ teste para o dia em que aparecerem.
 ## FEITO — #107: a camada de atenção linear não paga cache; paga estado
 
 A correção nasceu de uma frente que ia ser outra. O item que estava à frente
-desta página — hoje o follow-up 5 — pedia um downloader de pesos em partes para
+desta página — hoje o follow-up 4 — pedia um downloader de pesos em partes para
 baixar um MoE de 2026 que coubesse na placa; medido o repositório, as partes do `unsloth/GLM-5.3-Flash-GGUF` somam
 ≈200 GB e a `llama.dll` b12387 já abre split sozinha (`llama-model-loader.cpp:84`
 `llama_get_list_splits`, `:604-635`, com as strings `of-%05d` e `invalid split
@@ -279,7 +279,7 @@ esperado e o recebido.
 
 ## FEITO — #109: a etiqueta não é um tipo, e o catálogo passou a dizer o censo
 
-O follow-up 2 desta página — o que esta passagem fechou — segurava a entrada do
+O item 2 da lista desta página, que esta passagem fechou, segurava a entrada do
 `Qwen3.5-35B-A3B` por um motivo honesto: `UD-*` e `IQ*` são nomes de editor, não
 tipos ggml, e o portão
 `quants_are_all_implemented_by_the_engine` comparava a etiqueta do arquivo com
@@ -309,8 +309,9 @@ nome, `n_dims` (`uint32`), as dimensões (`uint64` cada), **o tipo ggml
 
 Os dois rodaram sobre os 46 arquivos que o catálogo oferecia (2026-11-20) e os
 23 arquivos de pesos do repositório do A3B (2026-11-24). A conferência de bytes
-foi rodada nos 49 arquivos que o catálogo oferece hoje mais 3 do A3B que ficam
-fora, e **bate nos 52: 52 conformes, 0 divergentes**. É ela que fixa a numeração
+cobriu os 49 arquivos que o catálogo oferece hoje, os 3 do A3B que ficam fora e,
+na segunda rodada, os 69 inteiros: **69 conformes, 0 divergentes**, com 34.829
+vizinhanças offset-a-offset conferidas e 0 violações. É ela que fixa a numeração
 dos tipos — a conta saiu do arquivo, não da minha memória nem de uma tabela
 copiada:
 
@@ -323,40 +324,50 @@ copiada:
 | 6 | `q5_0` | 32 × 22 | | 20 | `iq4_nl` | 32 × 18 |
 | 7 | `q5_1` | 32 × 24 | | 21 | `iq3_s` | 256 × 110 |
 | 8 | `q8_0` | 32 × 34 | | 22 | `iq2_s` | 256 × 82 |
-| 9 | `q8_1` | 32 × 36 | | 23 | `iq4_xs` | 256 × 136 |
+| 9 | `q8_1` | sem arquivo | | 23 | `iq4_xs` | 256 × 136 |
 | 10 | `q2_k` | 256 × 84 | | 29 | `iq1_m` | 256 × 56 |
 | 11 | `q3_k` | 256 × 110 | | 30 | `bf16` | 1 × 2 |
-| 12 | `q4_k` | 256 × 144 | | 39 | `mxfp4` | não conferido |
-| 13 | `q5_k` | 256 × 176 | | | | |
+| 12 | `q4_k` | 256 × 144 | | 39 | `mxfp4` | 32 × 17 |
+| 13 | `q5_k` | 256 × 176 | | 19 | `iq1_s` | 256 × **50** |
 
-A linha do `q6_k` tem negrito porque foi onde o instrumento me pegou: com 208
-bytes por bloco — o número que eu havia escrito de memória — o
+A linha do `q6_k` tem negrito porque foi onde o instrumento me pegou da primeira
+vez: com 208 bytes por bloco — o número que eu havia escrito de memória — o
 `granite-4.2-3b-Q6_K.gguf` saía **163.840 bytes curto** e o
-`granite-4.2-8b-Q6_K.gguf` **409.600**, contra os tamanhos publicados. Com 210
-(`3 × QK_K/4 + QK_K/16 + 2`) os dois batem e os 52 fecham. O `alojamento.rs`
-nunca esteve errado: ele usa `block_size()` e `type_size()` da própria
-biblioteca, e é por isso que a tabela acima é a prova do *entendimento*, não do
-código.
+`granite-4.2-8b-Q6_K.gguf` **409.600**, contra os tamanhos publicados; com 210 os
+dois batem. Da segunda vez o instrumento me pegou em duas linhas que eu havia
+copiado da minha própria tabela de instrumento: `iq1_s` **não é 256 × 52, é 256 ×
+50**, e `mxfp4` **é 4,25 bits por elemento, não 4,5** (32 × 17 — o mesmo
+bytes/elemento do `iq4_xs`, por coincidência). O curioso do `iq1_s` é que a soma
+de bytes **não vê o erro**: em `Qwen3-30B-A3B-UD-IQ1_S.gguf` nenhum tensor `iq1_s`
+é o último em offset, então as duas linhas devolvem o mesmo tamanho publicado, e a
+linha errada teria passado para sempre se a conferência fosse só de soma. O que
+reprovou foram 58 janelas offset-a-offset — em `blk.0.ffn_gate_exps.weight`, 201.326.592
+elementos ocupam 39.321.600 bytes, que é exatamente 786.432 blocos de 50; a linha
+52 pediria 40.894.464 e o arquivo não tem essa janela. O bits/elemento que eu já
+havia medido para o tipo (1,5625) também pedia 50: a conta estava certa no censo
+e errada na tabela de blocos, e ninguém tinha cruzado as duas.
 
-`mxfp4` (39) aparece no censo do `MXFP4_MOE` e é o único tipo lido cuja soma não
-foi rodada — o arquivo não tem como entrar mesmo assim, e o motivo está logo
-abaixo. É também a prova de que a numeração **não para no 30**: o 39 existe em
-arquivo publicado, e um leitor que conhece só os números até 30 o trata como
-desconhecido. Aqui a resposta dele é a certa, porque o candle também não conhece
-o 39 — mas acertar por desconhecimento dos dois lados não é projeto, é sorte, e
-é por isso que a linha está marcada como não conferida.
+Um limite honesto, e é o mais fino deste doc: a janela offset-a-offset fixa
+**bytes por elemento exatamente**; a granularidade do bloco não é observável por
+ela. Para o `mxfp4`, `32 × 17`, `64 × 34`, `256 × 136` e `2048 × 1088` fecham o
+mesmo tamanho publicado, porque os comprimentos de tensor são todos múltiplos
+compatíveis — no caso dos IQ, por potências de dois. O que está medido é o
+bits/elemento; a escrita em `elementos × bytes` segue a convenção do ggml e é
+assim que ela deve ser lida.
 
-Das 23 linhas da tabela acima, **19 tiveram o tamanho conferido** contra um arquivo
-publicado — são exatamente os tipos que aparecem nos 52 arquivos somados. Ficam
-sem prova de arquivo `q8_1` (9), `iq4_nl` (20) e `iq1_m` (29), que nenhum dos 69
-cabeçalhos lidos usa, e o `mxfp4` (39), que aparece em um arquivo lido mas cuja
-soma não foi rodada: onde qualquer deles entrar em jogo, a conta tem de ser
-conferida de novo. Pelo mesmo caminho, o
-bits/elemento derivado do espaçamento **não existe para o `f32` em nenhum arquivo
-lido** — os tensores de `f32` são os pequenos de normalização e de escala, todos
-abaixo dos 8 milhões de elementos que o instrumento exigia — e faltou em quatro
-arquivos para `q4_k`, `q4_1` e `q5_1` e em catorze para `q8_0`. Onde ele existiu,
-concordou com o nome; onde não existiu, quem respondeu foi a soma de bytes.
+Das 24 linhas da tabela, 21 têm o tamanho conferido contra um dos 69
+arquivos. Duas precisaram de prova fora da conta, e é justo nomeá-las:
+`iq1_s` (19) e `iq1_m` (29) não aparecem em nenhum dos 69 arquivos lidos, então
+foi baixado um sétimo arquivo como sonda — `Qwen3-30B-A3B-UD-IQ1_S.gguf`,
+9.043.300.928 bytes publicados, censo com dez tipos — e os dois fecharam lá, com
+os mesmos 1,5625 e 1,75 bits por elemento do espaçamento. O `q8_1` (9) continua
+**sem arquivo**, e o `q8_k` (15) nem entrou na tabela: nenhum dos 74 cabeçalhos
+lidos usa esses dois números. E o
+`mxfp4` (39) fecha o `MXFP4_MOE` sozinho, o que também responde uma dúvida que
+estava aberta: a numeração não para no 30, mas acima do 39 nada apareceu nestes
+74 cabeçalhos — os tipos 133, 139 e 140 medidos de passagem pertencem a um fork
+(`ik_llama.cpp`) que não é o motor que o Aether carrega, e ficam registrados como
+fronteira do que foi lido, não como catálogo.
 
 ### O que a etiqueta esconde
 
@@ -438,7 +449,7 @@ lidas mas não escolhíveis — `Q4_K_S` 20.673.845.888, `Q5_K_S` 24.823.544.448
 22.016.023.168) — é o caso em que a etiqueta `XL` não compra tipo nenhum; e o
 BF16 da série não é arquivo único: `BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf`
 49.826.698.560 + `…-00002-of-00002.gguf` 19.549.939.264, o que esbarra no
-follow-up 5.
+follow-up 4.
 
 `routable: false` nos três, e a regra passou a estar escrita: `SO_PARA_BAIXAR`
 (`catalog.rs:831`) é a lista de séries sem quant escolhível, cada uma com o
@@ -537,10 +548,12 @@ não abrir o app mantém fechado:
    onze quants com IQ ou MXFP4 do A3B ficam na fila, e que entre elas estão os
    oito arquivos cujos pesos caberiam nos 16 GiB de uma placa (a menor quant que
    o leitor abre mede 18,82 GiB de pesos). Todos os onze são arquivo único e têm
-   `lfs.oid` medido no `tree/main` de 2026-11-24. A tabela de blocos acima **já tem** os números conferidos de seis deles
-   (`iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98, `iq3_s` 110, `iq4_xs`
-   136), porque a soma de bytes dos três arquivos do A3B bateu com o tamanho
-   publicado — o que falta é o parser, não a medida.
+   `lfs.oid` medido no `tree/main` de 2026-11-24. A tabela de blocos acima já tem
+   os números de todos eles, conferidos arquivo por arquivo contra o tamanho
+   publicado — `iq2_xxs` 66, `iq2_xs` 74, `iq2_s` 82, `iq3_xxs` 98, `iq3_s` 110,
+   `iq4_nl` 18 por 32 elementos, `iq4_xs` 136 e `mxfp4` 17 por 32 — e os dois
+   `iq1` (50 e 56) vieram da sonda fora dos onze, já que nenhum arquivo daqui os
+   usa. O que falta é o parser, não a medida.
 
 ## Gates da frente do catálogo
 
@@ -581,21 +594,16 @@ removidas.
    o `gguf_file::Content::read` do candle — e até o codificador passa por ele
    antes de carregar os pesos (`ggml/mod.rs:603`). Uma tabela de blocos nossa, ao
    lado do censo que já está escrito no catálogo, é o que devolve ficha a esses
-   onze arquivos, com o `diff 0` dos 52 como instrumento de conferência.
+   onze arquivos, com o `diff 0` dos 69 como instrumento de conferência.
    Enquanto isso não existir, a frase honesta na tela é "este arquivo tem tipo
    que não sei medir".
-2. **`mxfp4` sem soma conferida.** É o tipo 39 do `Qwen3.5-35B-A3B-MXFP4_MOE.gguf`
-   (21.587.638.912 bytes publicados, censo `q5_k×41`, `q6_k×1`, `mxfp4×78`): o
-   único arquivo lido cujo censo tem um tipo que a tabela acima não conferiu
-   contra tamanho publicado. Entra na mesma fila do item 1 e não tem pressa — com
-   21 GB ele não cabe inteiro em placa única de 16 GiB nem dividido com folga.
-3. **`swa_full` desligado, se um dia valer a pena** — #106 mediu que a chave de
+2. **`swa_full` desligado, se um dia valer a pena** — #106 mediu que a chave de
    janela deslizante não reduz nada com o padrão da biblioteca
    (`swa_full = true`), e há 40 das 48 camadas do Gemma 4 nesse caso. Ligar o
    contrário (`p.swa_full = false` em `ggml/ffi.rs:454-459`) encurta o cache, mas
    muda o que a atenção vê fora da janela — é escolha de qualidade, e o que a
    decide é medição com a placa, não conta de cabeçalho.
-4. **Veredito de ferramenta por família** — medir, com a placa, quais das
+3. **Veredito de ferramenta por família** — medir, com a placa, quais das
    famílias de conversa do catálogo conseguem entregar uma chamada no formato que
    o laço parseia, e dizer isso na tela em vez de deixar a pessoa descobrir no
    meio de um turno. A leitura de cabeçalho de #109 já separou o problema e deu
@@ -607,7 +615,7 @@ removidas.
    caracteres do template dele. O que falta deixou de ser "qual família fala a
    língua": é se cada uma *entrega* o bloco fechado quando o laço pede, e isso só
    a corrida diz.
-5. **Downloader de pesos em partes (multi-shard) — adiado com medida, não com
+4. **Downloader de pesos em partes (multi-shard) — adiado com medida, não com
    palpite.** O registro anterior dizia "sem ele, GLM-5.3-Flash e qualquer quant
    >48 GB ficam fora". Medido na passagem #107: a `llama.dll` b12387 já abre
    split sozinha (`llama-model-loader.cpp:84`, `:604-635`), então o que falta é
