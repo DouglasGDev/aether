@@ -125,6 +125,7 @@
     "resumoMensagens": "{n} mensagens dobradas",
     "resumoDescartadas": "{n} ficaram de fora do resumo",
     "codigoLinhas": "{n} linhas",
+    "caracteres": "{n} caracteres",
     "codigoSemLinguagem": "código",
     "mostrarTudo": "Mostrar tudo",
     "recolher": "Recolher",
@@ -139,6 +140,12 @@
     "paradaLimite": "cortado pelo limite de tokens",
     "paradaCancelada": "você parou",
     "paradaJanela": "cortado pela janela cheia"
+  },
+  "atalhos": {
+    "titulo": "Atalhos"
+  },
+  "mencao": {
+    "titulo": "Mencionar"
   },
   "compactacao": {
     "instrucao": "Você comprime o começo de uma conversa de assistente. Responda apenas com o resumo, em português: o que a pessoa pediu, o que já foi feito, os caminhos, nomes e valores citados e o que ainda está pendente. No máximo oito frases, sem introdução e sem falar do resumo.",
@@ -703,6 +710,10 @@
     "aprovado": "aprovado",
     "reprovado": "reprovado",
     "naoRodado": "não rodou",
+    "aprovados": "aprovados {n}",
+    "reprovados": "reprovados {n}",
+    "naoRodados": "não rodaram {n}",
+    "abrirDetalhe": "Abrir a bancada",
     "executando": "Rodando",
     "caso": {
       "placa": "Motor na placa",

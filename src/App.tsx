@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { AppMenu, type Marca, type TelaAjuste } from "./components/AppMenu";
 import { ApprovalCard } from "./components/ApprovalCard";
@@ -14,6 +14,7 @@ import { IntentBar } from "./components/IntentBar";
 import { ResultCard } from "./components/ResultCard";
 import { TrustDial } from "./components/TrustDial";
 import { api, message, onBancadaEvent, onChatEvent, onMcpEvent, onMcpLagged, onVozEvent } from "./lib/api";
+import { listaDeAtalhos, resolverAtalho, type Mencao } from "./lib/atalhos";
 import { toolTitle } from "./lib/display";
 import { useIdioma } from "./lib/i18n";
 import type {
@@ -137,6 +138,9 @@ export default function App() {
   const [showVoz, setShowVoz] = useState(false);
   const [showRuntime, setShowRuntime] = useState(false);
   const [showBancada, setShowBancada] = useState(false);
+  /// A linha da rodada na conversa. Ocultar não apaga a medição: a folha continua
+  /// com os mesmos números, e a próxima rodada faz a linha voltar sozinha.
+  const [rodadaOculta, setRodadaOculta] = useState(false);
   const [showBancos, setShowBancos] = useState(false);
   /// A rodada da bancada mora aqui, não no dialog. A folha é desmontada quando
   /// fecha, e com ela sumia o que cada caso mediu — reabrir era obrigatório
@@ -491,6 +495,7 @@ export default function App() {
 
   const rodarBancada = useCallback(async () => {
     setBancadaErro(null);
+    setRodadaOculta(false);
     try {
       await api.bancadaRodar();
     } catch (cause) {
@@ -558,6 +563,14 @@ export default function App() {
   async function submitQuery() {
     const trimmed = query.trim();
     if (trimmed === "" || talking) return;
+    /// Um atalho escrito por inteiro é uma ação, não um pedido: Enter sem
+    /// escolher na folha dispara o mesmo que a folha dispararia.
+    const atalho = resolverAtalho(atalhos, trimmed);
+    if (atalho !== null) {
+      setQuery("");
+      atalho.onDisparar();
+      return;
+    }
     setError(null);
     setResult(null);
     setChosen(null);
@@ -837,8 +850,8 @@ export default function App() {
     marcasMenu.bancada = "aviso";
 
   /// Uma linha por tela: o Record completo é o que impede o menu de anunciar
-  /// uma porta que o app não abre.
-  function abrirAjuste(tela: TelaAjuste) {
+  /// uma porta que o app não abre. É a mesma mão que o atalho da barra aperta.
+  const abrirAjuste = useCallback((tela: TelaAjuste) => {
     const aberturas: Record<TelaAjuste, () => void> = {
       modelos: () => setShowModels(true),
       runtime: () => setShowRuntime(true),
@@ -853,7 +866,48 @@ export default function App() {
       bancada: () => setShowBancada(true),
     };
     aberturas[tela]();
-  }
+  }, []);
+
+  /// O que `/` da barra sabe fazer. Só portas que já existem: a lista não abre
+  /// caminho novo, e por isso ela não tem estado nenhum para divergir.
+  const atalhos = useMemo(
+    () =>
+      listaDeAtalhos({
+        abrir: abrirAjuste,
+        grafico: () => setPalco("grafo"),
+        rodarBancada: () => void rodarBancada(),
+        pararBancada: () => void pararBancada(),
+      }),
+    [abrirAjuste, rodarBancada, pararBancada],
+  );
+
+  /// O que `@` sabe nomear: as pastas que o agente pode ler agora e o modelo em
+  /// memória. É a conta que a tela já tem — nenhuma consulta nova, e o pedido
+  /// sai com a menção escrita como texto, para o agente ler.
+  const mencoes = useMemo<Mencao[]>(
+    () => [
+      ...pastas.map((pasta) => ({
+        nome: pasta.nome,
+        chave: "pastas.titulo",
+        icon: "folder",
+        detalhe: pasta.caminho,
+      })),
+      ...(loaded === null
+        ? []
+        : [{ nome: loaded, chave: "modelos.titulo", icon: "cube" }]),
+    ],
+    [pastas, loaded],
+  );
+
+  /// A linha da rodada só existe quando a bancada mediu alguma coisa nesta
+  /// janela; antes do primeiro `iniciou` não há número a mostrar.
+  const rodada =
+    rodadaOculta ||
+    (!bancada.andando &&
+      bancada.modelo === null &&
+      Object.keys(bancada.resultados).length === 0)
+      ? null
+      : bancada;
 
   return (
     <div className={showChats ? "app app--chats" : "app"}>
@@ -961,8 +1015,15 @@ export default function App() {
               result={result}
               onClose={() => setResult(null)}
             />
-          ) : turns.length > 0 ? (
-            <Conversation turns={turns} aguardando={pending.length > 0} />
+          ) : turns.length > 0 || rodada !== null ? (
+            <Conversation
+              turns={turns}
+              aguardando={pending.length > 0}
+              rodada={rodada}
+              totalDeCasos={bancadaCasos.length}
+              onAbrirRodada={() => setShowBancada(true)}
+              onDispensarRodada={() => setRodadaOculta(true)}
+            />
           ) : capabilities.length > 0 ? (
             <CapabilityCards
               tools={capabilities}
@@ -991,6 +1052,8 @@ export default function App() {
           onOuvir={() => void startMic()}
           onTranscrever={() => void stopMic()}
           onDescartar={() => void discardMic()}
+          atalhos={atalhos}
+          mencoes={mencoes}
         />
 
         {/* No palco do grafo os cartões já são esta faixa: um servidor aparece

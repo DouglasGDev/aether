@@ -125,6 +125,7 @@
     "resumoMensagens": "{n} messages folded",
     "resumoDescartadas": "{n} left out of the summary",
     "codigoLinhas": "{n} lines",
+    "caracteres": "{n} characters",
     "codigoSemLinguagem": "code",
     "mostrarTudo": "Show all",
     "recolher": "Collapse",
@@ -139,6 +140,12 @@
     "paradaLimite": "cut by the token limit",
     "paradaCancelada": "you stopped it",
     "paradaJanela": "cut by a full window"
+  },
+  "atalhos": {
+    "titulo": "Shortcuts"
+  },
+  "mencao": {
+    "titulo": "Mention"
   },
   "compactacao": {
     "instrucao": "You compress the beginning of an assistant conversation. Reply with the summary only, in English: what the person asked, what was already done, the paths, names and values mentioned, and what is still pending. At most eight sentences, no preamble and no talk about the summary.",
@@ -703,6 +710,10 @@
     "aprovado": "passed",
     "reprovado": "failed",
     "naoRodado": "did not run",
+    "aprovados": "{n} passed",
+    "reprovados": "{n} failed",
+    "naoRodados": "{n} did not run",
+    "abrirDetalhe": "Open the bench",
     "executando": "Running",
     "caso": {
       "placa": "Engine on the card",

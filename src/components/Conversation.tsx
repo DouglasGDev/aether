@@ -8,7 +8,14 @@ import {
   toolTitle,
 } from "../lib/display";
 import { useIdioma, useT } from "../lib/i18n";
-import type { ChatMessage, Choice, Medicao, ToolInfo, Vista } from "../lib/types";
+import type {
+  BancadaRodada,
+  ChatMessage,
+  Choice,
+  Medicao,
+  ToolInfo,
+  Vista,
+} from "../lib/types";
 import { Icon } from "./Icon";
 import { RichText } from "./RichText";
 import { ToolCard } from "./ToolCard";
@@ -90,9 +97,104 @@ interface Props {
   turns: Turn[];
   /// Há um pedido parado esperando o usuário decidir.
   aguardando: boolean;
+  /// A última rodada da bancada, ou `null` quando ela nunca rodou nesta janela.
+  /// A conta mora no aplicativo: a linha é a mesma medição que a folha mostra,
+  /// não uma cópia que aqui se atualizasse por conta própria.
+  rodada: BancadaRodada | null;
+  totalDeCasos: number;
+  onAbrirRodada: () => void;
+  onDispensarRodada: () => void;
 }
 
-export function Conversation({ turns, aguardando }: Props) {
+/// A rodada inteira em uma linha: o que já se sabe da bancada sem abrir a
+/// folha. Cada número vem de um evento que o núcleo mandou — `iniciou` dá o
+/// modelo, `caso` o que está em curso, `resultado` o veredito e os milissegundos.
+function LinhaDeRodada({
+  rodada,
+  total,
+  onAbrir,
+  onDispensar,
+}: {
+  rodada: BancadaRodada;
+  total: number;
+  onAbrir: () => void;
+  onDispensar: () => void;
+}) {
+  const t = useT();
+  const { id: idioma } = useIdioma();
+  const feitos = Object.values(rodada.resultados);
+  const aprovados = feitos.filter((r) => r.estado === "aprovado").length;
+  const reprovados = feitos.filter((r) => r.estado === "reprovado").length;
+  const naoRodados = feitos.filter((r) => r.estado === "naoRodado").length;
+  const somados = feitos.reduce((soma, r) => soma + r.ms, 0);
+  const convite = `${t("bancada.abrirDetalhe")}${
+    rodada.modelo === null ? "" : ` · ${rodada.modelo}`
+  }`;
+
+  return (
+    <div className="talk-rodada">
+      <button
+        type="button"
+        className="talk-rodada-linha"
+        onClick={onAbrir}
+        title={convite}
+      >
+        <Icon name="bancada" />
+        <span className="talk-rodada-nome">{t("bancada.titulo")}</span>
+        <span className="memoria-chip">
+          {rodada.andando ? `${t("bancada.executando")} ` : ""}
+          {inteiro(feitos.length, idioma)}
+          {total > 0 ? `/${inteiro(total, idioma)}` : ""}
+        </span>
+        {rodada.atual !== null && (
+          <span className="memoria-chip">{t(`bancada.caso.${rodada.atual}`)}</span>
+        )}
+        {aprovados > 0 && (
+          <span className="memoria-chip">
+            <Icon name="check" />
+            {t("bancada.aprovados", { n: inteiro(aprovados, idioma) })}
+          </span>
+        )}
+        {reprovados > 0 && (
+          <span className="memoria-chip aviso">
+            <Icon name="warning" />
+            {t("bancada.reprovados", { n: inteiro(reprovados, idioma) })}
+          </span>
+        )}
+        {naoRodados > 0 && (
+          <span className="memoria-chip aviso">
+            <Icon name="clock" />
+            {t("bancada.naoRodados", { n: inteiro(naoRodados, idioma) })}
+          </span>
+        )}
+        {feitos.length > 0 && (
+          <span className="memoria-chip">
+            <Icon name="clock" />
+            {`${t("cartao.duracao")} ${duracao(somados, idioma)}`}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
+        className="icon-only talk-rodada-fechar"
+        onClick={onDispensar}
+        aria-label={t("geral.dispensar")}
+        title={t("geral.dispensar")}
+      >
+        <Icon name="cross" />
+      </button>
+    </div>
+  );
+}
+
+export function Conversation({
+  turns,
+  aguardando,
+  rodada,
+  totalDeCasos,
+  onAbrirRodada,
+  onDispensarRodada,
+}: Props) {
   const end = useRef<HTMLDivElement>(null);
   const t = useT();
   const { id: idioma } = useIdioma();
@@ -177,14 +279,19 @@ export function Conversation({ turns, aguardando }: Props) {
             {turn.tools.length > 0 && (
               <div className="talk-tools">
                 <span className="talk-tools-label">{t("conversa.ferramentas")}</span>
-                {turn.tools.map((tool, at) => (
-                  <div
-                    className={`talk-tool ${
-                      tool.ok === undefined ? "running" : tool.ok ? "ok" : "fail"
-                    }`}
-                    key={at}
-                  >
-                    <span className="talk-tool-head">
+                {turn.tools.map((tool, at) => {
+                  const estado =
+                    tool.ok === undefined ? "running" : tool.ok ? "ok" : "fail";
+                  const cartao =
+                    tool.vista !== null && tool.vista !== undefined ? (
+                      <ToolCard vista={tool.vista} falha={tool.ok === false} />
+                    ) : null;
+                  /// Sem vista, o que a ferramenta devolveu é texto cru. Ele não
+                  /// é resposta do modelo e não merece o corpo da conversa: entra
+                  /// medido, numa linha, e o corpo só aparece para quem pedir.
+                  const bruto = cartao === null ? (tool.text ?? "") : "";
+                  const cabeca = (
+                    <>
                       <Icon name="bolt" />
                       <span className="talk-tool-name">
                         {tool.info !== undefined
@@ -200,17 +307,28 @@ export function Conversation({ turns, aguardando }: Props) {
                           <Icon name="cross" />
                         )}
                       </span>
-                    </span>
-                    {tool.vista !== null && tool.vista !== undefined ? (
-                      <ToolCard vista={tool.vista} falha={tool.ok === false} />
-                    ) : (
-                      tool.text !== undefined &&
-                      tool.text !== "" && (
-                        <pre className="talk-tool-out">{tool.text}</pre>
-                      )
-                    )}
-                  </div>
-                ))}
+                    </>
+                  );
+                  return bruto === "" ? (
+                    <div className={`talk-tool ${estado}`} key={at}>
+                      <span className="talk-tool-head">{cabeca}</span>
+                      {cartao}
+                    </div>
+                  ) : (
+                    <details className={`talk-tool ${estado}`} key={at}>
+                      <summary className="talk-tool-head">
+                        {cabeca}
+                        <span className="talk-tool-medida">
+                          {t("conversa.caracteres", {
+                            n: inteiro(bruto.length, idioma),
+                          })}
+                        </span>
+                        <Icon name="chevron" className="talk-tool-seta" />
+                      </summary>
+                      <pre className="talk-tool-out">{bruto}</pre>
+                    </details>
+                  );
+                })}
               </div>
             )}
 
@@ -283,6 +401,14 @@ export function Conversation({ turns, aguardando }: Props) {
             )}
           </div>
         ),
+      )}
+      {rodada !== null && (
+        <LinhaDeRodada
+          rodada={rodada}
+          total={totalDeCasos}
+          onAbrir={onAbrirRodada}
+          onDispensar={onDispensarRodada}
+        />
       )}
       <div ref={end} />
     </div>
