@@ -18,6 +18,11 @@ src-tauri/vendor/**/lib/*.dylib
 *.pdb
 *.log
 
+# Área de trabalho do desenvolvedor: sondas, logs de corrida, binários baixados
+# para ler por dentro. Nada aqui é fonte do que o aplicativo faz, e nada aqui
+# deve chegar ao repositório público.
+scratch/
+
 # Estado local e editor.
 *.local
 .DS_Store
