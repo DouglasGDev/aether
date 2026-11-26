@@ -9,10 +9,12 @@
 //! o texto canônico, e nada chega como adivinhação. Para o SQL livre, o
 //! `sp_describe_first_result_set` descreve o resultado antes da execução: é
 //! ele quem diz consulta de escrita sem executar nada, e é dele que saem os
-//! tipos das colunas do embrulho.
+//! tipos das colunas do embrulho. O driver é assíncrono: a conexão é da
+//! chamada, mas o agendador é do processo — ver `super::agendador`.
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, ExecuteResult, Row};
@@ -20,7 +22,7 @@ use tiberius::{AuthMethod, Client, Config, EncryptionLevel, ExecuteResult, Row};
 type ClienteTds = Client<tokio_util::compat::Compat<TcpStream>>;
 
 pub struct Mssql {
-    runtime: tokio::runtime::Runtime,
+    runtime: &'static tokio::runtime::Runtime,
     cliente: ClienteTds,
 }
 
@@ -74,12 +76,29 @@ fn citado(nome: &str) -> String {
     format!("[{}]", nome.replace(']', "]]"))
 }
 
-fn conferir_fonte(fonte: &str, conhecidas: &[String]) -> Result<String> {
-    conhecidas
-        .iter()
-        .find(|nome| nome.eq_ignore_ascii_case(fonte))
-        .cloned()
-        .ok_or_else(|| anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])))
+/// A ida única ao catálogo de uma fonte: a tabela conferida e as colunas dela,
+/// na ordem e com o nome que o próprio banco grafa. `LOWER(...) = LOWER(@P1)` é
+/// o que fazia a conferência da lista ser insensível, sem trazer a lista inteira.
+const ESQUEMA_SQL: &str = "SELECT t.table_name, c.column_name, c.data_type \
+     FROM information_schema.tables AS t \
+     JOIN information_schema.columns AS c \
+       ON c.table_schema = t.table_schema AND c.table_name = t.table_name \
+     WHERE t.table_schema = SCHEMA_NAME() AND t.table_type = 'BASE TABLE' \
+       AND LOWER(t.table_name) = LOWER(@P1) \
+     ORDER BY c.ordinal_position";
+
+/// As tabelas do esquema atual, para a lista que o dono vê — uma viagem só, e
+/// `bancos_tabelas` não descreve coluna nenhuma delas.
+const FONTES_SQL: &str = "SELECT table_name FROM information_schema.tables \
+     WHERE table_schema = SCHEMA_NAME() AND table_type = 'BASE TABLE' \
+     ORDER BY table_name";
+
+fn nome_da(linha: &Row, indice: usize) -> Result<String> {
+    Ok(linha
+        .try_get::<&str, _>(indice)
+        .map_err(erro)?
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn conferir_coluna(coluna: &str, conhecidas: &[(String, String)]) -> Result<(String, String)> {
@@ -238,30 +257,49 @@ fn ficha_de(conexao: &Conexao, senha: &str) -> Config {
     ficha
 }
 
+/// A espera de quem não tem prazo dentro do driver: o `tiberius` 0.12 não expõe
+/// tempo de consulta nenhum — não há `set_query_timeout` nem opção de soquete —
+/// então o prazo mora aqui. Sem ele, um SQL Server pendurado numa consulta longa
+/// segurava a conversa até o dono fechar o aplicativo.
+fn esperar_prazo<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    prazo: Duration,
+    futuro: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    runtime.block_on(async move {
+        tokio::time::timeout(prazo, futuro).await.map_err(|_| erro_de_prazo())?
+    })
+}
+
+fn esperar<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    futuro: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    esperar_prazo(runtime, prazo_de_espera(), futuro)
+}
+
 impl Mssql {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         let senha = conexao.senha()?;
         let ficha = ficha_de(conexao, senha.as_str());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())])))?;
-        let cliente = runtime.block_on(async {
+        let runtime = super::agendador()?;
+        let cliente = esperar(runtime, async {
             let tcp = TcpStream::connect(ficha.get_addr())
                 .await
                 .map_err(|e| anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())])))?;
             tcp.set_nodelay(true)
                 .map_err(|e| anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())])))?;
-            Client::connect(ficha, tcp.compat_write())
-                .await
-                .map_err(erro_abrir)
+            Client::connect(ficha, tcp.compat_write()).await.map_err(erro_abrir)
         })?;
         Ok(Self { runtime, cliente })
     }
 
-    /// Uma consulta com parâmetros, lendo o primeiro resultado inteiro.
+    /// Uma consulta com parâmetros, lendo o primeiro resultado inteiro. O que se
+    /// materializa aqui é o que o próprio SQL pediu — `TOP (teto)` em toda
+    /// leitura — e nunca o que o servidor resolveu mandar.
     fn linhas(&mut self, sql: &str, refs: &[&dyn tiberius::ToSql]) -> Result<Vec<Row>> {
-        self.runtime.block_on(async {
+        let runtime = self.runtime;
+        esperar(runtime, async {
             let stream = self.cliente.query(sql, refs).await.map_err(erro)?;
             stream.into_first_result().await.map_err(erro)
         })
@@ -270,37 +308,31 @@ impl Mssql {
     /// Uma escrita com parâmetros, com o total de linhas afetadas que o banco
     /// reportou.
     fn escrita(&mut self, sql: &str, refs: &[&dyn tiberius::ToSql]) -> Result<u64> {
-        self.runtime.block_on(async {
+        let runtime = self.runtime;
+        esperar(runtime, async {
             let resultado: ExecuteResult = self.cliente.execute(sql, refs).await.map_err(erro)?;
             Ok(resultado.total())
         })
     }
 
-    /// As colunas de uma fonte já conferida — sem revalidar a lista de fontes.
-    fn colunas_conferidas(&mut self, conferida: &str) -> Result<Vec<(String, String)>> {
-        let linhas = self.linhas(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_schema = SCHEMA_NAME() AND table_name = @P1 \
-             ORDER BY ordinal_position",
-            &[&conferida],
-        )?;
-        Ok(linhas
-            .iter()
-            .map(|linha| {
-                Ok((
-                    linha
-                        .try_get::<&str, _>(0)
-                        .map_err(erro)?
-                        .map(str::to_string)
-                        .unwrap_or_default(),
-                    linha
-                        .try_get::<&str, _>(1)
-                        .map_err(erro)?
-                        .map(str::to_string)
-                        .unwrap_or_default(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?)
+    /// A única ida ao catálogo que uma leitura precisa: a fonte conferida e as
+    /// colunas dela, juntas. Antes eram duas — a lista de tabelas inteira e,
+    /// dentro dela, a fonte que o chamador já podia ter pedido direto.
+    fn esquema_de(&mut self, fonte: &str) -> Result<(String, Vec<(String, String)>)> {
+        let linhas = self.linhas(ESQUEMA_SQL, &[&fonte])?;
+        let Some(primeira) = linhas.first() else {
+            return Err(anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])));
+        };
+        let conferida = nome_da(primeira, 0)?;
+        let mut esquema = Vec::with_capacity(linhas.len());
+        for linha in &linhas {
+            let nome = nome_da(linha, 1)?;
+            if nome.is_empty() {
+                continue;
+            }
+            esquema.push((nome, nome_da(linha, 2).unwrap_or_default()));
+        }
+        Ok((conferida, esquema))
     }
 
     fn ler(linha: &Row, indice: usize, celula: Celula) -> Result<Value> {
@@ -349,35 +381,21 @@ impl Mssql {
     }
 }
 
-use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql};
+use super::{
+    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto, erro_de_prazo,
+    prazo_de_espera, teto_de_leitura,
+};
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
 
 impl Motor for Mssql {
     fn fontes(&mut self) -> Result<Vec<String>> {
-        let linhas = self.linhas(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = SCHEMA_NAME() AND table_type = 'BASE TABLE' \
-             ORDER BY table_name",
-            &[],
-        )?;
-        Ok(linhas
-            .iter()
-            .filter_map(|linha| {
-                linha
-                    .try_get::<&str, _>(0)
-                    .map_err(erro)
-                    .ok()
-                    .flatten()
-                    .map(str::to_string)
-            })
-            .collect())
+        let linhas = self.linhas(FONTES_SQL, &[])?;
+        Ok(linhas.iter().map(|linha| nome_da(linha, 0)).collect::<Result<Vec<_>>>()?)
     }
 
     fn colunas(&mut self, fonte: &str) -> Result<Vec<(String, String)>> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        self.colunas_conferidas(&conferida)
+        Ok(self.esquema_de(fonte)?.1)
     }
 
     fn consultar(
@@ -389,9 +407,7 @@ impl Motor for Mssql {
         limite: usize,
     ) -> Result<Consulta> {
         let cronometro = Cronometro::agora();
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         let pedidas = if colunas_pedidas.is_empty() {
             esquema.iter().map(|(nome, _)| nome.clone()).collect::<Vec<_>>()
         } else {
@@ -421,7 +437,7 @@ impl Motor for Mssql {
         // limite, e não que o banco acabou ali.
         let sql = format!(
             "SELECT TOP ({}) {} FROM {}{}{}",
-            limite.saturating_add(1),
+            teto_de_leitura(limite),
             selecao,
             citado(&conferida),
             onde,
@@ -437,22 +453,17 @@ impl Motor for Mssql {
             }
             saida.push(valores);
         }
-        let truncado = saida.len() > limite;
-        if truncado {
-            saida.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(Consulta {
             colunas: pedidas,
-            linhas: saida,
+            linhas,
             truncado,
             duracao_ms: cronometro.ms(),
         })
     }
 
     fn contar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         let mut params = Vec::new();
         let mut numero = 1usize;
         let onde = onde_sql(filtro, &esquema, &mut params, &mut numero)?;
@@ -468,9 +479,7 @@ impl Motor for Mssql {
     }
 
     fn inserir(&mut self, fonte: &str, valores: &Map<String, Value>) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -504,9 +513,7 @@ impl Motor for Mssql {
         valores: &Map<String, Value>,
         filtro: &Filtro,
     ) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -537,9 +544,7 @@ impl Motor for Mssql {
     }
 
     fn apagar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if filtro.is_empty() {
             bail!(tr("erros.bancoOndeObrigatorio", &[]));
         }
@@ -592,7 +597,7 @@ impl Motor for Mssql {
             .join(", ");
         let sql = format!(
             "SELECT TOP ({}) {} FROM ({declaracao}) AS [__aether__]",
-            limite.saturating_add(1),
+            teto_de_leitura(limite),
             selecao
         );
         let refs: Vec<&dyn tiberius::ToSql> = Vec::new();
@@ -605,13 +610,10 @@ impl Motor for Mssql {
             }
             saida.push(valores);
         }
-        let truncado = saida.len() > limite;
-        if truncado {
-            saida.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(ResultadoSql::Consulta(Consulta {
             colunas: celulas.into_iter().map(|(nome, _)| nome).collect(),
-            linhas: saida,
+            linhas,
             truncado,
             duracao_ms: cronometro.ms(),
         }))
@@ -630,6 +632,66 @@ fn erro(e: tiberius::error::Error) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::bancos::config::{conexao_de_teste, Tipo};
+    use crate::bancos::motor::PRAZO_DE_LEITURA;
+
+    /// O catálogo de uma fonte cabe numa declaração: a tabela conferida e as
+    /// colunas dela na mesma junta. Duas viagens — a lista inteira e depois as
+    /// colunas — é o que fazia cada leitura pagar duas idas antes de ler nada.
+    #[test]
+    fn o_catalogo_de_uma_fonte_e_uma_ida_s() {
+        assert!(
+            ESQUEMA_SQL.contains("information_schema.tables"),
+            "defeito 2: sem a tabela no catálogo junto das colunas, a fonte é conferida numa viagem e lida em outra"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("information_schema.columns"),
+            "defeito 2: sem as colunas na mesma viagem, cada leitura paga duas idas ao catálogo"
+        );
+        assert_eq!(
+            ESQUEMA_SQL.matches(';').count(),
+            0,
+            "o catálogo de uma fonte tem de caber numa declaração"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("LOWER(t.table_name) = LOWER(@P1)"),
+            "sem a conferência insensível no servidor, a fonte digitada em outra caixa sumiria"
+        );
+        assert!(
+            !FONTES_SQL.contains("information_schema.columns"),
+            "listar tabelas não descreve coluna nenhuma: é a segunda viagem que sobra aqui"
+        );
+    }
+
+    /// O prazo espera de verdade: o que passa dele volta como erro do prazo, e
+    /// não como resultado. A tarefa dorme mais que o prazo e devolve `Ok`, então
+    /// o único erro possível aqui é o relógio do motor.
+    #[test]
+    fn uma_ida_que_passa_do_prazo_nao_vira_espera_infinita() {
+        let runtime = super::super::agendador().expect("o agendador do processo nasce");
+        let resultado = esperar_prazo(
+            runtime,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<(), anyhow::Error>(())
+            },
+        );
+        let erro = match resultado {
+            Err(erro) => erro,
+            Ok(()) => panic!("defeito 4: a ida voltou depois de passar do prazo — ninguém esperou nada"),
+        };
+        assert!(
+            erro.to_string().contains('1'),
+            "a frase do prazo tem de dizer segundos: {erro}"
+        );
+    }
+
+    /// A espera do cliente fica um segundo acima do prazo: quando os dois
+    /// existem, o erro que chega primeiro tem de ser o do banco.
+    #[test]
+    fn a_espera_do_cliente_fica_acima_do_prazo() {
+        assert!(prazo_de_espera() > PRAZO_DE_LEITURA);
+    }
 
     /// A confiança sai da flag, e de nada mais. Numeral de porta e host são
     /// escritos à mão pelo dono e não podem, sozinhos, decidir se o canal é

@@ -302,7 +302,7 @@ fn colunas(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
     // para consulta também não tem as colunas divulgadas — estar no cadastro
     // não basta, a política por operação é que manda.
     let fonte = fonte_pedida(&conexao, args, Operacao::Ler)?;
-    let mut motor = motor::abrir(&conexao)?;
+    let mut motor = motor::abrir_para(&conexao, Operacao::Ler)?;
     let lista = motor.colunas(&fonte)?;
     let cartoes: Vec<ColunaCartao> = lista
         .iter()
@@ -343,13 +343,26 @@ fn colunas_pedidas(args: &Map<String, Value>) -> Result<Vec<String>> {
     }
 }
 
+/// A grelha serializada por referência: `json!` copiava cada `Vec<Value>` da
+/// consulta para depois serializar a cópia, e a mesma grelha ainda era movida
+/// para a vista. Uma passada sobre o que já está na mão, com os campos na ordem
+/// que o modelo sempre leu.
+#[derive(serde::Serialize)]
+struct ConsultaSerializada<'a> {
+    colunas: &'a [String],
+    linhas: &'a [Vec<Value>],
+    truncado: bool,
+    #[serde(rename = "duracaoMs")]
+    duracao_ms: u64,
+}
+
 fn texto_da_consulta(consulta: &motor::Consulta) -> String {
-    serde_json::to_string(&json!({
-        "colunas": consulta.colunas,
-        "linhas": consulta.linhas,
-        "truncado": consulta.truncado,
-        "duracaoMs": consulta.duracao_ms,
-    }))
+    serde_json::to_string(&ConsultaSerializada {
+        colunas: &consulta.colunas,
+        linhas: &consulta.linhas,
+        truncado: consulta.truncado,
+        duracao_ms: consulta.duracao_ms,
+    })
     .expect("consulta é sempre serializável")
 }
 
@@ -374,7 +387,7 @@ fn consultar(config: &Config, args: &Map<String, Value>) -> Result<local::Saida>
     let ordem =
         ordem_coluna.as_deref().map(|c| (c, local::booleano(args, "ordemDesc", false)));
     let limite = teto_da_consulta(&conexao, args);
-    let mut motor = motor::abrir(&conexao)?;
+    let mut motor = motor::abrir_para(&conexao, Operacao::Ler)?;
     let consulta = motor.consultar(&fonte, &pedidas, &filtro, ordem, limite)?;
     Ok(local::Saida::nova(
         texto_da_consulta(&consulta),
@@ -386,7 +399,7 @@ fn contar(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
     let conexao = conexao_pedida(config, args)?;
     let fonte = fonte_pedida(&conexao, args, Operacao::Ler)?;
     let filtro = motor::filtro_de(args.get("filtro"))?;
-    let mut motor = motor::abrir(&conexao)?;
+    let mut motor = motor::abrir_para(&conexao, Operacao::Ler)?;
     let cronometro = Cronometro::agora();
     let total = motor.contar(&fonte, &filtro)?;
     let texto = tr(
@@ -417,7 +430,7 @@ fn inserir(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
     let conexao = conexao_pedida(config, args)?;
     let fonte = fonte_pedida(&conexao, args, Operacao::Inserir)?;
     let valores = valores_pedidos(args)?;
-    let mut motor = motor::abrir(&conexao)?;
+    let mut motor = motor::abrir_para(&conexao, Operacao::Inserir)?;
     let cronometro = Cronometro::agora();
     let linhas = motor.inserir(&fonte, &valores)?;
     let texto = tr(
@@ -441,7 +454,7 @@ fn atualizar(config: &Config, args: &Map<String, Value>) -> Result<local::Saida>
     let fonte = fonte_pedida(&conexao, args, Operacao::Atualizar)?;
     let valores = valores_pedidos(args)?;
     let filtro = motor::filtro_de(args.get("filtro"))?;
-    let mut motor = motor::abrir(&conexao)?;
+    let mut motor = motor::abrir_para(&conexao, Operacao::Atualizar)?;
     let cronometro = Cronometro::agora();
     let linhas = motor.atualizar(&fonte, &valores, &filtro)?;
     let texto = tr(
@@ -464,7 +477,7 @@ fn apagar(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
     let conexao = conexao_pedida(config, args)?;
     let fonte = fonte_pedida(&conexao, args, Operacao::Apagar)?;
     let filtro = motor::filtro_de(args.get("filtro"))?;
-    let mut motor = motor::abrir(&conexao)?;
+    let mut motor = motor::abrir_para(&conexao, Operacao::Apagar)?;
     let cronometro = Cronometro::agora();
     let linhas = motor.apagar(&fonte, &filtro)?;
     let texto = tr(
@@ -492,7 +505,10 @@ fn sql(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
     }
     let declaracao = local::obrigatorio(args, "sql")?;
     let limite = teto_da_consulta(&conexao, args);
-    let mut motor = motor::abrir(&conexao)?;
+    // A declaração livre pode escrever — o dono ligou `sql_livre` exatamente para
+    // isso — então a alça é a cheia. O que a leitura tem de teto aqui é o mesmo
+    // das ferramentas: o cursor para no limite+1, nunca na tabela inteira.
+    let mut motor = motor::abrir_para(&conexao, Operacao::Atualizar)?;
     let cronometro = Cronometro::agora();
     match motor.sql(&declaracao, limite)? {
         ResultadoSql::Consulta(consulta) => Ok(local::Saida::nova(
@@ -875,6 +891,133 @@ mod tests {
         )
         .expect_err("colunas não são texto");
         assert!(!erro.to_string().is_empty());
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    /// A régua de alocações do teste de serialização. Local à linha e ligada
+    /// só durante a medida: os outros testes do crate alocam em paralelo na
+    /// mesma hora e não têm nada a ver com o que está sendo medido aqui.
+    mod regua {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static CONTANDO: Cell<bool> = const { Cell::new(false) };
+            static ALOCACOES: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct Regua;
+
+        // A medida não toca em memória própria: conta e entrega ao sistema.
+        unsafe impl GlobalAlloc for Regua {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                CONTANDO.with(|ligada| {
+                    if ligada.get() {
+                        ALOCACOES.with(|a| a.set(a.get() + 1));
+                    }
+                });
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, novo: usize) -> *mut u8 {
+                CONTANDO.with(|ligada| {
+                    if ligada.get() {
+                        ALOCACOES.with(|a| a.set(a.get() + 1));
+                    }
+                });
+                unsafe { System.realloc(ptr, layout, novo) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static REGUA: Regua = Regua;
+
+        /// Roda `f` devolvendo o resultado e quantas vezes a linha alocou.
+        pub fn medindo<T>(f: impl FnOnce() -> T) -> (T, usize) {
+            ALOCACOES.with(|a| a.set(0));
+            CONTANDO.with(|ligada| ligada.set(true));
+            let resultado = f();
+            CONTANDO.with(|ligada| ligada.set(false));
+            (resultado, ALOCACOES.with(|a| a.get()))
+        }
+    }
+
+    /// A resposta da leitura era montada duas vezes: `json!` copiava a grelha
+    /// inteira para um Value e a mesma grelha ainda movia para a vista. O texto
+    /// é o mesmo, byte a byte — o que não pode mais é custar uma cópia.
+    #[test]
+    fn a_saida_da_leitura_nao_copia_a_grelha() {
+        let consulta = motor::Consulta {
+            colunas: (0..8).map(|i| format!("coluna {i}")).collect(),
+            linhas: (0..200)
+                .map(|l| (0..8).map(|i| Value::String(format!("valor {i} da linha {l}"))).collect())
+                .collect(),
+            truncado: false,
+            duracao_ms: 12,
+        };
+        // A forma antiga, construída fora da medida: serve de referência do que
+        // o modelo sempre leu, e de prova de que a mudança não altera a saída.
+        let referencia = serde_json::to_string(&json!({
+            "colunas": consulta.colunas,
+            "linhas": consulta.linhas,
+            "truncado": consulta.truncado,
+            "duracaoMs": consulta.duracao_ms,
+        }))
+        .expect("referência serializável");
+        let (texto, alocacoes) = regua::medindo(|| texto_da_consulta(&consulta));
+        assert_eq!(texto, referencia, "defeito 6: o texto que o modelo lê mudou de forma");
+        assert!(
+            alocacoes <= 32,
+            "defeito 6: serializar a grelha de 200×8 custou {alocacoes} alocações — ela está \
+             sendo copiada antes de virar texto, em vez de serializada no lugar"
+        );
+    }
+
+    /// A ferramenta de leitura faz as duas viagens do motor no arquivo — catálogo
+    /// uma, dado uma — e devolve o texto com as chaves de sempre, na ordem de
+    /// sempre.
+    #[test]
+    fn a_ferramenta_de_leitura_faz_duas_viagens_no_arquivo() {
+        let b = bancada();
+        crate::bancos::motor::sqlite::leitura_zerada();
+        let saida = executar(
+            "bancos_consultar",
+            json!({ "conexao": "Estoque", "fonte": "clientes" }),
+            &b.config_path,
+        )
+        .expect("consulta");
+        let viagens = crate::bancos::motor::sqlite::comandos_contados();
+        assert_eq!(viagens, 2, "defeito 2: bancos_consultar custou {viagens} declarações no arquivo");
+        assert!(
+            saida.texto.starts_with(
+                "{\"colunas\":[\"id\",\"nome\"],\"linhas\":[[1,\"Ana\"],[2,\"Bruno\"]],\"truncado\":false,\"duracaoMs\":"
+            ),
+            "o texto da leitura saiu diferente: {}",
+            saida.texto
+        );
+        assert!(saida.texto.ends_with('}'), "o texto não fecha o objeto: {}", saida.texto);
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    /// Ler pela ferramenta não pode escrever: a alça que `bancos_consultar` abre
+    /// é a de leitura, e uma escrita pelo `bancos_sql` continua possível onde o
+    /// dono ligou o SQL livre.
+    #[test]
+    fn a_leitura_da_ferramenta_nao_deixa_rastro_no_arquivo() {
+        let b = bancada();
+        let antes = std::fs::read(&b.raiz.join("estoque.db")).expect("lê o arquivo");
+        for _ in 0..2 {
+            executar(
+                "bancos_consultar",
+                json!({ "conexao": "Estoque", "fonte": "clientes" }),
+                &b.config_path,
+            )
+            .expect("consulta");
+        }
+        let depois = std::fs::read(&b.raiz.join("estoque.db")).expect("relê o arquivo");
+        assert_eq!(antes, depois, "defeito 7: a ferramenta de leitura mexeu no arquivo");
         std::fs::remove_dir_all(&b.raiz).ok();
     }
 }

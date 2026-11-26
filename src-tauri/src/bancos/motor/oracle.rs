@@ -13,9 +13,34 @@ use oracledb::{
 };
 use serde_json::{Map, Value};
 
-use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql};
+use super::{
+    Comparacao, Consulta, Cronometro, Filtro, Motor, PRAZO_DE_LEITURA, ResultadoSql, aparar_no_teto,
+    teto_de_leitura,
+};
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
+
+/// A ida única ao catálogo de uma fonte: a tabela conferida e as colunas dela,
+/// na ordem e com o nome que o próprio banco grafa. `UPPER(...) = UPPER(:1)` é o
+/// que fazia a busca da lista ser insensível, sem trazer a lista inteira — e o
+/// nome entra como parâmetro cru, porque entre aspas ele não é o nome que o
+/// dicionário guarda.
+const ESQUEMA_SQL: &str = "SELECT t.table_name, c.column_name, c.data_type \
+     FROM user_tables t JOIN user_tab_columns c ON c.table_name = t.table_name \
+     WHERE UPPER(t.table_name) = UPPER(:1) ORDER BY c.column_id";
+
+/// O nome entre aspas duplas, pronto para entrar no SQL: sempre depois de
+/// conferido no dicionário — nunca interpolado do texto do modelo.
+fn conferido(nome: &str) -> String {
+    format!("\"{}\"", nome.replace('"', "\"\""))
+}
+
+/// O nome como o dicionário o guarda: cru. Entre aspas ele vira `""NOME""` e não
+/// acha tabela nem coluna nenhuma — é assim que uma fonte existente passa a
+/// responder «coluna inexistente» em toda leitura.
+fn nome_no_dicionario(fonte: &str) -> String {
+    fonte.trim().to_string()
+}
 
 /// Como ler uma célula, decidido pelo tipo que o banco declara na coluna. O
 /// driver não converte por conta própria — cada estratégia pede o tipo Rust
@@ -198,45 +223,48 @@ impl Oracle {
             .map_err(erro)?
             .set_credentials(&usuario, &ficha.senha()?);
         let conexao = oracledb::connect(config).map_err(erro)?;
+        // O prazo do motorista: `call_timeout` é o relógio que o próprio driver
+        // impõe a cada chamada de rede. Sem ele, um servidor que para de
+        // responder à consulta deixa a ferramenta pendurada até o dono fechar o
+        // aplicativo — e o thin mode não tem variável de sessão que faça isso.
+        conexao.set_call_timeout(Some(PRAZO_DE_LEITURA)).map_err(erro)?;
         Ok(Self { conexao })
     }
 
-    /// O nome entre aspas duplas, depois de confirmado na lista que veio do
-    /// banco. O que não está na lista não é interpolado.
-    fn conferir_fonte<'a>(&self, fonte: &str, conhecidas: &'a [String]) -> Result<String> {
-        conhecidas
-            .iter()
-            .find(|nome| nome.eq_ignore_ascii_case(fonte))
-            .map(|nome| format!("\"{}\"", nome.replace('"', "\"\"")))
-            .ok_or_else(|| anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])))
+    /// A única ida ao catálogo que uma leitura precisa: a fonte conferida, com o
+    /// nome que o banco grafa, e as colunas dela. Antes eram duas — e a segunda
+    /// recebia o nome já entre aspas, que no dicionário é `""NOME""` e não acha
+    /// coluna nenhuma: toda leitura com coluna ou filtro nomeados caía em
+    /// «coluna inexistente».
+    fn esquema_de(&self, fonte: &str) -> Result<(String, Vec<(String, String)>)> {
+        let procurada = nome_no_dicionario(fonte);
+        let refs: Vec<&dyn ToDbValue> = vec![&procurada];
+        let cursor = self.conexao.query(ESQUEMA_SQL, &refs).map_err(erro)?;
+        let mut conferida: Option<String> = None;
+        let mut esquema = Vec::new();
+        for linha in cursor {
+            let linha = linha.map_err(erro)?;
+            let nome_tabela = linha.get::<Option<String>>(0).map_err(erro)?.unwrap_or_default();
+            let nome = linha.get::<Option<String>>(1).map_err(erro)?.unwrap_or_default();
+            let tipo = linha.get::<Option<String>>(2).map_err(erro)?.unwrap_or_default();
+            if conferida.is_none() && !nome_tabela.is_empty() {
+                conferida = Some(nome_tabela);
+            }
+            if !nome.is_empty() {
+                esquema.push((nome, tipo));
+            }
+        }
+        let conferida = conferida
+            .ok_or_else(|| anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])))?;
+        Ok((conferida, esquema))
     }
 
     fn conferir_coluna(coluna: &str, conhecidas: &[(String, String)]) -> Result<String> {
         conhecidas
             .iter()
             .find(|(nome, _)| nome.eq_ignore_ascii_case(coluna))
-            .map(|(nome, _)| format!("\"{}\"", nome.replace('"', "\"\"")))
+            .map(|(nome, _)| conferido(&nome))
             .ok_or_else(|| anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", coluna)])))
-    }
-
-    fn colunas_interno(&self, fonte: &str) -> Result<Vec<(String, String)>> {
-        let conferida = fonte.replace('"', "\"\"");
-        let refs: Vec<&dyn ToDbValue> = vec![&conferida];
-        let cursor = self
-            .conexao
-            .query(
-                "SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id",
-                &refs,
-            )
-            .map_err(erro)?;
-        let mut colunas = Vec::new();
-        for linha in cursor {
-            let linha = linha.map_err(erro)?;
-            let nome = linha.get::<Option<String>>(0).map_err(erro)?.unwrap_or_default();
-            let tipo = linha.get::<Option<String>>(1).map_err(erro)?.unwrap_or_default();
-            colunas.push((nome, tipo));
-        }
-        Ok(colunas)
     }
 
     /// A marca do parâmetro com o valor que o modelo mandou — `TO_NUMBER(:1)`,
@@ -421,7 +449,7 @@ impl Oracle {
             .map(|meta| (meta.name().to_string(), celula_de_tipo(meta.db_type())))
             .collect();
         let mut linhas: Vec<Vec<Value>> = Vec::new();
-        while linhas.len() < limite.saturating_add(1) {
+        while linhas.len() < teto_de_leitura(limite) {
             let Some(linha) = cursor.next() else {
                 break;
             };
@@ -434,10 +462,7 @@ impl Oracle {
                     .collect::<Result<Vec<_>>>()?,
             );
         }
-        let truncado = linhas.len() > limite;
-        if truncado {
-            linhas.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(linhas, limite);
         let colunas = estrategias.into_iter().map(|(nome, _)| nome).collect();
         Ok(Consulta { colunas, linhas, truncado, duracao_ms: cronometro.ms() })
     }
@@ -468,9 +493,7 @@ impl Motor for Oracle {
     }
 
     fn colunas(&mut self, fonte: &str) -> Result<Vec<(String, String)>> {
-        let conhecidas = self.fontes()?;
-        let fonte = self.conferir_fonte(fonte, &conhecidas)?;
-        self.colunas_interno(&fonte)
+        Ok(self.esquema_de(fonte)?.1)
     }
 
     fn consultar(
@@ -482,11 +505,17 @@ impl Motor for Oracle {
         limite: usize,
     ) -> Result<Consulta> {
         let cronometro = Cronometro::agora();
-        let conhecidas = self.fontes()?;
-        let fonte = self.conferir_fonte(fonte, &conhecidas)?;
-        let schema = self.colunas_interno(&fonte)?;
+        let (cru, schema) = self.esquema_de(fonte)?;
+        let fonte = conferido(&cru);
+        // Sem colunas pedidas entram as que o dicionário tem — que é o que a
+        // fonte autoriza. O `*` do lado de fora não alarga nada: quem decide a
+        // lista é o embrulho de dentro.
         let colunas_sql = if colunas_pedidas.is_empty() {
-            "*".to_string()
+            schema
+                .iter()
+                .map(|(nome, _)| conferido(nome))
+                .collect::<Vec<_>>()
+                .join(", ")
         } else {
             colunas_pedidas
                 .iter()
@@ -507,7 +536,7 @@ impl Motor for Oracle {
         // limite, e não que o banco acabou ali.
         let sql = format!(
             "SELECT * FROM (SELECT {colunas_sql} FROM {fonte}{onde}{ordenar}) WHERE ROWNUM <= {}",
-            limite.saturating_add(1)
+            teto_de_leitura(limite)
         );
         let refs: Vec<&dyn ToDbValue> =
             params.iter().map(|p| p as &dyn ToDbValue).collect::<Vec<_>>();
@@ -516,9 +545,8 @@ impl Motor for Oracle {
     }
 
     fn contar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let fonte = self.conferir_fonte(fonte, &conhecidas)?;
-        let schema = self.colunas_interno(&fonte)?;
+        let (cru, schema) = self.esquema_de(fonte)?;
+        let fonte = conferido(&cru);
         let mut params = Vec::new();
         let onde = Self::onde_sql(filtro, &schema, &mut params)?;
         let sql = format!("SELECT COUNT(*) FROM {fonte}{onde}");
@@ -533,9 +561,8 @@ impl Motor for Oracle {
     }
 
     fn inserir(&mut self, fonte: &str, valores: &Map<String, Value>) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let fonte = self.conferir_fonte(fonte, &conhecidas)?;
-        let schema = self.colunas_interno(&fonte)?;
+        let (cru, schema) = self.esquema_de(fonte)?;
+        let fonte = conferido(&cru);
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -560,9 +587,8 @@ impl Motor for Oracle {
         valores: &Map<String, Value>,
         filtro: &Filtro,
     ) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let fonte = self.conferir_fonte(fonte, &conhecidas)?;
-        let schema = self.colunas_interno(&fonte)?;
+        let (cru, schema) = self.esquema_de(fonte)?;
+        let fonte = conferido(&cru);
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -584,9 +610,8 @@ impl Motor for Oracle {
     }
 
     fn apagar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let fonte = self.conferir_fonte(fonte, &conhecidas)?;
-        let schema = self.colunas_interno(&fonte)?;
+        let (cru, schema) = self.esquema_de(fonte)?;
+        let fonte = conferido(&cru);
         if filtro.is_empty() {
             bail!(tr("erros.bancoOndeObrigatorio", &[]));
         }
@@ -620,6 +645,59 @@ impl Motor for Oracle {
 mod tests {
     use super::*;
     use crate::bancos::config::{conexao_de_teste, Tipo};
+
+    /// O catálogo de uma fonte cabe numa declaração: a tabela conferida e as
+    /// colunas dela na mesma junta. Duas viagens — a lista inteira de `user_tables`
+    /// e depois `user_tab_columns` — é o que cada leitura pagava antes de ler.
+    #[test]
+    fn o_catalogo_de_uma_fonte_e_uma_ida_s() {
+        assert!(
+            ESQUEMA_SQL.contains("user_tables"),
+            "defeito 2: sem a tabela no catálogo junto das colunas, a fonte é conferida numa viagem e lida em outra"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("user_tab_columns"),
+            "defeito 2: sem as colunas na mesma viagem, cada leitura paga duas idas ao catálogo"
+        );
+        assert_eq!(
+            ESQUEMA_SQL.matches(';').count(),
+            0,
+            "o catálogo de uma fonte tem de caber numa declaração"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("UPPER(t.table_name) = UPPER(:1)"),
+            "sem a conferência insensível no servidor, a fonte digitada em outra caixa sumiria"
+        );
+    }
+
+    /// O nome que vai para o dicionário é o cru. Entre aspas — que é o que o
+    /// identificador citado é — `user_tab_columns.table_name` não tem como
+    /// bater, e a fonte existente passava a responder «coluna inexistente» em
+    /// toda leitura que nomeasse coluna.
+    #[test]
+    fn o_nome_que_se_pede_ao_dicionario_e_cru() {
+        assert_eq!(nome_no_dicionario("  Pedes  "), "Pedes");
+        assert!(
+            !nome_no_dicionario("Pedes").contains('"'),
+            "defeito 2: o nome citado não é o que o dicionário guarda"
+        );
+        assert_eq!(conferido("Pedes"), "\"Pedes\"", "o que entra no SQL é citado");
+        assert_eq!(conferido("A\"B"), "\"A\"\"B\"", "a aspas dentro do nome se dobra");
+    }
+
+    /// O que só um servidor de verdade responde: o `call_timeout` aplicado na
+    /// conexão aberta é o prazo do motor. Fica ignorado porque esta máquina não
+    /// tem Oracle — medir isto aqui seria fingir.
+    #[ignore = "precisa de um Oracle real; sem ele não há conexão em que ler o prazo"]
+    #[test]
+    fn a_conexao_abre_com_o_prazo_do_motor() {
+        let conexao = Oracle::abrir(&conexao_de_teste(Tipo::Oracle)).expect("oracle de verdade");
+        assert_eq!(
+            conexao.conexao.call_timeout().expect("o driver responde o prazo"),
+            Some(PRAZO_DE_LEITURA),
+            "defeito 4: a conexão abre sem relógio nenhum"
+        );
+    }
 
     /// A flag é a única coisa que muda a string, e ela muda só o protocolo: o
     /// mesmo servidor, a mesma porta de fábrica e o mesmo serviço dos dois

@@ -6,7 +6,9 @@
 //! e um mesmo campo pode ser número num documento e texto noutro. O nome de
 //! campo é conferido por regra própria (nunca `$`, que é operador do Mongo, não
 //! identificador) — não por SQL, porque aqui não há SQL: os filtros viram
-//! consultas BSON pela API do driver, sem interpolar texto em nenhum ponto.
+//! consultas BSON pela API do driver, sem interpolar texto em nenhum ponto. O
+//! agendador é do processo, como nos demais motores de rede — ver
+//! `super::agendador`.
 
 use anyhow::{Result, anyhow, bail};
 use mongodb::{
@@ -17,7 +19,10 @@ use mongodb::{
 use serde_json::{Map, Value};
 use std::time::Duration;
 
-use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql};
+use super::{
+    Comparacao, Consulta, Cronometro, Filtro, Motor, PRAZO_DE_LEITURA, ResultadoSql,
+    aparar_no_teto, erro_de_prazo, prazo_de_espera, teto_de_leitura,
+};
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
 
@@ -25,7 +30,7 @@ use crate::idiomas::tr;
 const AMOSTRA: usize = 100;
 
 pub struct Mongo {
-    runtime: tokio::runtime::Runtime,
+    runtime: &'static tokio::runtime::Runtime,
     cliente: Client,
     banco: String,
 }
@@ -249,6 +254,27 @@ fn tls_da(conexao: &Conexao) -> Option<Tls> {
     conexao.tls_verificado.then(|| Tls::Enabled(TlsOptions::default()))
 }
 
+/// A espera de quem tem prazo no servidor mas não tem na conexão inteira: o
+/// `maxTimeMS` mata a consulta no Mongo, e o prazo do cliente é o que cobre o
+/// resto — um servidor que para de responder ao cursor deixaria a conversa
+/// pendurada para sempre sem ele.
+fn esperar_prazo<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    prazo: Duration,
+    futuro: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    runtime.block_on(async move {
+        tokio::time::timeout(prazo, futuro).await.map_err(|_| erro_de_prazo())?
+    })
+}
+
+fn esperar<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    futuro: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    esperar_prazo(runtime, prazo_de_espera(), futuro)
+}
+
 impl Mongo {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         if conexao.banco.trim().is_empty() {
@@ -275,10 +301,32 @@ impl Mongo {
         // O cliente do Mongo não conecta aqui: conecta na primeira operação, e é
         // lá que um host errado vira erro de verdade.
         let cliente = Client::with_options(opcoes).map_err(erro)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        Ok(Self { runtime, cliente, banco: conexao.banco.trim().to_string() })
+        Ok(Self {
+            runtime: super::agendador()?,
+            cliente,
+            banco: conexao.banco.trim().to_string(),
+        })
+    }
+
+    /// A coleção existe? O servidor responde com a lista filtrada pelo nome, e é
+    /// uma viagem de uma linha: `fontes()` inteira traz o nome de todas as
+    /// coleções do banco para comparar aqui, e a leitura não precisa delas.
+    fn colecao_conferida(&mut self, fonte: &str) -> Result<String> {
+        let cliente = self.cliente.clone();
+        let banco = self.banco.clone();
+        let pedida = fonte.trim().to_string();
+        let nomes = esperar(self.runtime, {
+            let procurada = pedida.clone();
+            async move {
+                cliente
+                    .database(&banco)
+                    .list_collection_names()
+                    .filter(doc! { "name": procurada })
+                    .await
+                    .map_err(erro)
+            }
+        })?;
+        conferir_colecao(&pedida, &nomes).map(str::to_string)
     }
 
     /// A união das chaves de uma amostra, na ordem em que apareceram: é o
@@ -290,6 +338,7 @@ impl Mongo {
             .collection::<DocBson>(colecao)
             .find(DocBson::new())
             .limit(AMOSTRA as i64)
+            .max_time(PRAZO_DE_LEITURA)
             .await
             .map_err(erro)?;
         let mut cursor = cursor;
@@ -310,7 +359,7 @@ impl Motor for Mongo {
     fn fontes(&mut self) -> Result<Vec<String>> {
         let cliente = self.cliente.clone();
         let banco = self.banco.clone();
-        self.runtime.block_on(async move {
+        esperar(self.runtime, async move {
             let mut nomes = cliente
                 .database(&banco)
                 .list_collection_names()
@@ -320,14 +369,14 @@ impl Motor for Mongo {
             // SQLite: não é coleção de dono.
             nomes.retain(|nome| !nome.starts_with("system."));
             nomes.sort();
-            Ok::<_, anyhow::Error>(nomes)
+            Ok(nomes)
         })
     }
 
     fn colunas(&mut self, fonte: &str) -> Result<Vec<(String, String)>> {
-        let conhecidas = self.fontes()?;
-        let colecao = conferir_colecao(fonte, &conhecidas)?.to_string();
-        self.runtime.block_on(self.amostrar(&colecao))
+        let colecao = self.colecao_conferida(fonte)?;
+        let amostra = esperar(self.runtime, self.amostrar(&colecao))?;
+        Ok(amostra)
     }
 
     fn consultar(
@@ -339,11 +388,10 @@ impl Motor for Mongo {
         limite: usize,
     ) -> Result<Consulta> {
         let cronometro = Cronometro::agora();
-        let conhecidas = self.fontes()?;
-        let colecao = conferir_colecao(fonte, &conhecidas)?.to_string();
+        let colecao = self.colecao_conferida(fonte)?;
         let consulta = filtro_bson(filtro)?;
         let pedidas: Vec<String> = if colunas_pedidas.is_empty() {
-            let amostra = self.runtime.block_on(self.amostrar(&colecao))?;
+            let amostra = esperar(self.runtime, self.amostrar(&colecao))?;
             amostra.into_iter().map(|(nome, _)| nome).collect()
         } else {
             colunas_pedidas
@@ -360,7 +408,10 @@ impl Motor for Mongo {
             .collection::<DocBson>(&colecao);
         // Campos pedidos entram como projeção — o Mongo devolve o que pediu, e
         // o que não tem no documento volta nulo na linha.
-        let mut achado = alvo.find(consulta).limit(limite.saturating_add(1) as i64);
+        let mut achado = alvo
+            .find(consulta)
+            .limit(teto_de_leitura(limite) as i64)
+            .max_time(PRAZO_DE_LEITURA);
         if let Some((coluna, desc)) = ordem {
             let mut ordenar = DocBson::new();
             ordenar.insert(conferir_campo(coluna)?, Bson::Int32(if desc { -1 } else { 1 }));
@@ -373,42 +424,42 @@ impl Motor for Mongo {
             }
             achado = achado.projection(projecao);
         }
-        let mut cursor = self
-            .runtime
-            .block_on(async move { achado.await })
-            .map_err(erro)?;
-        let mut linhas: Vec<Vec<Value>> = Vec::new();
-        while linhas.len() < limite.saturating_add(1) {
-            if !self.runtime.block_on(cursor.advance()).map_err(erro)? {
-                break;
+        // A busca e o despejo do cursor cabem numa espera só: `maxTimeMS` mata a
+        // consulta no servidor, mas é o cursor que fica pendurado entre uma
+        // página e outra, e é a leitura inteira que tem um prazo.
+        let colunas_da_linha = pedidas.clone();
+        let saida = esperar(self.runtime, async move {
+            let mut cursor = achado.await.map_err(erro)?;
+            let mut linhas: Vec<Vec<Value>> = Vec::new();
+            while linhas.len() < teto_de_leitura(limite) {
+                if !cursor.advance().await.map_err(erro)? {
+                    break;
+                }
+                let documento = cursor.deserialize_current().map_err(erro)?;
+                linhas.push(
+                    colunas_da_linha
+                        .iter()
+                        .map(|coluna| {
+                            documento
+                                .get(coluna)
+                                .map(bson_para_json)
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect(),
+                );
             }
-            let documento = cursor.deserialize_current().map_err(erro)?;
-            linhas.push(
-                pedidas
-                    .iter()
-                    .map(|coluna| {
-                        documento
-                            .get(coluna)
-                            .map(bson_para_json)
-                            .unwrap_or(Value::Null)
-                    })
-                    .collect(),
-            );
-        }
-        let truncado = linhas.len() > limite;
-        if truncado {
-            linhas.truncate(limite);
-        }
+            Ok(linhas)
+        })?;
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(Consulta { colunas: pedidas, linhas, truncado, duracao_ms: cronometro.ms() })
     }
 
     fn contar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let colecao = conferir_colecao(fonte, &conhecidas)?.to_string();
+        let colecao = self.colecao_conferida(fonte)?;
         let consulta = filtro_bson(filtro)?;
         let cliente = self.cliente.clone();
         let banco = self.banco.clone();
-        self.runtime.block_on(async move {
+        esperar(self.runtime, async move {
             cliente
                 .database(&banco)
                 .collection::<DocBson>(&colecao)
@@ -419,12 +470,11 @@ impl Motor for Mongo {
     }
 
     fn inserir(&mut self, fonte: &str, valores: &Map<String, Value>) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let colecao = conferir_colecao(fonte, &conhecidas)?.to_string();
+        let colecao = self.colecao_conferida(fonte)?;
         let documento = documento_de(valores)?;
         let cliente = self.cliente.clone();
         let banco = self.banco.clone();
-        self.runtime.block_on(async move {
+        esperar(self.runtime, async move {
             cliente
                 .database(&banco)
                 .collection::<DocBson>(&colecao)
@@ -441,8 +491,7 @@ impl Motor for Mongo {
         valores: &Map<String, Value>,
         filtro: &Filtro,
     ) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let colecao = conferir_colecao(fonte, &conhecidas)?.to_string();
+        let colecao = self.colecao_conferida(fonte)?;
         if filtro.is_empty() {
             bail!(tr("erros.bancoOndeObrigatorio", &[]));
         }
@@ -456,7 +505,7 @@ impl Motor for Mongo {
         let consulta = filtro_bson(filtro)?;
         let cliente = self.cliente.clone();
         let banco = self.banco.clone();
-        let atualizadas = self.runtime.block_on(async move {
+        let atualizadas = esperar(self.runtime, async move {
             cliente
                 .database(&banco)
                 .collection::<DocBson>(&colecao)
@@ -468,15 +517,14 @@ impl Motor for Mongo {
     }
 
     fn apagar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let colecao = conferir_colecao(fonte, &conhecidas)?.to_string();
+        let colecao = self.colecao_conferida(fonte)?;
         if filtro.is_empty() {
             bail!(tr("erros.bancoOndeObrigatorio", &[]));
         }
         let consulta = filtro_bson(filtro)?;
         let cliente = self.cliente.clone();
         let banco = self.banco.clone();
-        let apagadas = self.runtime.block_on(async move {
+        let apagadas = esperar(self.runtime, async move {
             cliente
                 .database(&banco)
                 .collection::<DocBson>(&colecao)
@@ -498,6 +546,33 @@ mod tests {
     use crate::bancos::config::{conexao_de_teste, Tipo};
     use crate::bancos::motor::filtro_de;
     use serde_json::json;
+
+    /// O prazo espera de verdade, e cobre a leitura inteira: no Mongo o
+    /// `maxTimeMS` mata a consulta no servidor, mas o cursor é despejado ida a
+    /// ida, e era cada uma delas que não tinha relógio nenhum. A tarefa dorme
+    /// mais que o prazo e devolve `Ok`, então o único erro possível é o relógio.
+    #[test]
+    fn uma_ida_que_passa_do_prazo_nao_vira_espera_infinita() {
+        let runtime = super::super::agendador().expect("o agendador do processo nasce");
+        let resultado = esperar_prazo(
+            runtime,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<(), anyhow::Error>(())
+            },
+        );
+        let erro = match resultado {
+            Err(erro) => erro,
+            Ok(()) => {
+                panic!("defeito 4: a ida voltou depois de passar do prazo — ninguém esperou nada")
+            }
+        };
+        assert!(
+            erro.to_string().contains('1'),
+            "a frase do prazo tem de dizer segundos: {erro}"
+        );
+    }
 
     /// Uma chave `$` no valor é operador da gramática do Mongo, não dado:
     /// aceita-la transformaria o filtro em consulta sempre-verdadeira e o

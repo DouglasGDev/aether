@@ -4,9 +4,8 @@
 //! textual (`$n::text`) e é convertido para o tipo que a coluna declara — o
 //! servidor nunca recebe texto do modelo no lugar de um identificador: nomes
 //! de tabela e coluna são conferidos contra o esquema descoberto do banco
-//! antes de entrar entre aspas. O driver é assíncrono, então cada conexão
-//! traz seu próprio runtime de uma thread: a ferramenta roda bloqueante e
-//! episódica, e o runtime morre com ela.
+//! antes de entrar entre aspas. O driver é assíncrono: a conexão é da chamada,
+//! mas o agendador é do processo — ver `super::agendador`.
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
@@ -14,12 +13,15 @@ use tokio_postgres::NoTls;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::Type;
 
-use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql};
+use super::{
+    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto, erro_de_prazo,
+    prazo_de_espera, prazo_em_ms, teto_de_leitura,
+};
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
 
 pub struct Postgres {
-    runtime: tokio::runtime::Runtime,
+    runtime: &'static tokio::runtime::Runtime,
     cliente: tokio_postgres::Client,
 }
 
@@ -104,20 +106,36 @@ fn citado(nome: &str) -> String {
     format!("\"{}\"", nome.replace('"', "\"\""))
 }
 
-fn conferir_fonte(fonte: &str, conhecidas: &[String]) -> Result<String> {
-    conhecidas
-        .iter()
-        .find(|nome| nome.eq_ignore_ascii_case(fonte))
-        .cloned()
-        .ok_or_else(|| anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])))
-}
-
 fn conferir_coluna(coluna: &str, conhecidas: &[(String, String)]) -> Result<(String, String)> {
     conhecidas
         .iter()
         .find(|(nome, _)| nome.eq_ignore_ascii_case(coluna))
         .cloned()
         .ok_or_else(|| anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", coluna)])))
+}
+
+/// A ida única ao catálogo de uma fonte: a tabela conferida e as colunas dela,
+/// na ordem e com o nome que o próprio banco grafa. `LOWER(...) = LOWER($n)` é o
+/// que fazia a busca insensível da lista, sem trazer a lista inteira.
+const ESQUEMA_SQL: &str = "SELECT t.table_name::text, c.column_name::text, c.data_type::text \
+     FROM information_schema.tables AS t \
+     JOIN information_schema.columns AS c \
+       ON c.table_schema = t.table_schema AND c.table_name = t.table_name \
+     WHERE t.table_schema = current_schema() AND t.table_type = 'BASE TABLE' \
+       AND LOWER(t.table_name) = LOWER($1) \
+     ORDER BY c.ordinal_position";
+
+/// As tabelas do esquema atual, para a lista que o dono vê — uma viagem só, e o
+/// `bancos_tabelas` não descreve coluna nenhuma delas.
+const FONTES_SQL: &str = "SELECT table_name::text FROM information_schema.tables \
+     WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
+     ORDER BY table_name";
+
+fn nome_da(linha: &tokio_postgres::Row, indice: usize) -> Result<String> {
+    Ok(linha
+        .try_get::<_, Option<String>>(indice)
+        .map_err(erro)?
+        .unwrap_or_default())
 }
 
 /// Todo parâmetro sai como texto do JSON: número vira "5", booleano vira
@@ -160,47 +178,70 @@ fn ficha_de(conexao: &Conexao, senha: &str) -> tokio_postgres::Config {
     if conexao.tls_verificado {
         ficha.ssl_mode(SslMode::Require);
     }
+    // O prazo vai na ficha de abertura, como parâmetro do servidor: uma
+    // declaração pendurada custa a conversa inteira, e `statement_timeout` é o
+    // que faz o próprio Postgres desistir — sem ida extra ao servidor e sem
+    // depender de o cliente saber cancelar.
+    ficha.options(format!("-c statement_timeout={}", prazo_em_ms()));
     ficha
+}
+
+/// A espera com relógio. O `timeout` nasce DENTRO do `block_on`: o `Sleep` do
+/// prazo não se constrói fora de um agendador — não há reactor ali — e montá-lo
+/// antes do `block_on` fazia toda chamada paniar na primeira consulta, o que é
+/// um jeito novo de nunca ler nada.
+fn esperar_prazo<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    prazo: std::time::Duration,
+    futuro: impl std::future::Future<Output = std::result::Result<T, tokio_postgres::Error>>,
+) -> Result<T> {
+    runtime.block_on(async move {
+        tokio::time::timeout(prazo, futuro)
+            .await
+            .map_err(|_| erro_de_prazo())?
+            .map_err(erro)
+    })
 }
 
 impl Postgres {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         let senha = conexao.senha()?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())])))?;
+        let runtime = super::agendador()?;
         let (cliente, driver) = runtime
             .block_on(async { ficha_de(conexao, senha.as_str()).connect(NoTls).await })
             .map_err(erro_abrir)?;
-        // O driver da conexão é uma tarefa à parte: sem ele rodando, nenhuma
-        // consulta é respondida. Morre junto com o runtime, quando o motor é
-        // descartado no fim da chamada.
+        // O driver da conexão é uma tarefa à parte: sem ela rodando, nenhuma
+        // consulta é respondida. Vive no agendador do processo e morre quando a
+        // conexão cai, no fim da chamada.
         let _driver = runtime.spawn(driver);
         Ok(Self { runtime, cliente })
     }
 
-    /// As colunas de uma fonte já conferida — sem passar de novo pela lista de
-    /// fontes, porque quem chama já conferiu.
-    fn colunas_conferidas(&self, conferida: &str) -> Result<Vec<(String, String)>> {
-        let linhas = self
-            .runtime
-            .block_on(self.cliente.query(
-                "SELECT column_name::text, data_type::text FROM information_schema.columns \
-                 WHERE table_schema = current_schema() AND table_name = $1 \
-                 ORDER BY ordinal_position",
-                &[&conferida],
-            ))
-            .map_err(erro)?;
-        Ok(linhas
-            .iter()
-            .map(|linha| {
-                Ok((
-                    linha.try_get::<_, Option<String>>(0).map_err(erro)?.unwrap_or_default(),
-                    linha.try_get::<_, Option<String>>(1).map_err(erro)?.unwrap_or_default(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?)
+    /// A espera de quem já tem `statement_timeout` do lado do servidor: um
+    /// segundo a mais, para que o erro que chega primeiro seja o do banco, que
+    /// sabe dizer o que expirou. Sem ele, um servidor que não responde ao
+    /// cancelamento seguraria a conversa para sempre.
+    fn espera<T>(
+        &self,
+        futuro: impl std::future::Future<Output = std::result::Result<T, tokio_postgres::Error>>,
+    ) -> Result<T> {
+        esperar_prazo(self.runtime, prazo_de_espera(), futuro)
+    }
+
+    /// A única ida ao catálogo que uma leitura precisa: a tabela conferida e as
+    /// colunas dela, juntas. Antes eram duas — a lista de tabelas e, para cada
+    /// tabela da lista, o que o chamador já podia ter pedido direto.
+    fn esquema_de(&mut self, fonte: &str) -> Result<(String, Vec<(String, String)>)> {
+        let linhas = self.espera(self.cliente.query(ESQUEMA_SQL, &[&fonte]))?;
+        let Some(primeira) = linhas.first() else {
+            return Err(anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])));
+        };
+        let conferida = nome_da(primeira, 0)?;
+        let mut esquema = Vec::with_capacity(linhas.len());
+        for linha in &linhas {
+            esquema.push((nome_da(linha, 1)?, nome_da(linha, 2).unwrap_or_default()));
+        }
+        Ok((conferida, esquema))
     }
 
     /// O SELECT de consulta: colunas nativas de pé, as demais com `::text` —
@@ -326,30 +367,12 @@ fn onde_sql(
 
 impl Motor for Postgres {
     fn fontes(&mut self) -> Result<Vec<String>> {
-        let linhas = self
-            .runtime
-            .block_on(self.cliente.query(
-                "SELECT table_name::text FROM information_schema.tables \
-                 WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' \
-                 ORDER BY table_name",
-                &[],
-            ))
-            .map_err(erro)?;
-        Ok(linhas
-            .iter()
-            .map(|linha| {
-                Ok(linha
-                    .try_get::<_, Option<String>>(0)
-                    .map_err(erro)?
-                    .unwrap_or_default())
-            })
-            .collect::<Result<Vec<_>>>()?)
+        let linhas = self.espera(self.cliente.query(FONTES_SQL, &[]))?;
+        Ok(linhas.iter().map(|linha| nome_da(linha, 0)).collect::<Result<Vec<_>>>()?)
     }
 
     fn colunas(&mut self, fonte: &str) -> Result<Vec<(String, String)>> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        self.colunas_conferidas(&conferida)
+        Ok(self.esquema_de(fonte)?.1)
     }
 
     fn consultar(
@@ -361,9 +384,7 @@ impl Motor for Postgres {
         limite: usize,
     ) -> Result<Consulta> {
         let cronometro = Cronometro::agora();
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         let pedidas = if colunas_pedidas.is_empty() {
             esquema
                 .iter()
@@ -402,13 +423,10 @@ impl Motor for Postgres {
             citado(&conferida),
             onde,
             ordenar,
-            limite.saturating_add(1)
+            teto_de_leitura(limite)
         );
         let referencias = params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
-        let linhas = self
-            .runtime
-            .block_on(self.cliente.query(sql.as_str(), &referencias))
-            .map_err(erro)?;
+        let linhas = self.espera(self.cliente.query(sql.as_str(), &referencias))?;
         let mut saida = Vec::new();
         for linha in &linhas {
             let mut valores = Vec::with_capacity(celulas.len());
@@ -417,38 +435,28 @@ impl Motor for Postgres {
             }
             saida.push(valores);
         }
-        let truncado = saida.len() > limite;
-        if truncado {
-            saida.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(Consulta {
             colunas: pedidas,
-            linhas: saida,
+            linhas,
             truncado,
             duracao_ms: cronometro.ms(),
         })
     }
 
     fn contar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         let mut params = Vec::new();
         let mut numero = 1usize;
         let onde = onde_sql(filtro, &esquema, &mut params, &mut numero)?;
         let sql = format!("SELECT COUNT(*) FROM {}{}", citado(&conferida), onde);
         let referencias = params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
-        let linha = self
-            .runtime
-            .block_on(self.cliente.query_one(sql.as_str(), &referencias))
-            .map_err(erro)?;
+        let linha = self.espera(self.cliente.query_one(sql.as_str(), &referencias))?;
         Ok(linha.try_get::<_, i64>(0).map_err(erro)?.max(0) as u64)
     }
 
     fn inserir(&mut self, fonte: &str, valores: &Map<String, Value>) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -474,10 +482,7 @@ impl Motor for Postgres {
             valores_sql.join(", ")
         );
         let referencias = params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
-        self.runtime
-            .block_on(self.cliente.execute(sql.as_str(), &referencias))
-            .map(|afetadas| afetadas)
-            .map_err(erro)
+        self.espera(self.cliente.execute(sql.as_str(), &referencias))
     }
 
     fn atualizar(
@@ -486,9 +491,7 @@ impl Motor for Postgres {
         valores: &Map<String, Value>,
         filtro: &Filtro,
     ) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -516,15 +519,11 @@ impl Motor for Postgres {
             onde
         );
         let referencias = params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
-        self.runtime
-            .block_on(self.cliente.execute(sql.as_str(), &referencias))
-            .map_err(erro)
+        self.espera(self.cliente.execute(sql.as_str(), &referencias))
     }
 
     fn apagar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas_conferidas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if filtro.is_empty() {
             bail!(tr("erros.bancoOndeObrigatorio", &[]));
         }
@@ -533,9 +532,7 @@ impl Motor for Postgres {
         let onde = onde_sql(filtro, &esquema, &mut params, &mut numero)?;
         let sql = format!("DELETE FROM {}{}", citado(&conferida), onde);
         let referencias = params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect::<Vec<_>>();
-        self.runtime
-            .block_on(self.cliente.execute(sql.as_str(), &referencias))
-            .map_err(erro)
+        self.espera(self.cliente.execute(sql.as_str(), &referencias))
     }
 
     fn sql(&mut self, declaracao: &str, limite: usize) -> Result<ResultadoSql> {
@@ -545,17 +542,11 @@ impl Motor for Postgres {
         if declaracao.is_empty() {
             bail!(tr("erros.bancoSqlVazio", &[]));
         }
-        let preparada = self
-            .runtime
-            .block_on(self.cliente.prepare(declaracao))
-            .map_err(erro)?;
+        let preparada = self.espera(self.cliente.prepare(declaracao))?;
         // O banco mesmo classifica: uma declaração que devolve colunas é
         // consulta; as outras, escrita. Nenhuma lista de palavras no meio.
         if preparada.columns().is_empty() {
-            let afetadas = self
-                .runtime
-                .block_on(self.cliente.execute(&preparada, &[]))
-                .map_err(erro)?;
+            let afetadas = self.espera(self.cliente.execute(&preparada, &[]))?;
             return Ok(ResultadoSql::Afetadas(afetadas));
         }
         // A consulta volta embrulhada: colunas nativas de pé, as demais com
@@ -568,12 +559,9 @@ impl Motor for Postgres {
         let sql = format!(
             "SELECT {} FROM ({declaracao}) AS \"__aether_consulta__\" LIMIT {}",
             Self::selecao(&celulas),
-            limite.saturating_add(1)
+            teto_de_leitura(limite)
         );
-        let linhas = self
-            .runtime
-            .block_on(self.cliente.query(sql.as_str(), &[]))
-            .map_err(erro)?;
+        let linhas = self.espera(self.cliente.query(sql.as_str(), &[]))?;
         let mut saida = Vec::new();
         for linha in &linhas {
             let mut valores = Vec::with_capacity(celulas.len());
@@ -582,13 +570,10 @@ impl Motor for Postgres {
             }
             saida.push(valores);
         }
-        let truncado = saida.len() > limite;
-        if truncado {
-            saida.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(ResultadoSql::Consulta(Consulta {
             colunas: preparada.columns().iter().map(|c| c.name().to_string()).collect(),
-            linhas: saida,
+            linhas,
             truncado,
             duracao_ms: cronometro.ms(),
         }))
@@ -659,6 +644,62 @@ mod tests {
             );
             assert_eq!(ficha.get_ports(), [5432], "a porta de fábrica de cada família");
             assert_eq!(ficha.get_dbname(), Some("estoque"));
+        }
+    }
+
+    /// O prazo não é uma promessa do cliente: ele vai escrito na ficha de
+    /// abertura, como parâmetro do servidor, e é legível de volta.
+    #[test]
+    fn a_ficha_leva_o_prazo_para_o_servidor() {
+        let ficha = ficha_de(&conexao_de_teste(Tipo::Postgres), "");
+        assert_eq!(
+            ficha.get_options(),
+            Some("-c statement_timeout=15000"),
+            "defeito 4: a ficha abre sem prazo, e uma declaração pendurada segura a conversa"
+        );
+    }
+
+    /// A conferência de fonte e colunas cabe numa consulta ao catálogo: duas
+    /// tabelas do information_schema unidas, uma ida. Duas strings separadas é o
+    /// que fazia a leitura pagar duas viagens.
+    #[test]
+    fn o_catalogo_de_uma_fonte_e_uma_ida_s() {
+        assert!(ESQUEMA_SQL.contains("information_schema.tables"));
+        assert!(ESQUEMA_SQL.contains("information_schema.columns"));
+        assert_eq!(
+            ESQUEMA_SQL.matches(';').count(),
+            0,
+            "o catálogo de uma fonte tem de caber numa declaração"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("LOWER(t.table_name) = LOWER($1)"),
+            "sem a conferência insensível no servidor, a fonte digitada em outra caixa sumiria"
+        );
+    }
+
+    /// O relógio da espera se constrói DENTRO do agendador: fora dele não há
+    /// reactor nenhum, e a primeira consulta paniava em vez de ler. A tarefa
+    /// dorme mais que o prazo e devolve `Ok`, então o único erro possível é o
+    /// prazo — e o pânico do reactor aparece como falha, não como susto.
+    #[test]
+    fn a_espera_nao_panie_fora_do_agendador() {
+        let runtime = super::super::agendador().expect("o agendador do processo nasce");
+        let resultado = esperar_prazo(
+            runtime,
+            std::time::Duration::from_millis(20),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Ok::<(), tokio_postgres::Error>(())
+            },
+        );
+        match resultado {
+            Err(erro) => assert!(
+                erro.to_string().contains('1'),
+                "a frase do prazo tem de dizer segundos: {erro}"
+            ),
+            Ok(()) => {
+                panic!("defeito 4: a ida voltou depois de passar do prazo — ninguém esperou nada")
+            }
         }
     }
 

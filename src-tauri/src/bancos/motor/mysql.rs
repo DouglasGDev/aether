@@ -4,33 +4,29 @@
 //! parâmetro textual converte sozinha, então os valores chegam tipados pelo
 //! que o JSON diz (Int, Double, Bytes, NULL) e o banco decide a conversão.
 //! Identificadores, ao contrário, não têm coerção — tabela e coluna são
-//! conferidos contra `information_schema` antes de entrar entre crases.
-//! O driver é assíncrono, então cada conexão traz seu runtime de uma thread,
-//! que morre junto com a ferramenta que o criou.
+//! conferidos contra `information_schema` antes de entrar entre crases. O
+//! driver é assíncrono: a conexão é da chamada, mas o agendador é do processo —
+//! ver `super::agendador`.
 
 use anyhow::{Result, anyhow, bail};
 use mysql_async::prelude::*;
 use serde_json::{Map, Value};
 
-use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql};
+use super::{
+    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto, erro_de_prazo,
+    prazo_de_espera, teto_de_leitura,
+};
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
+use std::time::Duration;
 
 pub struct Mysql {
-    runtime: tokio::runtime::Runtime,
+    runtime: &'static tokio::runtime::Runtime,
     conexao: mysql_async::Conn,
 }
 
 fn citado(nome: &str) -> String {
     format!("`{}`", nome.replace('`', "``"))
-}
-
-fn conferir_fonte(fonte: &str, conhecidas: &[String]) -> Result<String> {
-    conhecidas
-        .iter()
-        .find(|nome| nome.eq_ignore_ascii_case(fonte))
-        .cloned()
-        .ok_or_else(|| anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])))
 }
 
 fn conferir_coluna(coluna: &str, conhecidas: &[(String, String)]) -> Result<(String, String)> {
@@ -122,6 +118,23 @@ fn contagem_de(linha: &mysql_async::Row) -> u64 {
     }
 }
 
+/// A ida única ao catálogo de uma fonte: a tabela conferida e as colunas dela,
+/// na ordem e com o nome que o próprio banco grafa. `LOWER(...) = LOWER(?)` é o
+/// que fazia a conferência da lista ser insensível, sem trazer a lista inteira.
+const ESQUEMA_SQL: &str = "SELECT t.table_name, c.column_name, c.data_type \
+     FROM information_schema.tables AS t \
+     JOIN information_schema.columns AS c \
+       ON c.table_schema = t.table_schema AND c.table_name = t.table_name \
+     WHERE t.table_schema = DATABASE() AND t.table_type = 'BASE TABLE' \
+       AND LOWER(t.table_name) = LOWER(?) \
+     ORDER BY c.ordinal_position";
+
+/// As tabelas do banco atual, para a lista que o dono escolhe — uma viagem só,
+/// e `bancos_tabelas` não descreve coluna nenhuma delas.
+const FONTES_SQL: &str = "SELECT table_name FROM information_schema.tables \
+     WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
+     ORDER BY table_name";
+
 /// O WHERE em SQL, com marcas `?` e os parâmetros na ordem.
 fn onde_sql(
     filtro: &Filtro,
@@ -173,74 +186,138 @@ fn onde_sql(
     }
 }
 
+/// O SELECT de uma leitura, com o teto escrito: `limite + 1`, porque a linha de
+/// barriga é a única prova de que o corte foi por limite e não fim do banco.
+fn leitura_sql(citadas: &str, fonte: &str, onde: &str, ordenar: &str, limite: usize) -> String {
+    format!(
+        "SELECT {citadas} FROM {fonte}{onde}{ordenar} LIMIT {}",
+        teto_de_leitura(limite)
+    )
+}
+
+/// A ficha de abertura, separada da ligação para que se leia o que ela pede ao
+/// servidor sem tocar a rede.
+fn opcoes_de(conexao: &Conexao, senha: &str) -> mysql_async::OptsBuilder {
+    let mut construtor = mysql_async::OptsBuilder::default()
+        .ip_or_hostname(conexao.host.trim())
+        .tcp_port(conexao.porta_efetiva())
+        .db_name(Some(conexao.banco.trim()));
+    if !conexao.usuario.trim().is_empty() {
+        construtor = construtor.user(Some(conexao.usuario.trim()));
+    }
+    if !senha.is_empty() {
+        construtor = construtor.pass(Some(senha));
+    }
+    construtor
+}
+
+/// A espera de quem não tem prazo do lado do servidor: `mysql_async` 0.35 não
+/// expõe prazo de leitura nenhum na ficha — o único `wait_timeout` é variável de
+/// sessão, e `MAX_EXECUTION_TIME` é do MySQL e não da MariaDB que este mesmo
+/// motor atende, onde o nome certo é outro; um `SET` errado no meio da abertura
+/// derrubaria o login de quem tem razão. Sobra o prazo do cliente, que larga o
+/// soquete e devolve ao modelo a frase com o número.
+fn esperar_prazo<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    prazo: Duration,
+    futuro: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    runtime.block_on(async move {
+        tokio::time::timeout(prazo, futuro).await.map_err(|_| erro_de_prazo())?
+    })
+}
+
+fn esperar<T>(
+    runtime: &'static tokio::runtime::Runtime,
+    futuro: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    esperar_prazo(runtime, prazo_de_espera(), futuro)
+}
+
 impl Mysql {
     pub fn abrir(conexao: &Conexao) -> Result<Self> {
         conferir_canal(conexao)?;
         let senha = conexao.senha()?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow!(tr("erros.bancoAbrir", &[("detalhe", &e.to_string())])))?;
-        let mut construtor = mysql_async::OptsBuilder::default()
-            .ip_or_hostname(conexao.host.trim())
-            .tcp_port(conexao.porta_efetiva())
-            .db_name(Some(conexao.banco.trim()));
-        if !conexao.usuario.trim().is_empty() {
-            construtor = construtor.user(Some(conexao.usuario.trim()));
-        }
-        if !senha.is_empty() {
-            construtor = construtor.pass(Some(senha.as_str()));
-        }
-        let conexao = runtime
-            .block_on(mysql_async::Conn::new(construtor))
-            .map_err(erro_abrir)?;
+        let runtime = super::agendador()?;
+        let conexao = esperar(runtime, async {
+            mysql_async::Conn::new(opcoes_de(conexao, senha.as_str()))
+                .await
+                .map_err(erro_abrir)
+        })?;
         Ok(Self { runtime, conexao })
     }
 
-    fn linhas_texto(&mut self, sql: &str, params: mysql_async::Params) -> Result<Vec<mysql_async::Row>> {
-        self.runtime.block_on(async {
-            let mut resultado = self
-                .conexao
-                .exec_iter(sql, params)
-                .await
-                .map_err(erro)?;
+    /// As linhas de uma declaração, no máximo até o teto e no máximo até o prazo.
+    fn linhas_ate(
+        &mut self,
+        sql: &str,
+        params: mysql_async::Params,
+        teto: usize,
+    ) -> Result<Vec<mysql_async::Row>> {
+        let runtime = self.runtime;
+        esperar(runtime, async {
+            let mut resultado = self.conexao.exec_iter(sql, params).await.map_err(erro)?;
             let mut linhas = Vec::new();
-            while let Some(linha) = resultado.next().await.map_err(erro)? {
+            // O teto está no laço e não só no `LIMIT`: o que materializa o
+            // resultado todo antes de aparar puxa o banco inteiro quando o
+            // servidor devolve mais do que foi pedido.
+            while linhas.len() < teto {
+                let Some(linha) = resultado.next().await.map_err(erro)? else {
+                    break;
+                };
                 linhas.push(linha);
             }
             Ok(linhas)
         })
     }
+
+    /// O catálogo é do tamanho do esquema, não do tamanho de uma tabela: as
+    /// declarações dele vêm inteiras, e o que não vem inteiro é o dado de dono.
+    fn catalogo(&mut self, sql: &str, params: mysql_async::Params) -> Result<Vec<mysql_async::Row>> {
+        self.linhas_ate(sql, params, usize::MAX)
+    }
+
+    /// Uma escrita, com o número de linhas que o banco reportou. Cai sob o mesmo
+    /// prazo da leitura: escrita pendurada custa a conversa tanto quanto.
+    fn escrita(&mut self, sql: &str, params: mysql_async::Params) -> Result<u64> {
+        let runtime = self.runtime;
+        esperar(runtime, async {
+            let resultado = self.conexao.exec_iter(sql, params).await.map_err(erro)?;
+            Ok(resultado.affected_rows())
+        })
+    }
+
+    /// A única ida ao catálogo que uma leitura precisa: a fonte conferida e as
+    /// colunas dela, juntas. Antes eram quatro declarações — a lista de tabelas,
+    /// a lista de tabelas de novo dentro de `colunas`, as colunas, e o dado.
+    fn esquema_de(&mut self, fonte: &str) -> Result<(String, Vec<(String, String)>)> {
+        let linhas = self.catalogo(
+            ESQUEMA_SQL,
+            params_posicionais(&[mysql_async::Value::Bytes(fonte.trim().to_string().into_bytes())]),
+        )?;
+        let Some(primeira) = linhas.first() else {
+            return Err(anyhow!(tr("erros.bancoFonteInexistente", &[("fonte", fonte)])));
+        };
+        let conferida = texto_de(primeira, 0).unwrap_or_default();
+        let mut esquema = Vec::with_capacity(linhas.len());
+        for linha in &linhas {
+            let Some(nome) = texto_de(linha, 1) else {
+                continue;
+            };
+            esquema.push((nome, texto_de(linha, 2).unwrap_or_default()));
+        }
+        Ok((conferida, esquema))
+    }
 }
 
 impl Motor for Mysql {
     fn fontes(&mut self) -> Result<Vec<String>> {
-        let linhas = self.linhas_texto(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
-             ORDER BY table_name",
-            params_posicionais(&[]),
-        )?;
+        let linhas = self.catalogo(FONTES_SQL, params_posicionais(&[]))?;
         Ok(linhas.iter().filter_map(|linha| texto_de(linha, 0)).collect())
     }
 
     fn colunas(&mut self, fonte: &str) -> Result<Vec<(String, String)>> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let linhas = self.linhas_texto(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = ? \
-             ORDER BY ordinal_position",
-            params_posicionais(&[mysql_async::Value::Bytes(conferida.into_bytes())]),
-        )?;
-        Ok(linhas
-            .iter()
-            .filter_map(|linha| {
-                let nome = texto_de(linha, 0)?;
-                let tipo = texto_de(linha, 1).unwrap_or_default();
-                Some((nome, tipo))
-            })
-            .collect())
+        Ok(self.esquema_de(fonte)?.1)
     }
 
     fn consultar(
@@ -252,9 +329,7 @@ impl Motor for Mysql {
         limite: usize,
     ) -> Result<Consulta> {
         let cronometro = Cronometro::agora();
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         let pedidas = if colunas_pedidas.is_empty() {
             esquema
                 .iter()
@@ -276,17 +351,9 @@ impl Motor for Mysql {
                 format!(" ORDER BY {} {}", citado(&nome), if desc { "DESC" } else { "ASC" })
             }
         };
-        // Uma linha a mais do que o teto: é ela que diz que o corte foi por
-        // limite, e não que o banco acabou ali.
-        let sql = format!(
-            "SELECT {} FROM {}{}{} LIMIT {}",
-            citadas.join(", "),
-            citado(&conferida),
-            onde,
-            ordenar,
-            limite.saturating_add(1)
-        );
-        let linhas = self.linhas_texto(sql.as_str(), params_posicionais(&params))?;
+        let teto = teto_de_leitura(limite);
+        let sql = leitura_sql(&citadas.join(", "), &citado(&conferida), &onde, &ordenar, limite);
+        let linhas = self.linhas_ate(sql.as_str(), params_posicionais(&params), teto)?;
         let mut saida = Vec::new();
         for linha in &linhas {
             let mut valores = Vec::with_capacity(citadas.len());
@@ -297,26 +364,21 @@ impl Motor for Mysql {
             }
             saida.push(valores);
         }
-        let truncado = saida.len() > limite;
-        if truncado {
-            saida.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(Consulta {
             colunas: pedidas,
-            linhas: saida,
+            linhas,
             truncado,
             duracao_ms: cronometro.ms(),
         })
     }
 
     fn contar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         let mut params = Vec::new();
         let onde = onde_sql(filtro, &esquema, &mut params)?;
         let sql = format!("SELECT COUNT(*) FROM {}{}", citado(&conferida), onde);
-        let linhas = self.linhas_texto(sql.as_str(), params_posicionais(&params))?;
+        let linhas = self.linhas_ate(sql.as_str(), params_posicionais(&params), 1)?;
         let Some(linha) = linhas.first() else {
             return Ok(0);
         };
@@ -324,9 +386,7 @@ impl Motor for Mysql {
     }
 
     fn inserir(&mut self, fonte: &str, valores: &Map<String, Value>) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -345,11 +405,7 @@ impl Motor for Mysql {
             citadas.join(", "),
             marcas.join(", ")
         );
-        let resultado = self
-            .runtime
-            .block_on(self.conexao.exec_iter(sql.as_str(), params_posicionais(&params)))
-            .map_err(erro)?;
-        Ok(resultado.affected_rows())
+        self.escrita(sql.as_str(), params_posicionais(&params))
     }
 
     fn atualizar(
@@ -358,9 +414,7 @@ impl Motor for Mysql {
         valores: &Map<String, Value>,
         filtro: &Filtro,
     ) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if valores.is_empty() {
             bail!(tr("erros.bancoValoresVazios", &[]));
         }
@@ -381,28 +435,18 @@ impl Motor for Mysql {
             atribuicoes.join(", "),
             onde
         );
-        let resultado = self
-            .runtime
-            .block_on(self.conexao.exec_iter(sql.as_str(), params_posicionais(&params)))
-            .map_err(erro)?;
-        Ok(resultado.affected_rows())
+        self.escrita(sql.as_str(), params_posicionais(&params))
     }
 
     fn apagar(&mut self, fonte: &str, filtro: &Filtro) -> Result<u64> {
-        let conhecidas = self.fontes()?;
-        let conferida = conferir_fonte(fonte, &conhecidas)?;
-        let esquema = self.colunas(&conferida)?;
+        let (conferida, esquema) = self.esquema_de(fonte)?;
         if filtro.is_empty() {
             bail!(tr("erros.bancoOndeObrigatorio", &[]));
         }
         let mut params = Vec::new();
         let onde = onde_sql(filtro, &esquema, &mut params)?;
         let sql = format!("DELETE FROM {}{}", citado(&conferida), onde);
-        let resultado = self
-            .runtime
-            .block_on(self.conexao.exec_iter(sql.as_str(), params_posicionais(&params)))
-            .map_err(erro)?;
-        Ok(resultado.affected_rows())
+        self.escrita(sql.as_str(), params_posicionais(&params))
     }
 
     fn sql(&mut self, declaracao: &str, limite: usize) -> Result<ResultadoSql> {
@@ -412,10 +456,8 @@ impl Motor for Mysql {
         if declaracao.is_empty() {
             bail!(tr("erros.bancoSqlVazio", &[]));
         }
-        let preparada = self
-            .runtime
-            .block_on(self.conexao.prep(declaracao))
-            .map_err(erro)?;
+        let runtime = self.runtime;
+        let preparada = esperar(runtime, async { self.conexao.prep(declaracao).await.map_err(erro) })?;
         // O banco mesmo classifica: uma declaração que devolve colunas é
         // consulta; as outras, escrita. Nenhuma lista de palavras no meio.
         let colunas = preparada
@@ -424,45 +466,43 @@ impl Motor for Mysql {
             .map(|coluna| coluna.name_str().into_owned())
             .collect::<Vec<_>>();
         if colunas.is_empty() {
-            let resultado = self
-                .runtime
-                .block_on(
-                    self.conexao
-                        .exec_iter(&preparada, mysql_async::Params::Empty),
-                )
-                .map_err(erro)?;
-            return Ok(ResultadoSql::Afetadas(resultado.affected_rows()));
+            let afetadas = esperar(runtime, async {
+                let resultado = self
+                    .conexao
+                    .exec_iter(&preparada, mysql_async::Params::Empty)
+                    .await
+                    .map_err(erro)?;
+                Ok(resultado.affected_rows())
+            })?;
+            return Ok(ResultadoSql::Afetadas(afetadas));
         }
         // A consulta volta embrulhada, com teto próprio: o banco ainda pode
-        // ter linhas além do que a leitura levou, e isso é o que se diz.
-        let sql = format!(
-            "SELECT * FROM ({declaracao}) AS `__aether_consulta__` LIMIT {}",
-            limite.saturating_add(1)
-        );
-        let mut saida = Vec::new();
-        self.runtime.block_on(async {
+        // ter linhas além do que a leitura levou, e isso é o que se diz. O
+        // `*` aqui é sobre a declaração que o modelo escreveu e o banco descreveu
+        // — alargar colunas é escolha de quem redigiu o SQL, não do leitor.
+        let teto = teto_de_leitura(limite);
+        let sql = format!("SELECT * FROM ({declaracao}) AS `__aether_consulta__` LIMIT {teto}");
+        let saida = esperar(runtime, async {
             let mut resultado = self.conexao.query_iter(sql.as_str()).await.map_err(erro)?;
-            while let Some(linha) = resultado.next().await.map_err(erro)? {
+            let mut linhas = Vec::new();
+            while linhas.len() < teto {
+                let Some(linha) = resultado.next().await.map_err(erro)? else {
+                    break;
+                };
                 let mut valores = Vec::with_capacity(colunas.len());
                 for indice in 0..linha.len() {
                     valores.push(para_json(
                         linha.as_ref(indice).unwrap_or(&mysql_async::Value::NULL),
                     ));
                 }
-                saida.push(valores);
-                if saida.len() >= limite.saturating_add(1) {
-                    break;
-                }
+                linhas.push(valores);
             }
-            Ok::<(), anyhow::Error>(())
+            Ok(linhas)
         })?;
-        let truncado = saida.len() > limite;
-        if truncado {
-            saida.truncate(limite);
-        }
+        let (linhas, truncado) = aparar_no_teto(saida, limite);
         Ok(ResultadoSql::Consulta(Consulta {
             colunas,
-            linhas: saida,
+            linhas,
             truncado,
             duracao_ms: cronometro.ms(),
         }))
@@ -499,6 +539,122 @@ fn erro(e: mysql_async::Error) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::bancos::config::{conexao_de_teste, Tipo};
+    use crate::bancos::motor::PRAZO_DE_LEITURA;
+
+    /// O agendador é um só no processo, e nenhum motor pode montar o seu: a
+    /// régua é o texto dos próprios arquivos, porque um runtime por chamada é
+    /// justamente o que se quer impedir, e ele reaparece numa linha de qualquer
+    /// um dos seis.
+    #[test]
+    fn nenhum_motor_monta_o_proprio_agendador() {
+        let pasta = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("bancos")
+            .join("motor");
+        let mut acusados = Vec::new();
+        // As agulhas são montadas em pedaços: escritas inteiras, elas seriam
+        // achadas por esta própria régua no arquivo que as escreve.
+        let um_fio = ["new_current", "_thread"].concat();
+        let muitos_fios = ["Builder::new_multi", "_thread"].concat();
+        for entrada in std::fs::read_dir(&pasta).expect("a pasta dos motores existe") {
+            let caminho = entrada.expect("a entrada do diretório é legível").path();
+            let nome = caminho
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if nome == "mod.rs" || !nome.ends_with(".rs") {
+                continue;
+            }
+            let texto = std::fs::read_to_string(&caminho).expect("o motor é legível");
+            for (numero, linha) in texto.lines().enumerate() {
+                if linha.contains(&um_fio) || linha.contains(&muitos_fios) {
+                    acusados.push(format!("{nome}:{}", numero + 1));
+                }
+            }
+        }
+        assert!(
+            acusados.is_empty(),
+            "defeito 1: estes motores montam um runtime próprio, um por chamada: {}",
+            acusados.join(", ")
+        );
+    }
+
+    /// O catálogo de uma fonte cabe numa declaração: tabela conferida e colunas
+    /// na mesma junta. Duas strings separadas — a lista e depois as colunas — é
+    /// o que fazia cada leitura pagar duas viagens antes de ler uma linha.
+    #[test]
+    fn o_catalogo_de_uma_fonte_e_uma_ida_s() {
+        assert!(
+            ESQUEMA_SQL.contains("information_schema.tables"),
+            "defeito 2: sem a tabela no catálogo junto das colunas, a fonte é conferida numa viagem e lida em outra"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("information_schema.columns"),
+            "defeito 2: sem as colunas na mesma viagem, cada leitura paga duas idas ao catálogo"
+        );
+        assert_eq!(
+            ESQUEMA_SQL.matches(';').count(),
+            0,
+            "o catálogo de uma fonte tem de caber numa declaração"
+        );
+        assert!(
+            ESQUEMA_SQL.contains("LOWER(t.table_name) = LOWER(?)"),
+            "sem a conferência insensível no servidor, a fonte digitada em outra caixa sumiria"
+        );
+        assert!(
+            !FONTES_SQL.contains("information_schema.columns"),
+            "listar tabelas não descreve coluna nenhuma: é a segunda viagem que sobra aqui"
+        );
+    }
+
+    /// O teto vai escrito no SELECT, e é `limite + 1`: sem a linha de barriga,
+    /// uma leitura que encheu o teto é indistinguível de uma que achou o fim do
+    /// banco, e o cartão diria «todas as linhas» sobre um corte.
+    #[test]
+    fn a_leitura_pede_uma_linha_de_barriga() {
+        assert!(
+            leitura_sql("`a`", "`t`", "", "", 20).ends_with(" LIMIT 21"),
+            "defeito 5: sem a linha de barriga o corte vira fim de banco"
+        );
+        assert!(
+            leitura_sql("`a`", "`t`", " WHERE `a` = ?", " ORDER BY `a` DESC", 0).ends_with(" LIMIT 1"),
+            "limite zero ainda pergunta se havia linha"
+        );
+    }
+
+    /// O prazo espera de verdade: o que passa dele volta como o erro do prazo, e
+    /// não como resultado. A futura dorme mais que o prazo pedido — o único erro
+    /// possível aqui é o relógio do motor, porque a tarefa devolve `Ok`.
+    #[test]
+    fn uma_ida_que_passa_do_prazo_nao_vira_espera_infinita() {
+        let runtime = super::super::agendador().expect("o agendador do processo nasce");
+        let resultado = esperar_prazo(
+            runtime,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<(), anyhow::Error>(())
+            },
+        );
+        let erro = match resultado {
+            Err(erro) => erro,
+            Ok(()) => panic!(
+                "defeito 4: a ida voltou depois de passar do prazo — ninguém esperou nada"
+            ),
+        };
+        assert!(
+            erro.to_string().contains('1'),
+            "a frase do prazo tem de dizer segundos: {erro}"
+        );
+    }
+
+    /// A espera que os motores de rede partilham é um segundo acima do prazo do
+    /// servidor, quando ele existe: o erro que chega primeiro tem de ser o do
+    /// banco, que sabe dizer o que expirou.
+    #[test]
+    fn a_espera_do_cliente_fica_acima_do_prazo() {
+        assert!(prazo_de_espera() > PRAZO_DE_LEITURA);
+    }
 
     /// O cadastro promete: «cada motor que sabe falar TLS obedece; o que não
     /// sabe se recusa a fingir». Este driver foi compilado sem TLS nenhum,
