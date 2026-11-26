@@ -838,10 +838,13 @@ mod tests {
         }
     }
 
-    /// O caminho de CPU é o candle, e ele só implementa granite: para as outras
-    /// famílias a placa é obrigatória. Aqui se cobra a etiqueta que o motor de
-    /// CPU escolhe; o censo dos arquivos IBM está todo dentro da lista de tipos
-    /// acima, e é por isso que os dois testes não se sobrepõem.
+    /// Sem placa, a primeira alternativa é a llama.cpp contando no processador, e
+    /// ela abre qualquer arquitetura que a biblioteca abra. Se ela também falhar,
+    /// o último degrau é o candle — que só implementa granite. Este teste cobra o
+    /// degrau mais estreito: nenhuma entrada granite do catálogo pode ficar sem
+    /// execução na máquina que chegou ao fim da escada. O censo dos arquivos IBM
+    /// está todo dentro da lista de tipos acima, e é por isso que os dois testes
+    /// não se sobrepõem.
     #[test]
     fn granites_sao_executaveis_pelo_caminho_de_cpu() {
         const DO_CANDLE: [&str; 15] = [

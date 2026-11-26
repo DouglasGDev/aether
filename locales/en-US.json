@@ -106,7 +106,8 @@
   "efeito": {
     "soLe": "Read-only",
     "altera": "Modifies",
-    "podeApagar": "May delete"
+    "podeApagar": "May delete",
+    "saiDaMaquina": "Leaves the machine"
   },
   "conversa": {
     "promptSistema": "You are Aether, a local assistant that runs on the user's computer. Reply in {idioma}, briefly and directly. Act with the tools instead of describing the action: the approval screen is what authorizes each one, so do not ask for confirmation in your reply. Past chats live in the local memory index: before saying you do not remember a topic, search it with buscar_memoria.",
@@ -473,6 +474,10 @@
     "bancoApagar": "delete"
   },
   "ferramentas": {
+    "buscarNaWeb": {
+      "titulo": "Search the web",
+      "descricao": "Searches html.duckduckgo.com and pt.wikipedia.org and returns title, url and snippet. It exists only when the network is on in rede.json, and every call needs the user's approval. The query text is the only data that leaves the machine."
+    },
     "lerArquivo": {
       "titulo": "Read file",
       "descricao": "Reads the contents of a text file within the granted folders. Use inicio and fim to read only a portion."
@@ -563,6 +568,10 @@
     }
   },
   "argumentos": {
+    "consultaRede": "Query",
+    "consultaRedeDescricao": "The text to look for. It goes in as the value of one parameter of a fixed url: address, host and path are not the model's choices.",
+    "maximoResultados": "Maximum results",
+    "maximoResultadosDescricao": "Between 1 and 5; the code cuts anything above that.",
     "caminho": "Path",
     "caminhoDescricao": "Path of the file or folder, within a granted folder.",
     "conteudo": "Content",
@@ -767,7 +776,7 @@
       "naoEsqueceu": "the prefill reused the cache of the previous conversation"
     },
     "prefixo": {
-      "soNaPlaca": "prefix caching belongs to the card engine; the processor recomputes everything",
+      "soForaDoGgml": "prefix caching belongs to the llama.cpp library, on the card or on the processor; candle recomputes everything",
       "cacheVelho": "the first round already came with {n} tokens from another conversation's cache",
       "naoReaproveitou": "reused {reaproveitados} of {historico} input tokens",
       "semRecorte": "the divergent round did not trim the cache: reused {reaproveitados} of {ocupadas}",
@@ -824,7 +833,35 @@
       "bancosFicaram": "rows at the end"
     }
   },
+  "rede": {
+    "aviso": "Result obtained outside this machine, from a third-party server. Nothing here was verified locally.",
+    "consulta": "Query sent",
+    "origem": "Where the bytes came from",
+    "foraDaMaquina": "Outside this machine",
+    "vazio": "No result arrived",
+    "falha": "Provider {fornecedor} did not answer",
+    "motivo": {
+      "esquema": "Scheme refused: only https leaves this machine",
+      "host": "Host outside the allowlist",
+      "porta": "Port other than 443",
+      "caminho": "Path outside the endpoint declared for this host",
+      "usuario": "Credential in the url",
+      "endereco": "Loopback, private or link-local address",
+      "pulo": "Redirect outside the allowlist, or too many hops",
+      "corpo": "Body above 512 KiB",
+      "prazo": "Deadline exceeded",
+      "semEndereco": "The name did not resolve to a public address"
+    }
+  },
   "erros": {
+    "redeDesligada": "Web search is off: turn it on in rede.json",
+    "redeMotor": "Could not open the network engine",
+    "redeTodosFalharam": "No provider answered: {detalhe}",
+    "redeResposta": "The server replied with error {codigo}",
+    "redeSemDestino": "Response {codigo} with no place to go",
+    "redeFalhou": "The request failed: {detalhe}",
+    "redeArquivoQuebrado": "rede.json unreadable; the network stayed off",
+    "redeGravar": "Could not write rede.json: {detalhe}",
     "pedidoVazio": "empty request",
     "turnoEmAndamento": "a turn is already running",
     "turnoNaoTerminou": "the turn didn't finish: {detalhe}",
@@ -973,6 +1010,7 @@
     "motorDecodificacao": "the engine rejected the token batch (code {codigo})",
     "motorSemLogits": "the engine returned no logits",
     "motorSemPlaca": "this computer has no usable GPU",
+    "motorSemCpu": "ggml did not register a CPU device on this computer",
     "motorSemVocabulario": "the engine did not report this model's vocabulary size",
     "motorSemDispositivo": "the engine found no device to count vectors on",
     "motorSemDimensao": "the embeddings model did not declare its vector size",

@@ -47,6 +47,186 @@ const ATENCAO_AUTO: c_int = -1;
 /// muito mais que a conta em si.
 const ATENCAO_RAPIDA: c_int = 1;
 
+/// `LLAMA_FLASH_ATTN_TYPE_DISABLED`. É o degrau que a sonda de CPU compara com o
+/// de cima: na placa o quadrado `n × n` é memória que falta, no processador ele é
+/// aritmética a mais — e nem toda arquitetura tem kernel de atenção rápida em CPU.
+const ATENCAO_NULA: c_int = 0;
+
+/// Os números que a carga na CPU do sistema obedece. Vêm da sonda
+/// (`engine-probe cpu:`), não de uma preferência: `lote` é o
+/// `n_batch`/`n_ubatch` do contexto e `atencao_rapida` liga ou desliga o kernel
+/// de flash attention.
+///
+/// As threads são duas porque a biblioteca são duas: `threads` é a
+/// `n_threads`, que o llama.cpp usa no passo de um token só (a decodificação), e
+/// `threads_lote` é a `n_threads_batch`, usada no passo de muitos tokens (o
+/// prefill). Medido no 5700X3D (docs/melhorias/CPU.md), elas querem números
+/// opostos: o prefill rende mais com os 16 fios lógicos (75,3 t/s contra 60,8 dos
+/// 8), e a decodificação rende mais com os 8 núcleos físicos (10,16 t/s contra
+/// 8,41). Um `Escala` só não pode dizer as duas coisas — por isso ele carrega as
+/// duas. Zero em qualquer uma é "deixa com a biblioteca", que é o braço de
+/// controle da medição, nunca o valor publicado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Escala {
+    pub threads: c_int,
+    pub threads_lote: c_int,
+    pub lote: u32,
+    pub atencao_rapida: bool,
+}
+
+/// Quantos núcleos físicos a máquina tem. É o número que a decodificação obedece,
+/// e não é o `available_parallelism`: no 5700X3D os dois são 16 contra 8, e o
+/// passo de um token cai de 10,16 para 8,41 t/s quando os 16 fios trabalham nele
+/// (docs/melhorias/CPU.md) — os fios de um mesmo núcleo disputam a unidade de
+/// execução que já está parada no DRAM. Contar o núcleo em vez de dividir o
+/// total por dois é o que faz a escala valer numa máquina que não é esta.
+///
+/// `None` quando a contagem falha: quem chama cai no total de fios lógicos, que é
+/// o degrau onde a biblioteca já estava, e nunca um zero.
+#[cfg(windows)]
+pub fn nucleos_fisicos() -> Option<usize> {
+    use windows::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+    };
+    let mut necessario: u32 = 0;
+    // Primeira chamada sem buffer: ela recusa escrevendo o tamanho de que precisa.
+    // SAFETY: o único destino escrito é o `necessario` vivo nesta pilha.
+    let _ = unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut necessario)
+    };
+    if necessario == 0 {
+        return None;
+    }
+    // A sequência é de structs de 8 bytes de alinhamento, então o caixa é medido
+    // em `u64`: um `Vec<u8>` não promete alinhamento nenhum, e a API escreve
+    // structs C dentro dele.
+    let mut caixa = vec![0u64; (necessario as usize).div_ceil(8)];
+    // O mesmo parâmetro faz os dois lados da conversa: entra como o tamanho do
+    // buffer que a API pode escrever e sai como a quantidade que ela escreveu.
+    // Zerá-lo — como este arquivo fazia — é pedir a chamada com um buffer de zero
+    // bytes: ela recusa com `ERROR_INSUFFICIENT_BUFFER`, devolve o tamanho certo no
+    // mesmo lugar, e quem olha só o erro conclui que a máquina não respondeu.
+    let mut obtido: u32 = necessario;
+    // SAFETY: `caixa` cabe os bytes que a primeira chamada pediu, e a função só
+    // escreve dentro dele.
+    let ligada = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            Some(caixa.as_mut_ptr().cast()),
+            &mut obtido,
+        )
+    };
+    if ligada.is_err() || obtido == 0 {
+        return None;
+    }
+    // A conferência é do `obtido`, não da reserva: a segunda chamada devolve
+    // quantos bytes ela realmente escreveu.
+    // SAFETY: nenhum struct é lido por aqui — `u8` tem alinhamento 1, então toda
+    // a sequência de `u64` é reinterpretável como bytes, e `caminhar` só olha
+    // dentro do recorte que lhe é entregue.
+    let (_, bytes, _) = unsafe { caixa.align_to::<u8>() };
+    let logicos = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    caminhar(&bytes[..(obtido as usize).min(bytes.len())], logicos).map(|(nucleos, _)| nucleos)
+}
+
+/// Caminha a sequência que a API devolve um registro por vez, pelo `Size` que o
+/// próprio registro anuncia, e tira núcleos e fios das máscaras de afinidade —
+/// não do número de registros lidos.
+///
+/// Os dois detalhes são o ponto. Avançar de `size_of::<struct>()` em
+/// `size_of::<struct>()` só dá certo enquanto todo registro tem exatamente o
+/// tamanho do struct, e `GroupMask` é um `ANYSIZE_ARRAY` declarado com uma casa:
+/// numa máquina com mais de 64 processadores lógicos o registro do núcleo vem com
+/// um `GROUP_AFFINITY` por grupo, ou seja, maior que o struct. Somar um núcleo por
+/// item encontrado é a outra metade do mesmo erro — o número que a decodificação
+/// obedece é o de núcleos, e o que diz se a leitura fez sentido é a soma dos fios.
+///
+/// `None` para sequência que não fecha no `obtido`, `Size` menor que o cabeçalho
+/// (o laço não anda), núcleo em mais de um grupo (a struct tem espaço para a
+/// primeira máscara, e contar meio núcleo é pior que não contar) ou soma de fios
+/// diferente de `logicos`.
+#[cfg(windows)]
+fn caminhar(bytes: &[u8], logicos: usize) -> Option<(usize, usize)> {
+    use windows::Win32::System::SystemInformation::{
+        GROUP_AFFINITY, LOGICAL_PROCESSOR_RELATIONSHIP, PROCESSOR_RELATIONSHIP,
+        RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    // Os deslocamentos saem das próprias structs, não de números escritos à mão:
+    // as structs são o espelho do C, e um campo que mudar de lugar muda aqui junto.
+    let d_tipo = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship);
+    let d_tamanho = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size);
+    let d_anonimo = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+    let d_grupos = d_anonimo + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+    let d_mascara = d_anonimo
+        + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask)
+        + std::mem::offset_of!(GROUP_AFFINITY, Mask);
+    let bytes_mascara = std::mem::size_of::<usize>();
+
+    let fatia = |de: usize, tamanho: usize| -> Option<&[u8]> { bytes.get(de..de + tamanho) };
+    let mut nucleos = 0usize;
+    let mut fios = 0usize;
+    let mut de = 0usize;
+    while de < bytes.len() {
+        let tipo = i32::from_le_bytes(fatia(de + d_tipo, 4)?.try_into().ok()?);
+        let tamanho = u32::from_le_bytes(fatia(de + d_tamanho, 4)?.try_into().ok()?) as usize;
+        if tamanho <= d_anonimo || de + tamanho > bytes.len() {
+            return None;
+        }
+        if LOGICAL_PROCESSOR_RELATIONSHIP(tipo) == RelationProcessorCore {
+            if u16::from_le_bytes(fatia(de + d_grupos, 2)?.try_into().ok()?) != 1 {
+                return None;
+            }
+            let mascara =
+                usize::from_le_bytes(fatia(de + d_mascara, bytes_mascara)?.try_into().ok()?);
+            let do_nucleo = mascara.count_ones() as usize;
+            if do_nucleo == 0 {
+                return None;
+            }
+            nucleos += 1;
+            fios += do_nucleo;
+        }
+        de += tamanho;
+    }
+    if nucleos == 0 || (logicos > 0 && fios != logicos) {
+        return None;
+    }
+    Some((nucleos, fios))
+}
+
+#[cfg(not(windows))]
+pub fn nucleos_fisicos() -> Option<usize> {
+    None
+}
+
+impl Escala {
+    /// A escala lida na própria máquina: decodificação nos núcleos físicos,
+    /// prefill em todos os fios lógicos, e o lote com que a dupla ganhou (medida
+    /// em docs/melhorias/CPU.md). Onde a contagem de núcleos falha, os dois
+    /// números coincidem — que é o degrau de antes, não uma adivinhação.
+    pub fn da_maquina() -> Self {
+        let logicos = std::thread::available_parallelism()
+            .map(|n| n.get() as c_int)
+            .unwrap_or(0);
+        let fisicos = nucleos_fisicos().map(|n| n as c_int).unwrap_or(logicos);
+        Self {
+            threads: fisicos,
+            threads_lote: logicos,
+            lote: LOTE_CPU,
+            atencao_rapida: ATENCAO_RAPIDA_LIGADA,
+        }
+    }
+}
+
+/// O `n_batch` com que a CPU andou mais rápido no lote grande. É o valor com que
+/// a braço medido ganhou o prefill sem perder decodificação (docs/melhorias/CPU.md).
+pub const LOTE_CPU: u32 = 1024;
+
+/// Se a atenção rápida entra no contexto de conversa da CPU. Não é "ligada porque
+/// existe": o kernel troca decodificação por prefill, e o laço de ferramentas do
+/// Aether é pré-fil por dez tokens de saída para um — `bancada.rs:8` cita os
+/// 29.777 tokens de prompt recalculados por rodada antes do cache de prefixo.
+pub const ATENCAO_RAPIDA_LIGADA: bool = true;
+
 /// O sentinela do llama.cpp para "todas as camadas": negativo não é "quantas
 /// couberem" — a biblioteca manda todas e a conta de caber é de quem escolhe.
 /// É por isso que os dois caminhos passam um número medido
@@ -458,6 +638,28 @@ impl Ggml {
         p
     }
 
+    /// O contexto de conversa quando a conta acontece na CPU do sistema. Aqui os
+    /// números que importam num processador — quantas threads na decodificação,
+    /// quantas no lote, o tamanho do lote e se a atenção rápida está ligada —
+    /// deixam de ser o palpite da biblioteca e passam a ser o que a sonda mediu.
+    /// O `n_ubatch` acompanha o `n_batch` porque, sem placa, o lote é o quanto de
+    /// token cabe na cache de nível 3 de uma passada: fatiar por dentro do lote
+    /// só multiplica as idas ao DRAM que é o gargalo.
+    pub fn params_contexto_cpu(
+        &self,
+        janela: u32,
+        escala: &Escala,
+    ) -> ParamsContexto {
+        let mut p = unsafe { (self.params_contexto)() };
+        p.n_ctx = janela;
+        p.n_batch = escala.lote;
+        p.n_ubatch = escala.lote;
+        p.n_threads = escala.threads;
+        p.n_threads_batch = escala.threads_lote;
+        p.flash_attn_type = if escala.atencao_rapida { ATENCAO_RAPIDA } else { ATENCAO_NULA };
+        p
+    }
+
     /// O contexto de um modelo de embeddings. Três diferenças contra o de
     /// conversa, cada uma por um motivo medido:
     /// - `embeddings = true`, sem o qual a biblioteca não devolve vetor nenhum;
@@ -855,5 +1057,158 @@ mod testes {
             segunda.is_err(),
             "a segunda chamada deveria devolver o erro do carregador de novo: {segunda:?}"
         );
+    }
+
+    /// Os números da escala têm de chegar ao `llama_context_params`, porque é por
+    /// eles que a CPU faz o que a sonda mediu — e cada um vai a um campo
+    /// diferente. Um `n_threads` que não fosse copiado deixaria a biblioteca
+    /// escolhendo sozinha, que é exatamente o estado que a medição veio substituir.
+    ///
+    /// As duas contagens de thread vão a valores diferentes de propósito: a
+    /// medição mostrou que o prefill e o decode querem números opostos no mesmo
+    /// processador, e um `n_threads_batch = escala.threads` disfarçado de escala
+    /// dividida passaria verde neste teste entregando uma escala única.
+    ///
+    /// Sem runtime ggml na máquina o teste se retira: ele confere a cópia dos
+    /// campos, e a cópia só existe depois de a biblioteca abrir.
+    #[test]
+    fn a_escala_cpu_chega_ao_contexto() {
+        let pastas = crate::ai::ggml::reload::pastas_teste();
+        let Ok((ggml, _pasta)) = Ggml::abrir(&pastas) else {
+            eprintln!("sem runtime ggml: nada a conferir");
+            return;
+        };
+        let medida = ggml.params_contexto_cpu(
+            4096,
+            &Escala { threads: 6, threads_lote: 12, lote: 1024, atencao_rapida: true },
+        );
+        assert_eq!(medida.n_ctx, 4096);
+        assert_eq!(medida.n_batch, 1024, "o lote pedido não chegou ao contexto");
+        assert_eq!(medida.n_ubatch, 1024, "o micro-lote não acompanhou o lote");
+        assert_eq!(medida.n_threads, 6, "as threads da decodificação não chegaram");
+        assert_eq!(
+            medida.n_threads_batch, 12,
+            "as threads do lote chegaram amassadas nas da decodificação"
+        );
+        assert_eq!(medida.flash_attn_type, ATENCAO_RAPIDA);
+
+        // O braço de controle: `threads = 0` é a biblioteca decidindo, e a
+        // atenção desligada é o outro degrau da escala — os dois têm de passar
+        // ilesos por esta mesma cópia, senão o zero virou um número nosso.
+        let padrao = ggml.params_contexto_cpu(
+            2048,
+            &Escala { threads: 0, threads_lote: 0, lote: 512, atencao_rapida: false },
+        );
+        assert_eq!(padrao.n_threads, 0);
+        assert_eq!(padrao.n_threads_batch, 0);
+        assert_eq!(padrao.flash_attn_type, ATENCAO_NULA);
+        assert_eq!(padrao.n_batch, 512);
+    }
+
+    /// A sequência que a API devolve é uma lista de registros de tamanhos
+    /// diferentes, e era exatamente isso que a leitura antiga errava: ela avançava
+    /// de `size_of::<struct>()` em `size_of::<struct>()` e somava um núcleo por
+    /// item encontrado. Ninguém tem aqui uma máquina de 128 processadores lógicos
+    /// para ver o estrago, então o estrago vem escrito à mão: um `Vec<u8>` com
+    /// registros de 48 e de 64 bytes, um item de outro tipo no meio e máscaras de
+    /// afinidade reais. Os deslocamentos saem das mesmas structs da produção, e é
+    /// por isso que o fixture não precisa saber quantos bytes tem um registro.
+    #[cfg(windows)]
+    #[test]
+    fn a_caminhada_le_a_sequencia_pelo_tamanho_de_cada_registro() {
+        use windows::Win32::System::SystemInformation::{
+            GROUP_AFFINITY, PROCESSOR_RELATIONSHIP, RelationCache,
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        };
+        let d_tipo = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship);
+        let d_tamanho = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size);
+        let d_anonimo = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+        let d_grupos = d_anonimo + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+        let d_mascara = d_anonimo
+            + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask)
+            + std::mem::offset_of!(GROUP_AFFINITY, Mask);
+        let tamanho_mascara = std::mem::size_of::<usize>();
+        let tamanho_grupo = std::mem::size_of::<GROUP_AFFINITY>();
+
+        // Núcleo anunciado com `total` bytes: dois grupos caberiam num registro de
+        // 64 e um num de 48, e é o `Size` escrito aqui que o laço tem de obedecer.
+        let nucleo = |total: usize, grupos: u16, maskaras: &[usize]| -> Vec<u8> {
+            let mut b = vec![0u8; total];
+            b[d_tipo..d_tipo + 4].copy_from_slice(&0i32.to_le_bytes());
+            b[d_tamanho..d_tamanho + 4].copy_from_slice(&(total as u32).to_le_bytes());
+            b[d_grupos..d_grupos + 2].copy_from_slice(&grupos.to_le_bytes());
+            for (casa, m) in maskaras.iter().enumerate() {
+                let de = d_mascara + casa * tamanho_grupo;
+                b[de..de + tamanho_mascara].copy_from_slice(&m.to_le_bytes());
+            }
+            b
+        };
+        // Registro de outro tipo, cheio de `0xff` onde um núcleo teria máscaras:
+        // se a caminhada lesse todo item como processador, estes bytes virariam fios.
+        let estrangeiro = |total: usize| -> Vec<u8> {
+            let mut b = vec![0u8; total];
+            b[d_tipo..d_tipo + 4].copy_from_slice(&RelationCache.0.to_le_bytes());
+            b[d_tamanho..d_tamanho + 4].copy_from_slice(&(total as u32).to_le_bytes());
+            for byte in b[d_anonimo..].iter_mut() {
+                *byte = 0xff;
+            }
+            b
+        };
+
+        // O caso desta máquina: dois núcleos de dois fios, quatro fios no total.
+        let dois = [nucleo(48, 1, &[0b0011]), nucleo(48, 1, &[0b1100])].concat();
+        assert_eq!(caminhar(&dois, 4), Some((2, 4)));
+
+        // Máquinas com mais de 64 processadores lógicos devolvem o registro maior.
+        // Caminhar por `size_of` leria a segunda máscara como se fosse um registro.
+        let largos = [nucleo(64, 1, &[0b0011]), nucleo(64, 1, &[0b1100])].concat();
+        assert_eq!(caminhar(&largos, 4), Some((2, 4)));
+
+        // O tipo filtra: o `0xff` do cache no meio não conta como fio de ninguém.
+        let misto = [nucleo(48, 1, &[0b0011]), estrangeiro(40), nucleo(48, 1, &[0b1100])].concat();
+        assert_eq!(caminhar(&misto, 4), Some((2, 4)));
+
+        // Sequência truncada no meio do segundo registro: nada contado às pressas.
+        assert_eq!(caminhar(&dois[..dois.len() - 8], 4), None);
+        // Núcleo espalhado em dois grupos: a struct tem espaço para a primeira
+        // máscara, e meio núcleo contado é pior que nenhum.
+        assert_eq!(caminhar(&nucleo(64, 2, &[0b0011, 0b1100]), 4), None);
+        // `Size` menor que o cabeçalho faria o laço andar zero bytes para sempre.
+        // O registro é inteiro; só o tamanho que ele anuncia é falso.
+        let curto = {
+            let mut b = nucleo(48, 1, &[0b0011]);
+            b[d_tamanho..d_tamanho + 4].copy_from_slice(&4u32.to_le_bytes());
+            b
+        };
+        assert_eq!(caminhar(&curto, 4), None);
+        // A soma dos fios tem de bater com a máquina; se não bate, a leitura não
+        // foi entendida e o chamador cai no degrau de antes, não neste número.
+        assert_eq!(caminhar(&dois, 8), None);
+        // Um único núcleo com os 16 fios ligados é SMT fechado na BIOS — legítimo,
+        // e é o caso em que `threads` e `threads_lote` voltam a coincidir.
+        assert_eq!(caminhar(&nucleo(48, 1, &[0xffff]), 16), Some((1, 16)));
+    }
+
+    /// A caminhada acima é provada por bytes escritos à mão; este confere que a
+    /// sequência real desta máquina fecha com ela. Não se pede um número — pede-se
+    /// que a API responda, que o resultado divida a contagem de fios (núcleos
+    /// iguais em um mesmo pacote) e que nunca seja maior que ela.
+    #[cfg(windows)]
+    #[test]
+    fn a_contagem_real_fecha_com_a_sequencia_da_api() {
+        let logicos = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        let nucleos = nucleos_fisicos()
+            .expect("a API de núcleos não respondeu nesta máquina Windows");
+        assert!(nucleos >= 1 && nucleos <= logicos, "{nucleos} fora de 1..={logicos}");
+        assert_eq!(
+            logicos % nucleos,
+            0,
+            "{logicos} fios não se dividem em {nucleos} núcleos"
+        );
+        // E a escala publicada obedece a esta contagem: decodificação no núcleo,
+        // prefill no fio lógico.
+        let escala = Escala::da_maquina();
+        assert_eq!(escala.threads, nucleos as c_int);
+        assert_eq!(escala.threads_lote, logicos as c_int);
     }
 }

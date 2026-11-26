@@ -75,6 +75,8 @@ pub fn escolher(dispositivos: &[InfoDevice]) -> Option<Placa> {
     candidatas(dispositivos).into_iter().next()
 }
 
+pub use ffi::Escala;
+
 /// O registro inteiro, na ordem da biblioteca: é o que a medição confere, porque
 /// uma lista já filtrada não prova que o filtro acertou.
 pub fn registro(dlls: &[PathBuf]) -> Result<Vec<InfoDevice>> {
@@ -82,11 +84,22 @@ pub fn registro(dlls: &[PathBuf]) -> Result<Vec<InfoDevice>> {
     Ok(ggml.devices())
 }
 
+/// Para onde os pesos vão. `Placa` é o caminho de sempre: o dispositivo que
+/// `escolher` apontou e o despacho medido em camadas. `Sistema` é a mesma
+/// biblioteca contando no processador — o device CPU do mesmo registro, com as
+/// threads e o lote que a sonda mediu — e existe porque, sem placa, a alternativa
+/// a ela não precisa ser um motor mais limitado: é o mesmo motor sem placa.
+#[derive(Debug, Clone, Copy)]
+pub enum Destino {
+    Placa { camadas_gpu: c_int },
+    Sistema(ffi::Escala),
+}
+
 #[cfg(test)]
 mod reload {
     use super::*;
 
-    fn pastas_teste() -> Vec<PathBuf> {
+    pub(crate) fn pastas_teste() -> Vec<PathBuf> {
         let mut pastas = Vec::new();
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             pastas.push(PathBuf::from(local).join("ai.aether.core").join("runtime"));
@@ -131,6 +144,10 @@ pub struct Motor {
     pub janela: usize,
     /// Estado que a interface mostra: qual placa está servindo.
     pub dispositivo: String,
+    /// Se o device que serve é uma placa ou o processador. Vem do tipo que a ggml
+    /// registrou para ele, não do destino pedido: é a resposta à pergunta "a
+    /// conta aconteceu na placa?", que o `Acelerador` e a bancada fazem.
+    pub na_placa: bool,
     /// Os adaptadores que este motor tem em memória, com o handle que a
     /// biblioteca deu para o **modelo** dele. Um adaptador não é um arquivo
     /// aberto: é RAM da placa derivada dos pesos do base, e por isso o dono é o
@@ -194,20 +211,41 @@ fn prefixo_comum(cached: &[Token], prompt: &[Token]) -> usize {
 unsafe impl Send for Motor {}
 
 impl Motor {
-    /// Carrega `pesos` na única placa escolhida, despachando `camadas_gpu` para
-    /// ela: `-1` é o inteiro na placa, um número é o topo em cima e o resto em
-    /// RAM, `0` é nada na placa. Erro se não houver placa — o chamador decide se
-    /// cai para a CPU.
-    pub fn novo(dlls: &[PathBuf], pesos: &Path, janela: usize, camadas_gpu: c_int) -> Result<Motor> {
+    /// Carrega `pesos` no dispositivo pedido por `destino`: a placa escolhida,
+    /// com `camadas_gpu` dela, ou a CPU do sistema com a escala medida. Erro se o
+    /// destino não existir na máquina — o chamador decide o que tentar depois.
+    pub fn novo(dlls: &[PathBuf], pesos: &Path, janela: usize, destino: Destino) -> Result<Motor> {
         let (ggml, _pasta) = Ggml::abrir(dlls).map_err(anyhow::Error::msg)?;
         let dispositivos = ggml.devices();
-        let Some(placa) = escolher(&dispositivos) else {
-            bail!(tr("erros.motorSemPlaca", &[]));
+        let (bruto, nome, camadas_gpu, params, na_placa) = match destino {
+            Destino::Placa { camadas_gpu } => {
+                let Some(placa) = escolher(&dispositivos) else {
+                    bail!(tr("erros.motorSemPlaca", &[]));
+                };
+                (
+                    dispositivos[placa.indice].bruto,
+                    placa.nome.clone(),
+                    camadas_gpu,
+                    ggml.params_contexto(janela as u32),
+                    true,
+                )
+            }
+            Destino::Sistema(escala) => {
+                let Some(cpu) = dispositivos.iter().find(|d| d.tipo == TIPO_CPU) else {
+                    bail!(tr("erros.motorSemCpu", &[]));
+                };
+                (
+                    cpu.bruto,
+                    cpu.nome.clone(),
+                    0,
+                    ggml.params_contexto_cpu(janela as u32, &escala),
+                    false,
+                )
+            }
         };
-        let bruto = dispositivos[placa.indice].bruto;
 
         // Lista NULL-terminated, lida durante a carga: o array local é o dono, e
-        // um único elemento é o que mantém o modelo inteiro numa só placa.
+        // um único elemento é o que mantém o modelo inteiro num só device.
         let mut selecionados = [bruto, std::ptr::null_mut()];
         let modelo =
             unsafe { ggml.carregar(pesos, ggml.params_modelo(camadas_gpu), &mut selecionados) }
@@ -219,7 +257,6 @@ impl Motor {
             bail!(tr("erros.motorSemVocabulario", &[]));
         }
 
-        let params = ggml.params_contexto(janela as u32);
         let contexto = match unsafe { ggml.contexto(modelo, params) } {
             Ok(c) => c,
             Err(e) => {
@@ -233,7 +270,8 @@ impl Motor {
         let n_batch = ggml.tamanho_lote(contexto).max(1);
 
         Ok(Motor {
-            dispositivo: placa.nome.clone(),
+            dispositivo: nome,
+            na_placa,
             ggml,
             modelo,
             contexto,
@@ -423,6 +461,13 @@ impl Motor {
 
     pub fn vocabulario(&self) -> usize {
         self.n_vocab
+    }
+
+    /// O lote que a biblioteca aceitou, que é o `n_batch` pedido ajustado por ela.
+    /// A sonda de CPU imprime este número porque é ele, não o pedido, que decide
+    /// quantos tokens atravessam o modelo por decodificação.
+    pub fn lote(&self) -> usize {
+        self.n_batch
     }
 
     /// As placas visíveis nesta máquina, para a medição e para o diagnóstico.

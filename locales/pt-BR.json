@@ -106,7 +106,8 @@
   "efeito": {
     "soLe": "Só lê",
     "altera": "Altera",
-    "podeApagar": "Pode apagar"
+    "podeApagar": "Pode apagar",
+    "saiDaMaquina": "Sai da máquina"
   },
   "conversa": {
     "promptSistema": "Você é Aether, um assistente local que roda no computador do usuário. Responda em {idioma}, de forma breve e direta. Aja com as ferramentas em vez de descrever a ação: quem aprova cada ação é a tela de aprovação, então não peça confirmação na resposta. As conversas passadas ficam no índice de memória local: antes de dizer que não lembra de um assunto, procure em buscar_memoria.",
@@ -473,6 +474,10 @@
     "bancoApagar": "apagar"
   },
   "ferramentas": {
+    "buscarNaWeb": {
+      "titulo": "Pesquisar na internet",
+      "descricao": "Procura em html.duckduckgo.com e pt.wikipedia.org e devolve título, endereço e resumo. Só existe com a rede ligada em rede.json, e cada saída pede aprovação da pessoa. O texto da consulta é o único dado que sai da máquina."
+    },
     "lerArquivo": {
       "titulo": "Ler arquivo",
       "descricao": "Lê o conteúdo de um arquivo de texto dentro das pastas concedidas. Use inicio e fim para ler só um trecho."
@@ -563,6 +568,10 @@
     }
   },
   "argumentos": {
+    "consultaRede": "Consulta",
+    "consultaRedeDescricao": "O texto a procurar. Ele entra como valor de um parâmetro de uma URL fixa: endereço, host e caminho não são escolha do modelo.",
+    "maximoResultados": "Máximo de resultados",
+    "maximoResultadosDescricao": "Entre 1 e 5; mais que isto o código corta.",
     "caminho": "Caminho",
     "caminhoDescricao": "Caminho do arquivo ou pasta, dentro de uma pasta concedida.",
     "conteudo": "Conteúdo",
@@ -767,7 +776,7 @@
       "naoEsqueceu": "o prefill reaproveitou o cache da conversa anterior"
     },
     "prefixo": {
-      "soNaPlaca": "o cache de prefixo é do motor em placa; o processador recalcula tudo",
+      "soForaDoGgml": "o cache de prefixo é da biblioteca llama.cpp, na placa ou no processador; o candle recalcula tudo",
       "cacheVelho": "a primeira rodada já veio com {n} tokens do cache de outra conversa",
       "naoReaproveitou": "reaproveitou {reaproveitados} de {historico} tokens de entrada",
       "semRecorte": "a rodada divergente não recortou o cache: reaproveitou {reaproveitados} de {ocupadas}",
@@ -824,7 +833,35 @@
       "bancosFicaram": "linhas no fim"
     }
   },
+  "rede": {
+    "aviso": "Resultado obtido fora desta máquina, em servidor de terceiros. Nada aqui foi verificado localmente.",
+    "consulta": "Consulta enviada",
+    "origem": "Origem dos bytes",
+    "foraDaMaquina": "Fora da máquina",
+    "vazio": "Nenhum resultado chegou",
+    "falha": "O fornecedor {fornecedor} não respondeu",
+    "motivo": {
+      "esquema": "Esquema recusado: só https sai desta máquina",
+      "host": "Host fora da lista permitida",
+      "porta": "Porta diferente de 443",
+      "caminho": "Caminho fora do endpoint declarado para este host",
+      "usuario": "Credencial na URL",
+      "endereco": "Endereço de retorno, privado ou link-local",
+      "pulo": "Redirecionamento fora da lista, ou pulos demais",
+      "corpo": "Corpo acima de 512 KiB",
+      "prazo": "Prazo esgotado",
+      "semEndereco": "O nome não resolveu em endereço público"
+    }
+  },
   "erros": {
+    "redeDesligada": "A busca na web está desligada: ligue em rede.json",
+    "redeMotor": "Não foi possível abrir o motor de rede",
+    "redeTodosFalharam": "Nenhum fornecedor respondeu: {detalhe}",
+    "redeResposta": "O servidor respondeu com erro {codigo}",
+    "redeSemDestino": "Resposta {codigo} sem endereço para onde ir",
+    "redeFalhou": "O pedido falhou: {detalhe}",
+    "redeArquivoQuebrado": "rede.json ilegível; a rede ficou desligada",
+    "redeGravar": "Não foi possível gravar rede.json: {detalhe}",
     "pedidoVazio": "pedido vazio",
     "turnoEmAndamento": "já há um turno em andamento",
     "turnoNaoTerminou": "o turno não terminou: {detalhe}",
@@ -973,6 +1010,7 @@
     "motorDecodificacao": "o motor recusou o lote de tokens (código {codigo})",
     "motorSemLogits": "o motor não devolveu logits",
     "motorSemPlaca": "não há GPU utilizável neste computador",
+    "motorSemCpu": "a ggml não registrou um dispositivo de CPU neste computador",
     "motorSemVocabulario": "o motor não informou o tamanho do vocabulário deste modelo",
     "motorSemDispositivo": "o motor não achou nenhum dispositivo onde contar os vetores",
     "motorSemDimensao": "o modelo de embeddings não declarou a dimensão do vetor",

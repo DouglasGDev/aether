@@ -108,6 +108,20 @@ fn main() -> anyhow::Result<()> {
             .collect();
         return alojamento(&dir, &weights, &janelas, forcadas);
     }
+    // A mesma biblioteca contando no processador, medida escala por escala.
+    // `cpu:8,512,1;16,2048,0` são os combos threads,lote,atenção-rápida; `0`
+    // em threads é o padrão da biblioteca, que é o braço de controle. Com quatro
+    // campos — `cpu:8,16,1024,1` — o primeiro é a thread da decodificação e o
+    // segundo a do lote, porque a medição mostrou que elas querem números
+    // opostos no mesmo processador.
+    if let Some(list) = prompt.strip_prefix("cpu:") {
+        let escala = args
+            .get(6)
+            .map(PathBuf::from)
+            .map(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| t.map(|t| t.trim().to_string()));
+        return cpu_sweep(&dir, &weights, context, max_tokens, list, escala.as_deref());
+    }
 
     println!("carregando {weights} (janela {context})...");
     let load_start = Instant::now();
@@ -347,7 +361,12 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize], forcadas: Option<
         Alojamento::SoSistema { .. } => 0,
     };
     let inicio = Instant::now();
-    let motor = ggml::Motor::novo(&pastas, &caminho, context, camadas)
+    let motor = ggml::Motor::novo(
+        &pastas,
+        &caminho,
+        context,
+        ggml::Destino::Placa { camadas_gpu: camadas },
+    )
         .map_err(|e| anyhow::anyhow!("carga falhou: {e}"))?;
     // A segunda leitura é a metade medida do delta. Repetir o valor de antes
     // quando a placa não respondeu produziria um "0 MiB cedidos" que parece uma
@@ -378,6 +397,147 @@ fn alojamento(dir: &PathBuf, weights: &str, janelas: &[usize], forcadas: Option<
             None => "não medida".to_string(),
         }
     );
+    Ok(())
+}
+
+/// A mesma biblioteca contando no processador, combo por combo: uma carga por
+/// escala, prefill e decode guloso no mesmo lote de ids. O número que sai daqui
+/// é o que `Destino::Sistema` obedece no aplicativo, e é por isso que ele é
+/// medido em vez de escolhido — threads de mais paga troca de contexto, lote de
+/// mais paga DRAM, e qual dos dois dói mais é propriedade desta máquina.
+fn cpu_sweep(
+    dir: &PathBuf,
+    weights: &str,
+    context: usize,
+    passos: usize,
+    combos: &str,
+    texto: Option<&str>,
+) -> anyhow::Result<()> {
+    use aether_lib::ai::ggml::{self, Destino, Escala};
+    use tokenizers::Tokenizer;
+
+    let pastas = dlls();
+    let caminho = dir.join(weights);
+    let texto = texto
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            "Resuma em detalhes o que um assistente local faz com arquivos, bancos de dados e \
+             memória de longo prazo, cobrindo cada capacidade com um exemplo e explicando os \
+             limites conhecidos de cada uma."
+                .to_string()
+        });
+    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let ids: Vec<u32> = tokenizer
+        .encode(texto.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+        .get_ids()
+        .to_vec();
+    let nucleos = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    println!(
+        "cpu: arquivo={} janela={} prompt={} tokens | decode={} passos | threads lógicas={} | escala da máquina={:?} | combo=threads[,threads_lote],lote,fa | fixo para todos os combos",
+        weights,
+        context,
+        ids.len(),
+        passos,
+        nucleos,
+        // A escala que o aplicativo de fato monta nesta máquina, impressa antes
+        // de qualquer combo: é a prova de que `Escala::da_maquina()` devolve o
+        // número que a varredura escolheu, e não um número escrito no arquivo.
+        // Uma lista vazia de combos corre só esta linha.
+        Escala::da_maquina(),
+    );
+    for combo in combos.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+        let campo: Vec<&str> = combo.split(',').map(str::trim).collect();
+        // `threads,lote,fa` é a forma antiga; `threads,threads_lote,lote,fa` é a
+        // que separa a decodificação do prefill, porque os dois querem números
+        // opostos no mesmo processador.
+        let (t, tb, l, f) = match campo.as_slice() {
+            [t, l, f] => (*t, *t, *l, *f),
+            [t, tb, l, f] => (*t, *tb, *l, *f),
+            _ => {
+                println!("combo incompleto: {combo} (esperado threads[,threads_lote],lote,fa)");
+                continue;
+            }
+        };
+        let (Some(threads), Some(threads_lote), Some(lote), Some(fa)) = (
+            t.parse::<i32>().ok(),
+            tb.parse::<i32>().ok(),
+            l.parse::<u32>().ok(),
+            f.parse::<u32>().ok(),
+        ) else {
+            println!("combo ilegível: {combo} (esperado threads[,threads_lote],lote,fa)");
+            continue;
+        };
+        let escala =
+            Escala { threads, threads_lote, lote, atencao_rapida: fa != 0 };
+        let rotulo = if threads == threads_lote {
+            format!("threads={threads} lote={lote} fa={fa}")
+        } else {
+            format!("threads={threads}/{threads_lote} lote={lote} fa={fa}")
+        };
+        let inicio = Instant::now();
+        let mut motor = match ggml::Motor::novo(
+            &pastas,
+            &caminho,
+            context,
+            Destino::Sistema(escala),
+        ) {
+            Ok(motor) => motor,
+            Err(e) => {
+                println!("{rotulo} → carga falhou: {e}");
+                continue;
+            }
+        };
+        let carga = inicio.elapsed().as_secs_f64();
+        let (lote_aceito, janela_aceita, dispositivo) =
+            (motor.lote(), motor.janela, motor.dispositivo.clone());
+        let inicio = Instant::now();
+        let mut logits = match motor.passo(&ids) {
+            Ok(logits) => logits,
+            Err(e) => {
+                println!("{rotulo} → prefill falhou: {e}");
+                continue;
+            }
+        };
+        let prefill_ms = inicio.elapsed().as_secs_f64() * 1000.0;
+        let inicio = Instant::now();
+        let mut emitidos = 0usize;
+        for _ in 0..passos {
+            let Some(next) = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+            else {
+                break;
+            };
+            match motor.passo(&[next]) {
+                Ok(novos) => logits = novos,
+                Err(e) => {
+                    println!("{rotulo} → decode parou: {e}");
+                    break;
+                }
+            }
+            emitidos += 1;
+        }
+        let decode_ms = inicio.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "{rotulo} → device={} lote aceito={} janela aceita={} | carga {:.2}s | prefill {} tokens em {:.0}ms ({:.1} t/s) | decode {} tokens em {:.0}ms ({:.2} t/s)",
+            dispositivo,
+            lote_aceito,
+            janela_aceita,
+            carga,
+            ids.len(),
+            prefill_ms,
+            ids.len() as f64 / (prefill_ms / 1000.0),
+            emitidos,
+            decode_ms,
+            emitidos as f64 / (decode_ms / 1000.0),
+        );
+    }
     Ok(())
 }
 
@@ -1396,7 +1556,7 @@ fn prefixo_reutilizado(
         "carga: {} | backend={} dispositivo={:?} janela={}",
         weights, acelerador.tipo, acelerador.dispositivo, engine.context()
     );
-    if acelerador.tipo != "gpu" {
+    if !engine.usa_ggml() {
         eprintln!("prefixo: o recorte de cache é do caminho ggml; no candle o prefill é inteiro");
         std::process::exit(2);
     }

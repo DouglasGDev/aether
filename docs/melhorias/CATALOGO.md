@@ -408,9 +408,12 @@ o que não mediu antes (#36), a regra passou a ser o portão:
   (`catalog.rs:814`) — cada arquivo do catálogo e dos codificadores tem de ter
   linha medida, nenhum nome pode se repetir (é a chave), e cada tipo da linha tem
   de ter conta de bloco no leitor. Este teste substituiu o de etiquetas;
-- `granites_sao_executaveis_pelo_caminho_de_cpu` (`catalog.rs:846`) — a parte que
-  ainda é sobre o caminho de CPU, que só existe para o granite e escolhe pelo
-  nome da quant, preservada;
+- `granites_sao_executaveis_pelo_caminho_de_cpu` (`catalog.rs:849`) — a parte que
+  é sobre o degrau mais estreito do caminho de CPU: sem placa a llama.cpp conta
+  no processador e abre qualquer arquitetura que ela abra, e o candle só é
+  alcançado quando essa carga também falha. O degrau de baixo existe só para o
+  granite e escolhe pelo nome da quant, preservada (redescrita na frente #116,
+  que acrescentou o degrau do meio);
 - `tipo_sem_bloco_medido_nao_vira_ficha_inventada` (`alojamento.rs:1155`) — o
   GGUF sintético de um tensor só, escrito na #109 como `tipo_fora_da_tabela_do_leitor_nao_vira_ficha_inventada`
   e reescrito na #111: com o tipo 8 a ficha sai e conta os 68 bytes reais
@@ -609,8 +612,9 @@ inteiro na mão de ninguém: nada aqui lê a região de dados.
 
 O alojamento passou a usar isto: `fichar` (`alojamento.rs:546`) abre o cabeçalho
 por `cabecalho::ler` (`:515`) e `por_camada` (`:490`) recebe o `Cabecalho` do
-leitor. O candle continua no caminho de CPU do granite, que é outra coisa — carregar
-pesos, não medi-los.
+leitor. O candle continua carregando os pesos do granite — é outra coisa, medir não
+é executar — mas desde a #116 ele não é mais o caminho de CPU: sem placa a
+llama.cpp conta no processador, e o candle é o degrau abaixo dela.
 
 **A troca não muda um número de arquivo que já tinha veredito.** O candle não
 expõe `GgmlDType::from_u32` (é `pub(crate)`), mas `block_size()` e `type_size()`

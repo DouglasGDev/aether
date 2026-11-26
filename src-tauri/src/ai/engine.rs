@@ -1,10 +1,12 @@
 //! Carregamento e geração, com streaming token a token.
 //!
-//! Dois backends, uma amostragem: a conta vai para a placa quando existe uma
-//! (ggml/Vulkan, de qualquer fabricante) e para a CPU quando não existe nenhuma
-//! (candle). Os dois entregam logits na mesma forma, e é um único caminho de
-//! amostragem que os consome — sampler duplicado é como duas respostas passam a
-//! divergir entre si.
+//! Dois motores, uma amostragem: a conta vai para a placa quando existe uma
+//! (ggml/Vulkan, de qualquer fabricante) e, quando não existe, para a mesma
+//! biblioteca contando no processador (`ggml::Destino::Sistema`). O candle é o degrau
+//! depois desse, para a máquina em que nem a llama.cpp abriu: é o único caminho
+//! que conhece uma arquitetura só. Os dois entregam logits na mesma forma, e é um
+//! único caminho de amostragem que os consome — sampler duplicado é como duas
+//! respostas passam a divergir entre si.
 //!
 //! A inferência é bloqueante e pesada: quem chama precisa rodar isto fora do
 //! runtime async (spawn_blocking ou thread dedicada).
@@ -178,14 +180,16 @@ fn tokens_antes_do_corte(tokenizer: &Tokenizer, tokens: &[u32], corte: usize) ->
     Ok(k)
 }
 
-/// Onde a conta acontece.
+/// Onde a conta acontece, e com qual biblioteca.
 enum Motor {
-    /// ggml/llama.cpp numa placa. Posições e KV cache são da biblioteca: ela
-    /// mesma sabe onde termina a sequência.
-    Gpu { motor: ggml::Motor },
-    /// candle na CPU. As posições são contadas aqui, e é exatamente o que
-    /// `granite::Layer::rope` espera: `narrow(index_pos..index_pos + n)`.
-    Cpu { model: granite::Model, config: Config, pos: usize },
+    /// ggml/llama.cpp — na placa escolhida ou, quando ela não serve, no
+    /// processador. Posições e KV cache são da biblioteca: ela mesma sabe onde
+    /// termina a sequência.
+    Ggml { motor: ggml::Motor },
+    /// candle na CPU, único caminho que conhece só uma arquitetura. As posições
+    /// são contadas aqui, e é exatamente o que `granite::Layer::rope` espera:
+    /// `narrow(index_pos..index_pos + n)`.
+    Candle { model: granite::Model, config: Config, pos: usize },
 }
 
 impl Motor {
@@ -194,12 +198,12 @@ impl Motor {
     /// lote.
     fn passo(&mut self, tokens: &[u32]) -> Result<Tensor> {
         match self {
-            Motor::Gpu { motor } => {
+            Motor::Ggml { motor } => {
                 let logits = motor.passo(tokens)?;
                 let n = logits.len();
                 Ok(Tensor::from_vec(logits, (n,), &Device::Cpu)?)
             }
-            Motor::Cpu { model, pos, .. } => {
+            Motor::Candle { model, pos, .. } => {
                 let input = Tensor::new(tokens, &Device::Cpu)?.reshape((1, tokens.len()))?;
                 let logits = model.forward(&input, *pos)?.squeeze(0)?;
                 *pos += tokens.len();
@@ -214,12 +218,12 @@ impl Motor {
     /// medida honesta disso, não um reaproveitamento que não aconteceu.
     fn passo_prompt(&mut self, tokens: &[u32]) -> Result<(Tensor, usize, bool)> {
         match self {
-            Motor::Gpu { motor } => {
+            Motor::Ggml { motor } => {
                 let (logits, reaproveitados, recusado) = motor.passo_com_prefixo(tokens)?;
                 let n = logits.len();
                 Ok((Tensor::from_vec(logits, (n,), &Device::Cpu)?, reaproveitados, recusado))
             }
-            Motor::Cpu { .. } => {
+            Motor::Candle { .. } => {
                 self.limpar();
                 Ok((self.passo(tokens)?, 0, false))
             }
@@ -229,8 +233,8 @@ impl Motor {
     /// Esquece a conversa: cache e posições voltam ao estado de modelo novo.
     fn limpar(&mut self) {
         match self {
-            Motor::Gpu { motor } => motor.limpar(),
-            Motor::Cpu { model, pos, .. } => {
+            Motor::Ggml { motor } => motor.limpar(),
+            Motor::Candle { model, pos, .. } => {
                 model.clear_kv_cache();
                 *pos = 0;
             }
@@ -240,15 +244,15 @@ impl Motor {
     /// A janela que o backend aceitou, que pode ser menor que a pedida.
     fn janela(&self) -> usize {
         match self {
-            Motor::Gpu { motor } => motor.janela,
-            Motor::Cpu { model, .. } => model.max_seq_len(),
+            Motor::Ggml { motor } => motor.janela,
+            Motor::Candle { model, .. } => model.max_seq_len(),
         }
     }
 
     fn vocabulario(&self) -> usize {
         match self {
-            Motor::Gpu { motor } => motor.vocabulario(),
-            Motor::Cpu { config, .. } => config.vocab_size,
+            Motor::Ggml { motor } => motor.vocabulario(),
+            Motor::Candle { config, .. } => config.vocab_size,
         }
     }
 }
@@ -406,7 +410,12 @@ impl Engine {
                     super::geracao::CONTEXTO_MAX as usize,
                 )
             });
-        match ggml::Motor::novo(dlls, &weights, context, despacho) {
+        match ggml::Motor::novo(
+            dlls,
+            &weights,
+            context,
+            ggml::Destino::Placa { camadas_gpu: despacho },
+        ) {
             Ok(motor) => {
                 // O cedido só existe quando a placa respondeu depois da carga:
                 // zero sem medição seria dizer "nada foi levado" sem ter lido.
@@ -441,38 +450,78 @@ impl Engine {
                     eos_tokens,
                     template: ficha.as_ref().and_then(|f| f.template.clone()),
                     paradas: ficha.map(|f| f.paradas).unwrap_or_default(),
-                    motor: Motor::Gpu { motor },
+                    motor: Motor::Ggml { motor },
                     acelerador,
                 })
             }
             Err(falha_gpu) => {
-                // Fallback legítimo: nenhuma placa serviu. O que a placa respondeu
-                // continua visível, junto com o erro da CPU se ela também falhar.
-                let (model, config) = carregar_na_cpu(&weights, context)
-                    .map_err(|falha_cpu| {
-                        anyhow::anyhow!("{falha_gpu}\n{falha_cpu}")
-                    })?;
-                // As sondas que falharam antes da tentativa entram junto no
-                // motivo: explicam por que a carga chegou à CPU sem medida.
-                let motivo = match motivo_de_carga([erro_ficha, erro_sonda, None]) {
-                    Some(avisos) => format!("{falha_gpu}\n{avisos}"),
-                    None => falha_gpu.to_string(),
-                };
-                Ok(Self {
-                    model_id: model_id.to_string(),
-                    tokenizer,
-                    eos_tokens,
-                    template: ficha.as_ref().and_then(|f| f.template.clone()),
-                    paradas: ficha.map(|f| f.paradas).unwrap_or_default(),
-                    motor: Motor::Cpu { model, config, pos: 0 },
-                    acelerador: Acelerador {
-                        tipo: "cpu",
-                        dispositivo: String::new(),
-                        motivo: Some(motivo),
-                        alojado: None,
-                        janela_inteira: None,
-                    },
-                })
+                // Fallback legítimo: nenhuma placa serviu. A alternativa imediata
+                // não é um motor menor, é o mesmo motor sem placa — llama.cpp
+                // contando no processador com a escala lida desta máquina. Ele
+                // continua enxergando qualquer arquitetura e cortando prefixo de
+                // cache, que é o que o candle não faz: cair direto nele trocaria
+                // "sem placa" por "só Granite".
+                let escala = ggml::Escala::da_maquina();
+                match ggml::Motor::novo(
+                    dlls,
+                    &weights,
+                    context,
+                    ggml::Destino::Sistema(escala),
+                ) {
+                    Ok(motor) => {
+                        let dispositivo = motor.dispositivo.clone();
+                        // As sondas que falharam antes da tentativa entram junto no
+                        // motivo: explicam por que a carga chegou ao processador.
+                        let motivo = match motivo_de_carga([erro_ficha, erro_sonda, None]) {
+                            Some(avisos) => format!("{falha_gpu}\n{avisos}"),
+                            None => falha_gpu.to_string(),
+                        };
+                        Ok(Self {
+                            model_id: model_id.to_string(),
+                            tokenizer,
+                            eos_tokens,
+                            template: ficha.as_ref().and_then(|f| f.template.clone()),
+                            paradas: ficha.map(|f| f.paradas).unwrap_or_default(),
+                            motor: Motor::Ggml { motor },
+                            acelerador: Acelerador {
+                                tipo: "cpu",
+                                dispositivo,
+                                motivo: Some(motivo),
+                                alojado: None,
+                                janela_inteira: None,
+                            },
+                        })
+                    }
+                    // Nem a biblioteca sem placa serviu: aqui entra o candle, e o
+                    // erro dele vai junto com o da placa — os dois são o que a
+                    // máquina respondeu, e esconder um deixaria a tela sem causa.
+                    Err(falha_cpu_ggml) => {
+                        let (model, config) = carregar_na_cpu(&weights, context).map_err(
+                            |falha_candle| {
+                                anyhow::anyhow!("{falha_gpu}\n{falha_cpu_ggml}\n{falha_candle}")
+                            },
+                        )?;
+                        let motivo = match motivo_de_carga([erro_ficha, erro_sonda, None]) {
+                            Some(avisos) => format!("{falha_gpu}\n{falha_cpu_ggml}\n{avisos}"),
+                            None => format!("{falha_gpu}\n{falha_cpu_ggml}"),
+                        };
+                        Ok(Self {
+                            model_id: model_id.to_string(),
+                            tokenizer,
+                            eos_tokens,
+                            template: ficha.as_ref().and_then(|f| f.template.clone()),
+                            paradas: ficha.map(|f| f.paradas).unwrap_or_default(),
+                            motor: Motor::Candle { model, config, pos: 0 },
+                            acelerador: Acelerador {
+                                tipo: "cpu",
+                                dispositivo: String::new(),
+                                motivo: Some(motivo),
+                                alojado: None,
+                                janela_inteira: None,
+                            },
+                        })
+                    }
+                }
             }
         }
     }
@@ -494,8 +543,8 @@ impl Engine {
     /// fino ligado que não muda uma palavra da resposta.
     pub fn usar_adaptadores(&mut self, pedidos: &[(PathBuf, f32)]) -> Vec<ggml::Aplicado> {
         match &mut self.motor {
-            Motor::Gpu { motor } => motor.usar_adaptadores(pedidos),
-            Motor::Cpu { .. } => pedidos
+            Motor::Ggml { motor } => motor.usar_adaptadores(pedidos),
+            Motor::Candle { .. } => pedidos
                 .iter()
                 .map(|(caminho, _)| ggml::Aplicado {
                     caminho: caminho.clone(),
@@ -510,8 +559,8 @@ impl Engine {
     /// lê o GGUF é a llama.cpp e estes escalares nunca passam por nós.
     pub fn config(&self) -> Option<&Config> {
         match &self.motor {
-            Motor::Gpu { .. } => None,
-            Motor::Cpu { config, .. } => Some(config),
+            Motor::Ggml { .. } => None,
+            Motor::Candle { config, .. } => Some(config),
         }
     }
 
@@ -558,15 +607,22 @@ impl Engine {
     /// biblioteca não disse.
     pub fn cache_ocupado(&self) -> Option<usize> {
         match &self.motor {
-            Motor::Gpu { motor } => Some(motor.ocupadas()),
-            Motor::Cpu { .. } => None,
+            Motor::Ggml { motor } => Some(motor.ocupadas()),
+            Motor::Candle { .. } => None,
         }
     }
 
-    /// Se a conta está na placa. A regra do produto é placa primeiro; a bancada
-    /// pergunta se foi a placa que rodou, e o recorte de prefixo só existe lá.
+    /// Se a conta está na placa. A regra do produto é placa primeiro, e a tela
+    /// diz onde ela foi parada — um motor ggml no processador não é uma placa.
     pub fn na_placa(&self) -> bool {
-        matches!(self.motor, Motor::Gpu { .. })
+        matches!(&self.motor, Motor::Ggml { motor } if motor.na_placa)
+    }
+
+    /// Se quem conta é a llama.cpp, na placa ou no processador. É esta a
+    /// pergunta que o cache de prefixo faz: a redução é da biblioteca, não do
+    /// dispositivo, e o candle não tem recorte parcial de cache nenhum.
+    pub fn usa_ggml(&self) -> bool {
+        matches!(self.motor, Motor::Ggml { .. })
     }
 
     /// Gera a continuação de `prompt_tokens`, emitindo texto por `emit`.
@@ -686,9 +742,10 @@ impl Engine {
     }
 }
 
-/// O caminho de CPU: candle sobre o granite nativo, para máquinas sem placa
-/// nenhuma. É também onde a arquitetura continua restrita a granite, porque é
-/// o que este motor implementa.
+/// O último degrau: candle sobre o granite nativo, para a máquina em que a
+/// llama.cpp não abriu nem no processador. É aqui que a arquitetura continua
+/// restrita a granite, porque é o que este motor implementa — o degrau de cima,
+/// `ggml::Destino::Sistema`, não tem essa restrição.
 fn carregar_na_cpu(weights: &Path, context: usize) -> Result<(granite::Model, Config)> {
     let mut file = std::fs::File::open(weights).map_err(|e| {
         anyhow::anyhow!(tr(

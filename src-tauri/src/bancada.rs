@@ -629,12 +629,12 @@ fn caso_prefixo(
     cancel: &AtomicBool,
     inicio: Instant,
 ) -> anyhow::Result<Resultado> {
-    if !engine.na_placa() {
+    if !engine.usa_ggml() {
         return Ok(veredito(
             "prefixo",
             Estado::NaoRodado,
             Vec::new(),
-            Some(t("bancada.prefixo.soNaPlaca")),
+            Some(t("bancada.prefixo.soForaDoGgml")),
             inicio,
         ));
     }
