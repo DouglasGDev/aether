@@ -20,6 +20,13 @@ pub enum ToolEffect {
     ReadOnly,
     Mutating,
     Destructive,
+    /// Tira bytes da máquina. Não é um degrau acima de `Destructive`: é outro
+    /// eixo, e por isso não se graduou junto com os três de sempre. O
+    /// `Destructive` mexe no que está aqui, e o que estava aqui continua sendo
+    /// da pessoa que apaga; o que sai pela rede já está do outro lado no momento
+    /// em que a pessoa veria o cartão, e não há volta para o texto enviado.
+    /// Nenhum modo autoriza este efeito em silêncio — ver `evaluate`.
+    Rede,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,20 +51,33 @@ pub fn evaluate(
                 Decision::Deny
             }
         }
-        AgentMode::Auto | AgentMode::FullAccess => Decision::Allow,
+        // Os dois modos que liberam o resto da máquina sem perguntar param na
+        // porta de saída. O que um `Auto` compra é efeito sobre o que está aqui:
+        // apagar um arquivo admite arrependimento e a máquina continua sendo da
+        // pessoa, enquanto o texto enviado para fora já está do outro lado antes
+        // de qualquer cartão. A rede não entra nesse pacote — ela é o único
+        // efeito que todo modo ainda tem de aprovar a olho.
+        AgentMode::Auto | AgentMode::FullAccess => {
+            if effect == ToolEffect::Rede {
+                Decision::Ask
+            } else {
+                Decision::Allow
+            }
+        }
         AgentMode::AutoAccept => match effect {
             ToolEffect::ReadOnly | ToolEffect::Mutating => Decision::Allow,
-            ToolEffect::Destructive => Decision::Ask,
+            ToolEffect::Destructive | ToolEffect::Rede => Decision::Ask,
         },
         AgentMode::Default => {
             // A prefix allowlist cannot verify what a pipe or substitution does,
             // so a compound command always earns a fresh prompt.
             if compound {
                 Decision::Ask
-            } else if effect == ToolEffect::Destructive {
-                // Apagar exige um prompt novo mesmo com a confiança da sessão: o
-                // Default é mais cauteloso que o AutoAccept, que já pergunta para
-                // destrutivo. Um grant não pode tornar o modo padrão menos seguro.
+            } else if matches!(effect, ToolEffect::Destructive | ToolEffect::Rede) {
+                // Apagar e sair pela rede exigem um prompt novo mesmo com a
+                // confiança da sessão: o Default é mais cauteloso que o
+                // AutoAccept, que já pergunta para os dois. Um grant não pode
+                // tornar o modo padrão menos seguro.
                 Decision::Ask
             } else if session_granted {
                 Decision::Allow
@@ -220,6 +240,12 @@ mod tests {
             evaluate(AgentMode::Plan, ToolEffect::Destructive, false, true),
             Decision::Deny
         );
+        // O plano não executa nada que altere a máquina, e a rede altera mais do
+        // que a máquina: manda fora o que aqui está.
+        assert_eq!(
+            evaluate(AgentMode::Plan, ToolEffect::Rede, false, true),
+            Decision::Deny
+        );
     }
 
     #[test]
@@ -229,7 +255,81 @@ mod tests {
                 evaluate(mode, ToolEffect::Destructive, true, false),
                 Decision::Allow
             );
+            // A exceção é uma só, e ela é o motivo deste efeito existir: o modo
+            // que libera o disco inteiro ainda pergunta antes de mandar um byte
+            // para fora da máquina.
+            assert_eq!(
+                evaluate(mode, ToolEffect::Rede, false, false),
+                Decision::Ask,
+                "{mode:?} liberou a rede sem perguntar"
+            );
         }
+    }
+
+    /// A régua inteira, num só lugar: todo modo, comando composto ou não, com ou
+    /// sem a confiança da sessão. Nenhum dos vinte cruzamentos devolve `Allow`
+    /// para a rede — e é isto que impede um modo novo de herdar egresso de
+    /// silêncio, porque a lista de modos é o que o teste percorre.
+    #[test]
+    fn nenhum_modo_aprova_a_rede() {
+        for mode in [
+            AgentMode::Plan,
+            AgentMode::Default,
+            AgentMode::AutoAccept,
+            AgentMode::Auto,
+            AgentMode::FullAccess,
+        ] {
+            for compound in [false, true] {
+                for granted in [false, true] {
+                    assert_ne!(
+                        evaluate(mode, ToolEffect::Rede, compound, granted),
+                        Decision::Allow,
+                        "{mode:?} composto={compound} concedido={granted} aprovou a rede"
+                    );
+                }
+            }
+        }
+        // O plano recusa (não executa nada que não leia); os outros quatro
+        // perguntam — e perguntar é a decisão explícita que o efeito exige.
+        assert_eq!(evaluate(AgentMode::Plan, ToolEffect::Rede, false, false), Decision::Deny);
+        for mode in [
+            AgentMode::Default,
+            AgentMode::AutoAccept,
+            AgentMode::Auto,
+            AgentMode::FullAccess,
+        ] {
+            assert_eq!(evaluate(mode, ToolEffect::Rede, false, false), Decision::Ask);
+        }
+    }
+
+    #[test]
+    fn a_confianca_da_sessao_nao_compra_a_porta_de_saida() {
+        // O grant de sessão é a pessoa dizendo "confio neste conector" uma vez.
+        // Ele cobre o que acontece dentro da máquina; um pedido que sai dela
+        // continua tendo de ser aprovado a cada vez, no modo mais cauteloso que
+        // existe e no mais liberado que existe.
+        for mode in [AgentMode::Default, AgentMode::FullAccess] {
+            let mut gate = PermissionGate::new(mode);
+            gate.grant_session("computador");
+            assert_eq!(
+                gate.decide("computador", ToolEffect::Rede, false),
+                Decision::Ask,
+                "{mode:?} deixou a rede passar pela confiança da sessão"
+            );
+            // A mesma confiança continua valendo para o que é daqui — sem isto o
+            // teste não provaria que foi a rede que mudou a resposta.
+            assert_eq!(gate.decide("computador", ToolEffect::Mutating, false), Decision::Allow);
+        }
+    }
+
+    #[test]
+    fn o_efeito_da_rede_serdeja_como_a_palavra_rede() {
+        // O efeito viaja para a interface como texto: uma chave nova aqui é uma
+        // chave que a tela e o `mcp.json` vão ler.
+        assert_eq!(
+            serde_json::to_value(ToolEffect::Rede).unwrap(),
+            serde_json::json!("rede")
+        );
     }
 
     #[test]
@@ -240,6 +340,10 @@ mod tests {
         );
         assert_eq!(
             evaluate(AgentMode::AutoAccept, ToolEffect::Destructive, false, false),
+            Decision::Ask
+        );
+        assert_eq!(
+            evaluate(AgentMode::AutoAccept, ToolEffect::Rede, false, true),
             Decision::Ask
         );
     }

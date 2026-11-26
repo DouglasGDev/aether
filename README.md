@@ -61,7 +61,19 @@ por número escrito à mão) e o `401` de quem chega sem token.
 | Caminho | O que executa | Quando |
 | --- | --- | --- |
 | GPU | llama.cpp pelo backend **Vulkan** — qualquer arquitetura que a `llama.dll` vendorizada registre | sempre que existe placa Vulkan registrada |
-| CPU | implementação própria em candle (`src-tauri/src/ai/granite.rs`), só granite | máquina sem GPU, ou quando a placa recusa a carga |
+| CPU | a **mesma** llama.cpp contando no processador (`ggml::Destino::Sistema`), com a escala lida da máquina | existe a `llama.dll` e a placa recusou a carga — ou não existe placa |
+| CPU (degrau) | implementação própria em candle (`src-tauri/src/ai/granite.rs`), só granite | quando nem a llama.cpp abre no processador |
+
+O degrau do meio é medido, não alegado. Na mesma máquina, com os mesmos pesos
+(granite 4.2 3B Q4_K_M), o mesmo prompt de 2.048 tokens e os mesmos 64 passos:
+**25,2 s** de rodada pela llama.cpp contando no processador contra **75,3 s** pelo
+candle — 3,0× — com o prefill a 108,4 t/s contra 33,7 e a decodificação a 10,14 t/s
+contra 4,40. A escala que esse caminho usa não é um número escrito no arquivo: 8
+threads para a decodificação e 16 para o lote, lidos da própria máquina
+(`GetLogicalProcessorInformationEx`, somando as máscaras de afinidade e conferindo a
+soma contra `available_parallelism`), porque os dois lados querem números opostos no
+mesmo processador. As três tabelas, as mutações e o que não foi medido estão em
+[`docs/melhorias/CPU.md`](docs/melhorias/CPU.md).
 
 Vulkan é a porta única para NVIDIA, AMD e Intel — não há SDK de fabricante no
 meio. Antes de carregar qualquer modelo, `src-tauri/src/ai/alojamento.rs` lê a VRAM livre
@@ -196,6 +208,31 @@ movido se um hash divergir. Veja
   pede aprovação mesmo depois de um "confiar neste servidor": `apagar` e
   `bancos_apagar` não entram pela porta do grant de sessão, que era o caminho que
   deixava o modo cauteloso menos seguro que o modo aberto.
+- **Buscar na internet** — existe uma ferramenta a mais, e ela não está lá por
+  padrão: `buscar_na_web` entra no catálogo quando `rede.json` diz
+  `{"ativa": true}` (as 12 ferramentas viram 13); arquivo ausente, ilegível ou
+  vazio é desligado, com aviso na leitura quebrada. Ela trouxe um quarto efeito
+  para o gate — `Sai da máquina` —, que não é um degrau acima de destrutivo: é
+  outro eixo, porque o texto enviado já está do outro lado antes de o cartão
+  aparecer. Nenhum modo autoriza este efeito em silêncio: *Plan* nega, e *Auto*,
+  *Autoaceitar* e *Acesso total* perguntam, mesmo com o "confio neste conector"
+  dado. O modelo escolhe o que procurar, nunca onde bater — a allowlist é uma
+  constante de pares (host, caminho) com `html.duckduckgo.com/html/` e
+  `pt.wikipedia.org/w/api.php`, e a consulta entra como valor de um parâmetro
+  codificado, não como rota. Saem só HTTPS na porta 443, sem credencial na URL,
+  sem endereço literal nem faixa privada; o DNS é resolvido por este código e
+  amarrado ao cliente (`resolve_to_addrs`), porque conferir só o nome deixaria um
+  arquivo `hosts` hostil apontar a Wikipédia para `127.0.0.1`. O redirecionamento
+  do cliente está desligado: quem segue o pulo é o laço daqui, conferindo antes de
+  conectar e parando em 2 pulos, com 8 s por pedido, 4 s de conexão e 15 s de
+  teto — menor que a soma de propósito, para um host que silencia em cada pulo não
+  somar oito segundos três vezes. O corpo tem teto de 512 KiB contado peça a peça,
+  e passar dele recusa a resposta inteira: HTML cortado no meio produziria um
+  resultado pela metade. O cartão abre dizendo de onde os bytes vieram, e o texto
+  que o modelo recebe abre com o aviso de que nada ali foi verificado nesta
+  máquina. O que **não** foi medido é o transporte: nenhuma requisição ao vivo —
+  os parsedores têm corpo congelado como prova e o validador tem URL
+  (`docs/melhorias/REDE.md`).
 - **Bancos de dados** — conexões com SQLite, PostgreSQL, MySQL, SQL Server,
   MongoDB e Oracle cadastradas na tela *Bancos de dados* (o Oracle fala o
   protocolo do driver oficial em modo thin, sem Instant Client instalado). A
@@ -230,8 +267,9 @@ movido se um hash divergir. Veja
   segura arquivo por arquivo. Os escritores do índice fora da varredura (revogar
   uma pasta e revalidar as conversas de um turno) são serializados: sem isso, dois
   leem a mesma cópia e o último publica ressuscita o trecho que o primeiro acabou
-  de apagar, no disco e na memória. Medido na suíte: 509 testes de unidade
-  passando, 516 no total com os 7 que pedem rede ou placa, incluindo os que provam
+  de apagar, no disco e na memória. Medido na suíte: 685 testes de unidade
+  passando, 697 anunciados com os 12 que pedem rede, placa, um modelo em disco ou
+  um download de 46 MB, incluindo os que provam
   o isolamento das duas fontes, a idempotência da prova e os que soltam dois
   escritores no mesmo índice por uma barreira e exigem zero efeitos perdidos.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
@@ -261,6 +299,20 @@ movido se um hash divergir. Veja
   aprovado/reprovado; nenhum caso é aprovado por suposição — ele aprova o que o
   motor devolveu naquela rodada. A bancada não começa com um turno de conversa em
   curso, e o botão *Parar* dela usa o mesmo interruptor de cancelamento do chat.
+- **A barra** — `/` na barra de texto abre uma folha com as seis portas que já
+  existiam: `bancada`, `parar`, `modelos`, `bancos`, `memoria`, `grafo`. Nenhum
+  atalho vira mensagem de conversa — escolher na folha limpa a barra e aperta a
+  ação, e Enter com `/bancada` escrito à mão é resolvido antes de qualquer envio.
+  `@` menciona as pastas concedidas e o modelo em memória, e a menção é texto puro
+  do pedido: o núcleo não ganha analisador nenhum por causa dela. Uma rodada da
+  bancada ganhou uma linha no pé da conversa — `Rodando 3/9`, o caso em curso,
+  aprovados / reprovados / não rodaram, duração — e clicar nela abre a janela que
+  já existia; a linha e a janela lêem o mesmo estado, então não há dois números na
+  tela, e o × esconde a linha sem parar a medição. O corpo cru de uma
+  ferramenta de terceiros, que era um muro de texto solto por chamada, agora é um
+  bloco fechado por padrão, com o cabeçalho que já existia e a medida do corpo na
+  linha — e o que é vista estruturada continua aberto: o cartão de aprovação, o
+  derrame com o `ler_resultado` à mão e o bloco de medidas do turno não mudaram.
 - **Grafo** — a tela de ligações é a forma de editar a política (quais
   conectores, quais ferramentas, quais pastas). O desenho não é a política: o
   núcleo cobra `mcp.json` e `pastas.json` em cada chamada.
@@ -338,12 +390,15 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 516 testes (509 passam, 7 com `#[ignore]`)
+cd src-tauri && cargo test --lib     # 697 testes anunciados (685 passam, 12 com `#[ignore]`)
 npm run build                        # tsc + vite
 ```
 
-Os testes que dependem de rede real (download do HuggingFace) e os que dependem
-de placa estão marcados com `#[ignore]` e rodam sob demanda:
+Os doze ignorados são os que dependem de algo fora do repositório: 4 de download
+(HuggingFace), 2 de motor (um modelo em disco; as DLLs e a placa), 4 de banco (um
+servidor real de PostgreSQL, SQL Server, MongoDB e Oracle), 1 do runtime (46 MB
+dos releases oficiais) e 1 de voz (Kokoro falando e Whisper ouvindo). Rodam sob
+demanda:
 
 ```sh
 cd src-tauri && cargo test --lib -- --ignored
@@ -402,19 +457,23 @@ real só existe na memória do aplicativo, na hora de abrir a conexão.
 
 ## Limites conhecidos
 
-- A integridade de um download é conferida por tamanho, não por hash: o arquivo é
-  publicado quando os bytes recebidos batem com o que o servidor anuncia. Um
-  corpo corrompido no meio, com o tamanho certo, passaria. Conferir o sha256 que o
-  HuggingFace publica, antes do rename, é o próximo passo — registrado em
-  `docs/melhorias/PLANO.md`.
+- Onde o repositório não publica soma, o download é conferido por tamanho. O
+  sha256 do conteúdo é medido e comparado contra o `lfs.oid` publicado **antes** de
+  o `.part` virar o arquivo definitivo — um corpo trocado no meio é descartado e o
+  arquivo inteiro é pedido de novo, até duas vezes —, mas um arquivo git comum,
+  como os de apoio do Granite, só tem SHA-1 do blob: para esses não existe
+  expectativa de 256 bits a conferir, e o aplicativo diz isso em vez de fotografar
+  o download e chamar o retrato de verificação (`docs/melhorias/M8.md`).
 - O modelo que o roteador escolhe para uma tarefa média tem 3 bilhões de
   parâmetros. Ele às vezes traduz o nome de uma ferramenta ao chamá-la, e o
   repositório não finge que isso é confiabilidade: o erro devolve os nomes reais
   e o laço para quando o modelo insiste, em vez de queimar a placa. Para
   programação existe o Ornith 1.5 9B no gerenciador de modelos — ele não vem
   instalado, são 5,4 GiB de pesos, e o roteador só o escolhe depois de baixado.
-- O caminho de CPU executa só granite, porque é uma implementação própria em
-  candle. Numa máquina sem GPU, as outras famílias do catálogo não carregam, e o
+- O degrau de candle executa só granite, porque é uma implementação própria. Ele
+  só é alcançado quando a llama.cpp não abre nem no processador: enquanto a
+  biblioteca existe, o caminho de CPU é ela mesma contando na CPU, e as outras
+  famílias do catálogo carregam nele. Quando o degrau de baixo é o que serve, o
   aplicativo diz qual arquitetura pediu o quê em vez de falhar mudo.
 - Recortar o KV no meio do histórico depende do tipo de memória do modelo. Num
   híbrido com estado recorrente — o Ornith 1.5 9B é um — a metade recorrente só
@@ -423,8 +482,18 @@ real só existe na memória do aplicativo, na hora de abrir a conexão.
   reaproveitados). Nesses modelos a rodada divergente prefila inteira, como faz o
   llama.cpp; o reaproveitamento do prefixo puro continua valendo. Num modelo de
   atenção pura (Granite 4.2 3B) o recorte acontece e é medido.
-- Adaptadores LoRA/QLoRA por turno estão em construção; o que existe hoje é o
-  catálogo GGUF, o roteador e a montagem de contexto.
+- Adaptadores por turno existem e montam: `llama_adapter_lora_init` é chamado pelo
+  FFI, a tela de Adaptadores escolhe quais, e um DoRA registrado como tal entra com
+  a metade que a biblioteca vendorizada permite — o delta — e diz, no cartão, que a
+  normalização de magnitude ficou fora (`docs/melhorias/DORA.md`). O que **não**
+  existe é treinamento: o aplicativo monta adaptadores publicados, não escreve um.
+  Fine-tuning local e uma base de conhecimento curada dentro do app são as duas
+  pontas abertas desta agenda (`docs/melhorias/PLANO.md`).
+- O agente ainda não vê imagem. Não é escusa de upstream: a revisão presa do
+  llama.cpp publica `mtmd.dll` no mesmo pacote de onde vieram as 19 bibliotecas
+  já vendorizadas, e ela está entre as 33 entradas que a cópia deixou de fora. O
+  bloqueio é medido arquivo por arquivo, com os cinco passos que faltam e o que
+  cada um custa, em `docs/melhorias/VISAO.md`.
 - Janela e teto de tokens são escalas do usuário. A escada de janela vai até o
   `context_length` que o GGUF instalado publica no próprio cabeçalho (262.144 no
   Ornith 1.5 9B, 131.072 no Granite 4.2 3B). As Escalas também mostram, medido na

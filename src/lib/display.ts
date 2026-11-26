@@ -29,12 +29,14 @@ export const EFFECT_KEY: Record<ToolEffect, string> = {
   "read-only": "efeito.soLe",
   mutating: "efeito.altera",
   destructive: "efeito.podeApagar",
+  rede: "efeito.saiDaMaquina",
 };
 
 export const EFFECT_ICON: Record<ToolEffect, string> = {
   "read-only": "eye",
   mutating: "pencil",
   destructive: "warning",
+  rede: "globe",
 };
 
 /// Os dois serviços do catálogo de voz. O núcleo manda a variante do enum; a

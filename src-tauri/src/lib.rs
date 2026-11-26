@@ -37,6 +37,12 @@ pub fn run() {
             let gate = Arc::new(Mutex::new(PermissionGate::new(AgentMode::Default)));
             let pastas_path = app.path().app_config_dir()?.join("pastas.json");
             let pastas = Arc::new(RwLock::new(Pastas::carregar(&pastas_path)?));
+            // A rede é uma escolha gravada, não um estado de memória: lida antes
+            // de o conector embutido se conectar, porque é ela que decide se
+            // `buscar_na_web` entra no catálogo que o gerente publica. Arquivo
+            // ausente é desligado — o estado de fábrica do aplicativo.
+            let rede_path = app.path().app_config_dir()?.join(local::web::ARQUIVO);
+            local::web::carregar(&rede_path);
             let models_root = app.path().app_local_data_dir()?.join("models");
             // A mesma lista serve os dois motores nativos: é ao lado do
             // executável que `build.rs` publica a ggml e a sherpa-onnx.
@@ -103,6 +109,7 @@ pub fn run() {
                 ai,
                 pastas,
                 pastas_path,
+                rede_path,
                 memoria,
                 servidores_root,
                 instalacoes: mcp::instalador::Instalacoes::novo(),

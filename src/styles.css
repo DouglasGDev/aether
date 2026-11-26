@@ -10,6 +10,8 @@
   --read: #5eead4;
   --write: #fbbf24;
   --danger: #fb7185;
+  /* O quarto efeito: o byte que sai da máquina não é uma escrita, é uma porta. */
+  --egress: #a78bfa;
 
   color-scheme: dark;
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -3495,6 +3497,10 @@ details[open] > .talk-tool-head .talk-tool-seta {
   stroke: var(--danger);
   --brilho: var(--danger);
 }
+.lig-fio--rede {
+  stroke: var(--egress);
+  --brilho: var(--egress);
+}
 .lig-fio--pasta {
   stroke: color-mix(in srgb, var(--accent) 60%, var(--muted));
   --brilho: var(--accent);
@@ -3813,6 +3819,7 @@ details[open] > .talk-tool-head .talk-tool-seta {
 .lig-porta--le.on .lig-ponto { border-color: var(--read); background: var(--read); }
 .lig-porta--altera.on .lig-ponto { border-color: var(--write); background: var(--write); }
 .lig-porta--apaga.on .lig-ponto { border-color: var(--danger); background: var(--danger); }
+.lig-porta--rede.on .lig-ponto { border-color: var(--egress); background: var(--egress); }
 
 .lig-porta.on .lig-porta-nome {
   color: var(--text);

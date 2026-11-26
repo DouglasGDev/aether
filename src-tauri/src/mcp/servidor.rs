@@ -373,6 +373,10 @@ fn ferramentas_anunciadas(execucao: &Execucao) -> Vec<Tool> {
                 ToolEffect::ReadOnly => anotacoes.read_only_hint = Some(true),
                 ToolEffect::Destructive => anotacoes.destructive_hint = Some(true),
                 ToolEffect::Mutating => {}
+                // Rede não recebe anotação nenhuma: MCP não tem hint de saída da
+                // máquina, e afirmar `read_only` diria a um cliente que nada
+                // atravessa a rede — que é justamente o que esta ferramenta faz.
+                ToolEffect::Rede => {}
             }
             let esquema = match ferramenta.esquema {
                 Value::Object(mapa) => Arc::new(mapa),

@@ -12,6 +12,7 @@ pub mod pastas;
 pub mod sistema;
 pub mod terminal;
 pub mod vista;
+pub mod web;
 
 use crate::ai::memoria::Custodio;
 use crate::connectors::{Connector, ConnectorCategory, ConnectorKind, McpAuth};
@@ -84,9 +85,30 @@ pub(crate) fn ferramenta(
     }
 }
 
-/// O catálogo é montado a cada conexão e a cada troca de idioma, para que a
-/// descrição que o modelo lê esteja no idioma que o usuário escolheu.
+/// O catálogo local do aplicativo, no idioma da vez e com a rede como ela está
+/// ligada agora.
+///
+/// A escolha mora em `rede.json` e é lida uma vez na abertura (`web::carregar`),
+/// mas é consultada aqui, a cada montagem: um catálogo velho em memória é uma
+/// ferramenta que continua aparecendo para o modelo depois de o usuário ter
+/// desligado a porta.
 pub fn catalogo() -> Vec<Ferramenta> {
+    catalogo_com_rede(&web::rede_atual())
+}
+
+/// O catálogo com a escolha escrita à mão. Separada da memória global porque a
+/// memória é uma só por processo e os testes correm em paralelo: ligá-la num
+/// teste mudaria a resposta de todos os outros, e isto é exatamente o que a
+/// porta de saída não pode permitir por acidente.
+pub fn catalogo_com_rede(rede: &web::Rede) -> Vec<Ferramenta> {
+    let mut ferramentas = catalogo_base();
+    if rede.ativa {
+        ferramentas.push(web::ferramenta());
+    }
+    ferramentas
+}
+
+fn catalogo_base() -> Vec<Ferramenta> {
     use ToolEffect::{Destructive, Mutating, ReadOnly};
     vec![
         ferramenta(
@@ -318,6 +340,10 @@ pub fn executar(
         "apagar" => arquivos::apagar(&args, pastas),
         "executar_comando" => terminal::executar(&args, pastas),
         "info_sistema" => sistema::informacoes(pastas),
+        // A única que fala com o mundo. Sem `rede.json` ligado ela não está no
+        // catálogo e, mesmo chamada à mão pelo nome, recusa antes de abrir
+        // soquete — o portão não é o catálogo, é a execução.
+        "buscar_na_web" => web::buscar(&args),
         outra => {
             // O nome errado e o nome bloqueado são fatos diferentes, e o modelo
             // só corrige o primeiro se a resposta disser quais são as ferramentas.
@@ -402,7 +428,86 @@ mod tests {
         ] {
             assert!(nomes.contains(&esperado), "falta {esperado}");
         }
+        // Doze, e não treze: `buscar_na_web` não está aqui porque a rede está
+        // desligada neste processo. O número é a prova de que desligado significa
+        // ausente, e não presente-e-recusando.
         assert_eq!(nomes.len(), 12);
+        assert!(!nomes.contains(&"buscar_na_web"), "a rede ligou sozinha no catálogo");
+    }
+
+    /// A porta de saída só existe se o arquivo dizer que existe. Este é o único
+    /// lugar do aplicativo onde uma ferramenta entra no catálogo por uma escolha
+    /// do usuário — e é por isso que ele é testado pelas duas pontas.
+    #[test]
+    fn a_rede_ligada_e_a_unica_ferramenta_que_entre_e_saia_do_catalogo() {
+        let desligada = catalogo_com_rede(&web::Rede { ativa: false });
+        let ligada = catalogo_com_rede(&web::Rede { ativa: true });
+        assert_eq!(desligada.len(), 12, "catálogo com a rede desligada");
+        assert_eq!(ligada.len(), 13, "a rede ligada não acrescentou uma ferramenta");
+        let novas: Vec<&str> = ligada
+            .iter()
+            .map(|f| f.nome)
+            .filter(|n| !desligada.iter().any(|d| &d.nome == n))
+            .collect();
+        assert_eq!(novas, vec!["buscar_na_web"], "a rede trouxe mais alguma coisa");
+        // O resto do catálogo não muda de efeito quando a rede liga: uma escolha
+        // de rede não reclassifica o que a máquina faz com os arquivos dela.
+        for ferramenta in &desligada {
+            let mesma = ligada.iter().find(|f| f.nome == ferramenta.nome).expect("ainda está");
+            assert_eq!(mesma.efeito, ferramenta.efeito, "{}", ferramenta.nome);
+        }
+    }
+
+    /// O efeito da única ferramenta de rede é o efeito que nenhum modo aprova
+    /// sozinho, e ele é conferido nos dois sentidos: o catálogo declara `Rede`, e
+    /// o gate recusa `Rede` em todos os modos. Um `ToolEffect::Rede` que caísse
+    /// num `ReadOnly` por engano transformaria o cartão em rodapé.
+    #[test]
+    fn a_ferramenta_de_rede_tem_o_efeito_que_o_gate_nao_deixa_passar() {
+        use crate::permissions::{AgentMode, Decision, evaluate};
+        let ferramenta = web::ferramenta();
+        assert_eq!(ferramenta.efeito, ToolEffect::Rede);
+        for modo in [
+            AgentMode::Plan,
+            AgentMode::Default,
+            AgentMode::AutoAccept,
+            AgentMode::Auto,
+            AgentMode::FullAccess,
+        ] {
+            assert_eq!(
+                evaluate(modo, ToolEffect::Rede, false, true),
+                if modo == AgentMode::Plan { Decision::Deny } else { Decision::Ask },
+                "{modo:?} deixou a rede passar sem card"
+            );
+        }
+    }
+
+    /// O portão da rede está na execução, não só no catálogo. Um modelo que
+    /// decorou o nome e chama com o `rede.json` desligado tem de receber a recusa
+    /// da ferramenta, e não a lista de nomes do catálogo — que diria "isso não
+    /// existe" e empurraria a procura por outra porta de saída.
+    #[test]
+    fn chamar_a_rede_pelo_nome_com_a_porta_desligada_devolve_a_recusa() {
+        let pastas = pastas::Pastas::default();
+        let argumentos = json!({ "consultaRede": "amazonas" });
+        let mapa = argumentos.as_object().expect("objeto").clone();
+        let erro = executar(
+            web::FERRAMENTA,
+            argumentos,
+            &pastas,
+            &memoria(),
+            &deposito("rede-desligada"),
+        )
+        .expect_err("rede desligada não executa");
+        let texto = format!("{erro:#}");
+        assert_eq!(
+            texto,
+            web::buscar(&mapa).unwrap_err().to_string(),
+            "quem respondeu não foi a ferramenta de rede"
+        );
+        // A lista do catálogo não entra na resposta: quem recusou foi a porta, e
+        // um nome que a porta fechou não é um nome que o aplicativo desconhece.
+        assert!(!texto.contains(&format!("{CONECTOR}__ler_arquivo")), "{texto}");
     }
 
     #[test]

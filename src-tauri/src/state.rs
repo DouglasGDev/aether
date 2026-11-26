@@ -59,6 +59,12 @@ pub struct AppState {
     /// quem entrega uma cópia a cada ferramenta local no momento da chamada.
     pub pastas: Arc<RwLock<Pastas>>,
     pub pastas_path: PathBuf,
+    /// A escolha de existir ou não uma ferramenta de rede. Uma chave só, lida na
+    /// abertura (`web::carregar`) e escrita por `web::definir`: o caminho mora no
+    /// estado para que a tela que um dia liga o botão escreva no mesmo arquivo que
+    /// o catálogo leu, em vez de abrir um segundo interruptor em memória — que é
+    /// exatamente o que `CONTRIBUTING.md` proíbe.
+    pub rede_path: PathBuf,
     /// A memória do assistente: o codificador de vetores, o índice das pastas
     /// concedidas e as escolhas de `rag.json`. Compartilhada com o gerente porque
     /// recuperar memória é uma ferramenta local como as outras.

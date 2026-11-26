@@ -368,7 +368,9 @@ function cor(efeito: ToolEffect | "pasta"): string {
       ? "altera"
       : efeito === "destructive"
         ? "apaga"
-        : "pasta";
+        : efeito === "rede"
+          ? "rede"
+          : "pasta";
 }
 
 const ZOOM_MINIMO = 0.6;

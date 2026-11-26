@@ -45,7 +45,7 @@ export interface Connector {
   toolAllowlist?: string[] | null;
 }
 
-export type ToolEffect = "read-only" | "mutating" | "destructive";
+export type ToolEffect = "read-only" | "mutating" | "destructive" | "rede";
 
 export interface ToolInfo {
   qualifiedName: string;
