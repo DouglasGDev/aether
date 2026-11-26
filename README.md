@@ -21,7 +21,7 @@ do aplicativo está no menu.
 
 ![Tela inicial do Aether](docs/capturas/tela-inicial.png)
 
-**O menu** — as onze telas de ajuste em quatro seções: motor, conexões, local e
+**O menu** — as doze telas de ajuste em quatro seções: motor, conexões, local e
 sistema. O ponto verde marca a tela cujo ajuste está valendo agora.
 
 ![Menu de configurações do Aether](docs/capturas/menu.png)
@@ -159,7 +159,7 @@ movido se um hash divergir. Veja
   de uma chamada XML já lida não vira segunda chamada: a varredura guarda os
   intervalos que a leitura XML já tomou, porque executar duas vezes a mesma
   escrita é o pior dos dois mundos.
-- **Conector local** — 12 ferramentas de arquivo, terminal, código, memória e
+- **Conector local** — 13 ferramentas de arquivo, terminal, código, memória e
   sistema, dentro das pastas que a pessoa concedeu, mais `criar_mcp_local`, que
   publica o servidor abaixo. Ele entra no mesmo cadastro, na mesma allowlist e no
   mesmo gate que um servidor MCP de terceiros. A contenção é lida do caminho real,
@@ -187,7 +187,7 @@ movido se um hash divergir. Veja
   devolveu o catálogo do momento (as 11 ferramentas locais, antes dos bancos
   entrarem) e um `tools/call` de `info_sistema` ficou parado até a pessoa
   clicar *Aprovar* no cartão da tela — depois disso devolveu o sistema, a placa e
-  as pastas concedidas de verdade. O servidor anuncia o catálogo inteiro — as 12
+  as pastas concedidas de verdade. O servidor anuncia o catálogo inteiro — as 13
   ferramentas locais e as 9 de banco de dados; `criar_mcp_local` não é anunciada
   por ele, porque publicar de dentro de uma publicação seria outra porta para a
   mesma sala. Aperto de mão e descoberta de ferramentas têm 45 s de prazo
@@ -210,7 +210,7 @@ movido se um hash divergir. Veja
   deixava o modo cauteloso menos seguro que o modo aberto.
 - **Buscar na internet** — existe uma ferramenta a mais, e ela não está lá por
   padrão: `buscar_na_web` entra no catálogo quando `rede.json` diz
-  `{"ativa": true}` (as 12 ferramentas viram 13); arquivo ausente, ilegível ou
+  `{"ativa": true}` (as 13 viram 14); arquivo ausente, ilegível ou
   vazio é desligado, com aviso na leitura quebrada. Ela trouxe um quarto efeito
   para o gate — `Sai da máquina` —, que não é um degrau acima de destrutivo: é
   outro eixo, porque o texto enviado já está do outro lado antes de o cartão
@@ -246,13 +246,16 @@ movido se um hash divergir. Veja
   leitura e o SQL livre são da conexão. São 9
   ferramentas (`bancos_listar` a `bancos_sql`) no mesmo catálogo, na mesma
   allowlist e no mesmo gate que as locais; só `bancos_apagar` é destrutiva.
-- **Memória (RAG)** — um índice, duas fontes: os arquivos das pastas concedidas e
-  as conversas salvas. As duas entram na mesma busca híbrida (BM25 + vetorial com
+- **Memória (RAG)** — um índice, três fontes: os arquivos das pastas concedidas,
+  as conversas salvas e as notas da base curada. As três entram na mesma busca
+  híbrida (BM25 + vetorial com
   fusão), com peças sobrepostas e piso de similaridade, e cada uma obedece à
   política da própria fonte: um trecho de arquivo só é lembrado enquanto a pasta
   dele continua concedida; um trecho de conversa é lembrado enquanto a conversa
-  está no histórico e não é a conversa em curso, que já está na janela do modelo.
-  Revogar uma pasta não apaga a memória de conversa e a varredura de pastas não
+  está no histórico e não é a conversa em curso, que já está na janela do modelo;
+  uma nota da base é lembrada enquanto o `.md` dela existe na pasta `base/` —
+  apagá-lo por fora tira a nota do turno seguinte, e a peça fica no índice até a
+  próxima sincronização. Revogar uma pasta não apaga a memória de conversa e a varredura de pastas não
   apaga as conversas. A injeção automática e a ferramenta `buscar_memoria`
   obedecem ao mesmo fio do grafo; a ferramenta, ao contrário da injeção, também
   responde pela conversa aberta. O bloco que entra no turno declara de quem é
@@ -265,13 +268,34 @@ movido se um hash divergir. Veja
   fora do turno com barra de progresso, drena o resto — e não congela a tela: o
   estado que a janela lê vem de um espelho pequeno, não do lock que a varredura
   segura arquivo por arquivo. Os escritores do índice fora da varredura (revogar
-  uma pasta e revalidar as conversas de um turno) são serializados: sem isso, dois
+  uma pasta, revalidar as conversas de um turno e sincronizar a base) são serializados: sem isso, dois
   leem a mesma cópia e o último publica ressuscita o trecho que o primeiro acabou
-  de apagar, no disco e na memória. Medido na suíte: 685 testes de unidade
-  passando, 697 anunciados com os 12 que pedem rede, placa, um modelo em disco ou
+  de apagar, no disco e na memória. Medido na suíte: 712 testes de unidade
+  passando, 724 anunciados com os 12 que pedem rede, placa, um modelo em disco ou
   um download de 46 MB, incluindo os que provam
-  o isolamento das duas fontes, a idempotência da prova e os que soltam dois
+  o isolamento das três fontes, a idempotência da prova e os que soltam dois
   escritores no mesmo índice por uma barreira e exigem zero efeitos perdidos.
+- **Base de conhecimento** — a pasta `base/`, ao lado do `rag.json`, com uma nota
+  por `.md` e o id vindo do próprio título (minúsculo, sem acento, com hífens). A
+  nota é o arquivo: não há banco, nem índice lateral, nem metadados em outro lugar
+  — inclusive a decisão de presa, que é uma linha dentro do texto
+  (`<!-- aether:fixada -->`), então um `.md` copiado para a pasta já é a nota com
+  todas as decisões dela. Um `.md` largado lá à mão é adotado; apagar por fora
+  tira a nota do turno na chamada seguinte.
+  Pregada, ela entra em **todo** turno na frente do bloco, sem precisar ser
+  achada pela busca, dividindo com o resto o mesmo teto de trechos — e o mesmo
+  zero que desliga a busca desliga a presa junto, porque uma chave que deixa
+  passar conteúdo com a busca fechada é uma segunda porta, não um desligamento.
+  Medido por mutação: abrir só uma das duas metades do zero continua verde, e as
+  duas abertas caem no assert (`docs/melhorias/KB.md`).
+  A nota também é ferramenta: `escrever_na_base` entra no catálogo com efeito
+  `Altera`, no mesmo gate, e o cartão mostra antes de rodar o que ela vai
+  escrever. São 13 ferramentas locais com a rede desligada, 14 com ela ligada.
+  A tela (`/base`, item no menu) mostra as três contas separadas — o que está na
+  pasta, o que o índice lembra, o que está preso — e diz por que a segunda pode
+  ser menor que a primeira, em vez de fingir que são a mesma.
+  O que **não** existe aqui é treinamento: a base é RAG gerenciável, não um
+  conjunto de dados de ajuste; o adaptador se monta, não se escreve.
 - **Voz** — Kokoro para fala, Whisper para escuta, ambos locais.
 - **Conversas salvas** — várias conversas no disco, com barra lateral: criar,
   trocar, renomear e apagar (com confirmação em dois cliques). Trocar de conversa
@@ -390,7 +414,7 @@ npm run tauri build
 ## Testar
 
 ```sh
-cd src-tauri && cargo test --lib     # 697 testes anunciados (685 passam, 12 com `#[ignore]`)
+cd src-tauri && cargo test --lib     # 724 testes anunciados (712 passam, 12 com `#[ignore]`)
 npm run build                        # tsc + vite
 ```
 
@@ -487,8 +511,9 @@ real só existe na memória do aplicativo, na hora de abrir a conexão.
   a metade que a biblioteca vendorizada permite — o delta — e diz, no cartão, que a
   normalização de magnitude ficou fora (`docs/melhorias/DORA.md`). O que **não**
   existe é treinamento: o aplicativo monta adaptadores publicados, não escreve um.
-  Fine-tuning local e uma base de conhecimento curada dentro do app são as duas
-  pontas abertas desta agenda (`docs/melhorias/PLANO.md`).
+  A base de conhecimento curada já é uma ponta fechada — ela melhora o agente pelo
+  índice, não pelo peso (`docs/melhorias/KB.md`); escrever um adaptador continua
+  aberto nesta agenda (`docs/melhorias/PLANO.md`).
 - O agente ainda não vê imagem. Não é escusa de upstream: a revisão presa do
   llama.cpp publica `mtmd.dll` no mesmo pacote de onde vieram as 19 bibliotecas
   já vendorizadas, e ela está entre as 33 entradas que a cópia deixou de fora. O

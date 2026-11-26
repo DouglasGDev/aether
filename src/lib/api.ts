@@ -15,16 +15,19 @@ import type {
   ConexaoRegistro,
   Connector,
   EstadoAdaptadores,
+  EstadoBase,
   EstadoConversas,
   EstadoLigacoes,
   EstadoMemoria,
   EstadoVoz,
   FichaConversa,
   GrantedFolder,
+  ListaNotas,
   McpEvent,
   MemoriaEvento,
   MedidorVoz,
   ModelEvent,
+  NotaRemovida,
   PendingApproval,
   Plano,
   Posicao,
@@ -35,6 +38,7 @@ import type {
   ServerEvent,
   ServidorCatalogo,
   ServidorMcpEstado,
+  Sincronizada,
   ToolInfo,
   TurnOutcome,
   VozEvento,
@@ -130,6 +134,19 @@ export const api = {
   ragApagar: () => invoke<void>("rag_apagar"),
   memoriaBuscar: (consulta: string, trechos: number) =>
     invoke<RespostaMemoria>("memoria_buscar", { consulta, trechos }),
+  /// A base de conhecimento: o censo da pasta `base/`, o que o índice lembra dela
+  /// e as três mãos que mexem nela. Cada número dos retornos foi lido no disco ou
+  /// no índice durante a própria chamada, então a tela não soma nada por conta.
+  baseEstado: () => invoke<EstadoBase>("base_estado"),
+  baseListar: () => invoke<ListaNotas>("base_listar"),
+  /// `nota` ausente é o disco quem dá o id; `fixar` ausente continua a decisão
+  /// que já estava na nota. Os dois são opcionais justamente para a tela não
+  /// precisar reescrever o que não foi tocado.
+  baseEscrever: (titulo: string, corpo: string, nota?: string, fixar?: boolean) =>
+    invoke<Sincronizada>("base_escrever", { titulo, corpo, nota, fixar }),
+  baseApagar: (id: string) => invoke<NotaRemovida>("base_apagar", { id }),
+  baseFixar: (id: string, fixada: boolean) =>
+    invoke<Sincronizada>("base_fixar", { id, fixada }),
   adaptadoresEstado: () =>
     invoke<EstadoAdaptadores>("adaptadores_estado"),
   adaptadoresAjustar: (ajustes: AjustesAdaptadores) =>

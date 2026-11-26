@@ -77,6 +77,7 @@ mod testes {
                 &raiz.join("modelos"),
                 &raiz.join("memoria"),
                 raiz.join("rag.json"),
+                &raiz.join(crate::ai::base::PASTA),
                 Arc::new(RwLock::new(Pastas::default())),
             ),
             guardado,

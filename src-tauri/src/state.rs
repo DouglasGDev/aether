@@ -65,6 +65,11 @@ pub struct AppState {
     /// o catálogo leu, em vez de abrir um segundo interruptor em memória — que é
     /// exatamente o que `CONTRIBUTING.md` proíbe.
     pub rede_path: PathBuf,
+    /// A pasta da base de conhecimento (`ai::base`), ao lado de `rag.json`. Mora
+    /// no estado pelo mesmo motivo do `rede_path`: a tela e a ferramenta escrevem
+    /// no mesmo lugar que o índice lê, e não há segunda verdade sobre onde as
+    /// notas estão. O `Custodio` recebe o mesmo caminho na abertura.
+    pub base_path: PathBuf,
     /// A memória do assistente: o codificador de vetores, o índice das pastas
     /// concedidas e as escolhas de `rag.json`. Compartilhada com o gerente porque
     /// recuperar memória é uma ferramenta local como as outras.

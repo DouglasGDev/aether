@@ -1,5 +1,5 @@
-//! A memória do Aether: o que o assistente leu das pastas concedidas, guardado
-//! como vetor, e recuperado por proximidade.
+//! A memória do Aether: o que o assistente leu, guardado como vetor, e
+//! recuperado por proximidade.
 //!
 //! É RAG sem nuvem, e o nome descreve o que está aqui: o texto vira vetor num
 //! codificador GGUF local, os vetores vivem num arquivo desta máquina e a busca
@@ -8,6 +8,11 @@
 //! download do próprio codificador, que é o mesmo caminho dos modelos de
 //! conversa.
 //!
+//! Três fontes entram no mesmo índice, cada uma com a sua política: o arquivo de
+//! uma pasta concedida, a fala de uma conversa salva e a nota da base de
+//! conhecimento ([`crate::ai::base`]) — a que o dono escreveu de propósito, e que
+//! por isso não obedece nem às pastas nem às conversas. Ver [`Fonte`].
+//!
 //! A política não é duplicada: recuperar memória é a ferramenta
 //! `computador__buscar_memoria`, então o fio do grafo que a liga é o mesmo que
 //! autoriza a injeção automática no prompt, e as pastas que ela enxerga são as
@@ -15,6 +20,7 @@
 
 use super::catalog::{self, ModelSpec};
 use super::ggml::{Despacho, Embutidor};
+use crate::ai::base::Nota;
 use crate::idiomas::tr;
 use crate::local::pastas::Pastas;
 use crate::state::{trava_estado, trava_escrita, trava_leitura};
@@ -149,7 +155,7 @@ const SEM_ACENTO: &[(char, char)] = &[
     ('ç', 'c'), ('ñ', 'n'), ('ý', 'y'), ('ÿ', 'y'), ('š', 's'), ('ž', 'z'),
 ];
 
-fn sem_acento(letra: char) -> char {
+pub(crate) fn sem_acento(letra: char) -> char {
     SEM_ACENTO
         .iter()
         .find(|(de, _)| *de == letra)
@@ -243,17 +249,25 @@ pub enum Origem {
     Vetorial,
     Lexica,
     Ambas,
+    /// O trecho não veio de busca nenhuma: entrou porque o dono prendeu a nota
+    /// em que ele está. É a única origem que não é medida, e por isso ela existe
+    /// como variante em vez de um número — ver [`Achado::pontuacao`].
+    Fixada,
 }
 
-/// O que escreve um trecho no índice. As duas fontes convivem no mesmo arquivo e
+/// O que escreve um trecho no índice. As três fontes convivem no mesmo arquivo e
 /// na mesma busca — é isso que faz um cosseno e um BM25 competirem na mesma
 /// régua — mas a política de cada uma é sua.
 ///
 /// Um arquivo só é lido enquanto a pasta onde ele está continua concedida; a
 /// revogação tira o conteúdo dele da resposta e da varredura. Uma conversa é
 /// estado do próprio aplicativo: não há pasta a revogar, e quem a apaga é a
-/// lista de conversas. Confundir as duas — deixar a varredura de pastas apagar as
-/// conversas, ou a concessão de pastas esconder o histórico — seria uma das
+/// lista de conversas. Uma nota de documento é a terceira coisa, e não é nenhuma
+/// das duas: ela obedece à **lista de notas** — a pasta `base/` — e não às pastas
+/// concedidas nem à lista de conversas. [`Fonte`] existe para isso: as fontes
+/// não emprestam política uma para a outra. Confundí-las — deixar a varredura de
+/// pastas apagar as conversas, a concessão esconder o histórico, ou a revogação
+/// de uma pasta levar uma nota que o dono escreveu de propósito — seria uma das
 /// duas: memória perdida ou memória que o dono mandou esquecer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -263,6 +277,9 @@ pub enum Fonte {
     Arquivo,
     /// Uma fala de uma conversa salva.
     Conversa,
+    /// O texto de uma nota da base de conhecimento (`crate::ai::base`). A chave
+    /// no índice é o `id` da nota, que é o nome do arquivo dela sem a extensão.
+    Documento,
 }
 
 impl Fonte {
@@ -271,6 +288,7 @@ impl Fonte {
         match self {
             Self::Arquivo => "arquivo",
             Self::Conversa => "conversa",
+            Self::Documento => "documento",
         }
     }
 }
@@ -411,6 +429,29 @@ struct FichaConversa {
     truncada: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FichaDocumento {
+    /// O título da nota, lido do arquivo dela no momento em que ela entrou. É o
+    /// que o cartão mostra como `nome`.
+    titulo: String,
+    /// Instante da última escrita no `.md`, em milissegundos: é o que ordena as
+    /// fixadas e o que a tela mostra como data.
+    atualizada: u64,
+    /// Se a nota estava presa quando o índice a leu. É espelho do marcador dentro
+    /// do arquivo — a decisão mora no `.md`, e um `rag.json` com lista de fixadas
+    /// seria a segunda verdade da mesma nota.
+    fixada: bool,
+    /// Bytes do texto indexado e instante do arquivo: a prova de que as peças
+    /// gravadas são o texto de hoje, e não o de ontem.
+    prova: Assinatura,
+    /// A nota foi cortada pelo teto de trechos no meio do fatiamento: o índice
+    /// lembra só o começo. Mesma regra da ficha de conversa, pelo mesmo motivo —
+    /// marcada, ela não está "vista" e volta para a fila quando abrir espaço.
+    #[serde(default)]
+    truncada: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Meta {
@@ -434,6 +475,12 @@ struct Meta {
     /// as duas fontes têm políticas diferentes, e um mapa só obrigaria a varredura
     /// de pastas a decidir o que fazer com o histórico — que não é dela.
     conversas: BTreeMap<String, FichaConversa>,
+    /// Uma nota por id, com o título que o cartão mostra, a data do arquivo e se
+    /// ela estava presa. Terceiro mapa e pelos mesmos três motivos do segundo: a
+    /// nota tem política própria (nem pasta, nem conversa), a varredura de pastas
+    /// não tem nada a decidir sobre ela, e o índice gravado antes disto existir é
+    /// vazio — que é a verdade sobre uma base que ainda não foi escrita.
+    documentos: BTreeMap<String, FichaDocumento>,
     trechos: Vec<Trecho>,
 }
 
@@ -443,7 +490,8 @@ struct Meta {
 pub struct Achado {
     /// O caminho do arquivo, ou o id da conversa.
     pub arquivo: String,
-    /// O rótulo curto do cartão: o nome do arquivo ou o título da conversa.
+    /// O rótulo curto do cartão: o nome do arquivo, o título da conversa ou o
+    /// título da nota.
     pub nome: String,
     pub linha: usize,
     pub texto: String,
@@ -451,14 +499,22 @@ pub struct Achado {
     /// em todos os modos: um trecho que entrou pela palavra tem vetor no índice,
     /// e o número mostrado é ele, medido — nunca a pontuação da fusão, que não é
     /// uma similaridade e apareceria como se fosse.
+    ///
+    /// A exceção é [`Origem::Fixada`]: um trecho preso nunca foi procurado, então
+    /// não há cosseno nenhum a mostrar, e o valor é zero — que é o número dizendo
+    /// "nenhuma medida foi feita", não "medido como nada parecido". Quem mostra
+    /// o cartão escreve a palavra *fixada* neste caso, e não o zero: a origem é
+    /// que diz isso, e é por ela que o campo existe.
     pub pontuacao: f32,
-    /// O que trouxe o trecho: a proximidade, a palavra, ou as duas.
+    /// O que trouxe o trecho: a proximidade, a palavra, as duas, ou a decisão do
+    /// dono de prender a nota. O cartão traduz.
     pub origem: Origem,
-    /// De onde veio o trecho — arquivo concedido ou conversa salva. O cartão
-    /// traduz, porque "linha 12" de um arquivo não é a mesma coisa que a mensagem
-    /// 12 de uma conversa.
+    /// De onde veio o trecho — arquivo concedido, conversa salva ou nota da
+    /// base. O cartão traduz, porque "linha 12" de um arquivo não é a mesma
+    /// coisa que a mensagem 12 de uma conversa.
     pub fonte: Fonte,
-    /// Instante da última mensagem da conversa, em milissegundos. `None` num
+    /// Instante da última mensagem da conversa, ou da última escrita da nota, em
+    /// milissegundos. `None` num
     /// arquivo: a data que importa ali é a do trecho, e ela não existe no índice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quando: Option<u64>,
@@ -480,6 +536,11 @@ pub struct Resposta {
 /// O que uma busca precisa, lido do `rag.json` vivo. Agrupado porque as
 /// escalas andam sempre juntas: uma busca com o `k` de um ajuste e o `piso` de
 /// outro é exatamente a resposta que não se pode reproduzir.
+///
+/// `Copy` porque quem completa a busca é o `Custodio`: as sete palavras são
+/// referências e números, e a lista de notas lida do disco entra por uma cópia,
+/// sem mover nada de quem chamou.
+#[derive(Clone, Copy)]
 pub struct Busca<'a> {
     pub vetor: &'a [f32],
     pub texto: &'a str,
@@ -490,6 +551,12 @@ pub struct Busca<'a> {
     /// conversa que já está no buffer do modelo: reler o que ele acabou de ler
     /// custa os tokens que faltariam para a conversa que ele realmente não sabe.
     pub ignorar: &'a [String],
+    /// As notas que existem na base neste momento, lidas do disco no instante da
+    /// busca. É a resposta da terceira fonte à pergunta que `raizes` responde para
+    /// o arquivo e `ignorar` para a conversa: a nota ainda está na lista? Apagar
+    /// o `.md` por fora tira o texto da resposta antes de tirar do índice, e
+    /// nenhum `rag.json` precisa ter sido tocado para isso.
+    pub documentos: &'a [String],
 }
 
 /// Uma conversa como a memória a recebe: a ficha que o cartão mostra e o texto
@@ -521,6 +588,18 @@ impl ConversaViva {
     }
 }
 
+/// A prova de que o índice gravado ainda representa esta nota: os bytes do texto
+/// que entra no índice — não os do arquivo, que têm a linha de título e o
+/// marcador no meio — e o instante em que o disco disse que ela foi escrita.
+/// Os dois números vêm do arquivo lido, e é por eles que um `.md` trocado por
+/// fora do aplicativo é reconhecido como trabalho novo na sincronização seguinte.
+fn prova_da_nota(nota: &Nota) -> Assinatura {
+    Assinatura {
+        bytes: nota.para_indexar().len() as u64,
+        modificado: nota.atualizado,
+    }
+}
+
 /// O que a tela lê do índice sem precisar dos vetores: tamanho, origem, o
 /// agrupamento que a biblioteca respondeu quando eles foram produzidos e a
 /// escala com que as peças foram cortadas.
@@ -530,6 +609,12 @@ struct Leitura {
     arquivos: usize,
     conversas: usize,
     trechos_conversas: usize,
+    /// Notas que o índice lembra, e quantos trechos vieram delas. Lidos dos mapas
+    /// gravados, nunca da pasta: a pergunta da tela é o que a memória sabe.
+    notas: usize,
+    trechos_notas: usize,
+    /// Notas presas na ficha — o que o índice viu da última sincronização.
+    fixadas: usize,
     dimensao: usize,
     agrupamento: String,
     peca: u32,
@@ -565,6 +650,7 @@ impl Indice {
                 sobreposicao,
                 assinaturas: BTreeMap::new(),
                 conversas: BTreeMap::new(),
+                documentos: BTreeMap::new(),
                 trechos: Vec::new(),
             },
             vetores: Vec::new(),
@@ -607,6 +693,10 @@ impl Indice {
         // a ficha junto, o índice diria que a conversa está lembrada quando o
         // vetor que a representa não existe mais.
         self.meta.conversas.clear();
+        // As notas também foram cortadas na escala antiga. Esquecer a ficha delas
+        // junto é o que faz a base voltar para a fila na próxima sincronização,
+        // em vez de ficar prometendo um texto que não existe mais.
+        self.meta.documentos.clear();
         self.vetores.clear();
         true
     }
@@ -701,6 +791,145 @@ impl Indice {
         saíram
     }
 
+    /// Esquece uma nota inteira: as peças dela e a ficha. É o que acontece quando
+    /// o dono apaga o `.md` — da lista para o índice o caminho é só este, e ele é
+    /// o par exato de [`Indice::esquecer_conversa`].
+    pub fn esquecer_documento(&mut self, id: &str) -> usize {
+        let saíram = self.remover(Fonte::Documento, id);
+        self.meta.documentos.remove(id);
+        saíram
+    }
+
+    /// Notas que o índice lembra. A tela compara com a pasta `base/` para o dono
+    /// ver se a memória está atrás do que ele escreveu.
+    pub fn documentos(&self) -> usize {
+        self.meta.documentos.len()
+    }
+
+    /// Quantas notas lembradas estão presas. É lido da ficha, não do disco: a
+    /// pergunta do `Estado` é "o que o índice sabe", e o índice sabe o que viu na
+    /// última sincronização.
+    pub fn fixadas(&self) -> usize {
+        self.meta.documentos.values().filter(|f| f.fixada).count()
+    }
+
+    /// Se a nota já está no índice exatamente como a lista a descreve. Ficha
+    /// truncada nunca está vista, pela mesma razão da conversa: falta texto dela.
+    fn nota_vista(&self, id: &str, prova: &Assinatura) -> bool {
+        self.meta
+            .documentos
+            .get(id)
+            .is_some_and(|ficha| !ficha.truncada && ficha.prova == *prova)
+    }
+
+    /// Quantas notas pedem trabalho: as novas, as que mudaram de texto e as que
+    /// saíram da pasta. Zero é o turno comum, e é ele que não custa vetor nenhum.
+    pub fn notas_pendentes(&self, notas: &[Nota]) -> usize {
+        let fora = self
+            .meta
+            .documentos
+            .keys()
+            .filter(|id| !notas.iter().any(|n| n.id == **id))
+            .count();
+        let mudaram = notas
+            .iter()
+            .filter(|n| !self.nota_vista(&n.id, &prova_da_nota(n)))
+            .count();
+        fora + mudaram
+    }
+
+    /// Esquece toda nota que não está mais na pasta. Devolve quantas saíram.
+    pub fn reter_notas(&mut self, notas: &[Nota]) -> usize {
+        let fora: Vec<String> = self
+            .meta
+            .documentos
+            .keys()
+            .filter(|id| !notas.iter().any(|n| *n.id == **id))
+            .cloned()
+            .collect();
+        let mut saíram = 0usize;
+        for id in fora {
+            saíram += self.esquecer_documento(&id);
+        }
+        saíram
+    }
+
+    /// Troca a memória de uma nota inteira: saem as peças lembradas dela, entram
+    /// as de agora com a ficha que o cartão mostra. Reescrever a nota toda, e não
+    /// só o que mudou, é o que faz um `.md` editado por fora não deixar peça órfã
+    /// apontando para uma linha que não existe mais.
+    fn substituir_documento(
+        &mut self,
+        nota: &Nota,
+        prova: Assinatura,
+        pecas: &[(Peca, Vec<f32>)],
+        truncada: bool,
+    ) {
+        self.remover(Fonte::Documento, &nota.id);
+        for (peca, vetor) in pecas {
+            self.meta.trechos.push(Trecho {
+                arquivo: nota.id.clone(),
+                linha: peca.linha,
+                texto: peca.texto.clone(),
+                fonte: Fonte::Documento,
+            });
+            self.vetores.extend_from_slice(vetor);
+        }
+        self.meta.documentos.insert(
+            nota.id.clone(),
+            FichaDocumento {
+                titulo: nota.titulo.clone(),
+                atualizada: nota.atualizado,
+                fixada: nota.fixada,
+                prova,
+                truncada,
+            },
+        );
+    }
+
+    /// A primeira peça de cada nota presa, na ordem da última escrita — a mais
+    /// mexida primeiro. Não passa por busca nenhuma: é por isto que a nota fixada
+    /// entra no prompt mesmo quando a pergunta não tem nada a ver com ela, e é por
+    /// isto que o `ignorar` do turno não a tira (o `ignorar` corta conversa, não
+    /// decisão do dono).
+    ///
+    /// Zero peças quando a nota ainda não foi indexada: preso é o que o índice
+    /// sabe, e um cartão inventado sobre uma nota que ninguém vetorou seria a
+    /// tela prometendo memória que não existe.
+    pub fn pecas_fixadas(&self) -> Vec<Achado> {
+        let mut presas: Vec<(&String, &FichaDocumento)> = self
+            .meta
+            .documentos
+            .iter()
+            .filter(|(_, ficha)| ficha.fixada)
+            .collect();
+        presas.sort_by(|a, b| b.1.atualizada.cmp(&a.1.atualizada).then(a.0.cmp(b.0)));
+        presas
+            .into_iter()
+            .filter_map(|(id, ficha)| {
+                let (indice, _) = self
+                    .meta
+                    .trechos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.fonte == Fonte::Documento && &t.arquivo == id)
+                    .min_by_key(|(_, t)| t.linha)?;
+                let trecho = &self.meta.trechos[indice];
+                Some(Achado {
+                    nome: ficha.titulo.clone(),
+                    arquivo: id.clone(),
+                    linha: trecho.linha,
+                    texto: trecho.texto.clone(),
+                    // Não medido: ninguém procurou este trecho, ele estava preso.
+                    pontuacao: 0.0,
+                    origem: Origem::Fixada,
+                    fonte: Fonte::Documento,
+                    quando: Some(ficha.atualizada),
+                })
+            })
+            .collect()
+    }
+
     /// Tira do índice os trechos de uma chave, e só os da fonte pedida. As duas
     /// fontes têm chaves que não se encontram — caminho cheio contra id de
     /// conversa — mas é a fonte que decide, para a varredura de pastas não mexer
@@ -725,6 +954,12 @@ impl Indice {
 
     /// Esquece tudo que não está mais dentro de uma pasta concedida. É isto que
     /// faz o fio da memória perder o conteúdo de uma pasta revogada no grafo.
+    ///
+    /// Só arquivos. Este é exatamente o laço onde a política das fontes não pode
+    /// se misturar: as notas vivem na pasta `base/` do aplicativo, que não é
+    /// concedida a ninguém, e uma conversa não tem pasta nenhuma. Passar uma das
+    /// duas por aqui seria a revogação de um diretório apagando o que o dono
+    /// escreveu — o `Documento nunca passa pelo reter_dentro` é o teste.
     pub fn reter_dentro(&mut self, raizes: &[PathBuf]) -> usize {
         let fora: Vec<String> = self
             .meta
@@ -813,8 +1048,9 @@ impl Indice {
     }
 
     /// Os `k` melhores acima do `piso`, na ordem que o `modo` manda, e só do que
-    /// ainda pode ser lembrado: os arquivos das pastas concedidas em `raizes` e as
-    /// conversas que `ignorar` não corta.
+    /// ainda pode ser lembrado: os arquivos das pastas concedidas em `raizes`, as
+    /// conversas que `ignorar` não corta e as notas que ainda estão em
+    /// `documentos`.
     ///
     /// O cosseno é sempre medido, mesmo em modo léxico: ele é o número do
     /// cartão, e um achado que chegou pela palavra continua tendo o vetor dele no
@@ -835,7 +1071,8 @@ impl Indice {
         let lexico = matches!(busca.modo, Modo::Hibrido | Modo::Lexico);
         // Quem responde se um trecho pode ser devolvido é a fonte dele: o arquivo
         // obedece às pastas concedidas, a conversa obedece à lista de conversas e
-        // ao `ignorar` do turno. Nenhuma das duas empresta política para a outra.
+        // ao `ignorar` do turno, e a nota obedece à lista de notas da pasta
+        // `base/`. Nenhuma das três empresta política para as outras duas.
         let pode = |indice: usize| -> bool {
             let trecho = &self.meta.trechos[indice];
             match trecho.fonte {
@@ -843,6 +1080,13 @@ impl Indice {
                 Fonte::Conversa => {
                     !busca.ignorar.iter().any(|id| *id == trecho.arquivo)
                 }
+                // A nota ainda existe? O `ignorar` do turno não passa por aqui:
+                // ele corta o que a conversa já tem no buffer, e uma nota curada
+                // não está em buffer nenhum.
+                Fonte::Documento => busca
+                    .documentos
+                    .iter()
+                    .any(|id| *id == trecho.arquivo),
             }
         };
         let mut proximidade = vec![0f32; self.meta.trechos.len()];
@@ -926,6 +1170,16 @@ impl Indice {
                             .map(|ficha| {
                                 (ficha.titulo.clone(), Some(ficha.atualizada))
                             })
+                            .unwrap_or_else(|| (trecho.arquivo.clone(), None)),
+                        // O nome do achado de uma nota é o título dela, lido da
+                        // ficha gravada junto com o trecho — nunca deduzido do id:
+                        // o `id` é o nome do arquivo, e o dono pode ter trocado o
+                        // `#` de lugar depois de indexar.
+                        Fonte::Documento => self
+                            .meta
+                            .documentos
+                            .get(&trecho.arquivo)
+                            .map(|ficha| (ficha.titulo.clone(), Some(ficha.atualizada)))
                             .unwrap_or_else(|| (trecho.arquivo.clone(), None)),
                     };
                     Achado {
@@ -1198,6 +1452,9 @@ fn leitura(indice: &Indice) -> Leitura {
         arquivos: indice.arquivos(),
         conversas: indice.conversas(),
         trechos_conversas: indice.trechos_de(Fonte::Conversa),
+        notas: indice.documentos(),
+        trechos_notas: indice.trechos_de(Fonte::Documento),
+        fixadas: indice.fixadas(),
         dimensao: indice.dimensao(),
         agrupamento: indice.agrupamento().to_string(),
         peca,
@@ -1478,6 +1735,25 @@ pub struct Resumo {
     pub cancelado: bool,
 }
 
+/// O que uma sincronização da base fez, medido durante ela.
+///
+/// Quatro números e um tempo, todos contados por quem os escreveu: `notas` é o
+/// tamanho da lista que foi dada (não o da pasta — a pasta é o que a função lê, e
+/// ler duas vezes daria duas respostas se alguém escrevesse no meio), `pecas` são
+/// as que entraram, `removidas` as que saíram porque o arquivo deixou de existir
+/// e `tokens` os que o codificador efetivamente comeu. Zero em `pecas` com
+/// `notas` maior que zero tem duas respostas honestas no `estado`: ou a pasta já
+/// estava lembrada, ou não há codificador instalado.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sincronia {
+    pub notas: usize,
+    pub pecas: usize,
+    pub removidas: usize,
+    pub tokens: usize,
+    pub ms: u64,
+}
+
 /// O que a interface mostra. É tudo número lido do motor ou do disco.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1508,6 +1784,15 @@ pub struct Estado {
     /// Dos `indexados`, quantos vieram de conversa e não de arquivo. É o número
     /// que diz se a memória de conversa está realmente montada.
     pub trechos_conversas: usize,
+    /// Notas que o índice lembra, dos arquivos que ele leu na última
+    /// sincronização. Comparado com `base_estado.notas` é o que a tela diz: a base
+    /// tem N, a memória sabe de M.
+    pub notas: usize,
+    /// Dos `indexados`, quantos são peças de nota.
+    pub trechos_notas: usize,
+    /// Notas presas na ficha do índice. Não é `base::listar`: é o que a memória
+    /// sabe que estava preso quando ela leu.
+    pub fixadas: usize,
     /// Quantas camadas do codificador subiram para a placa, com o veredito que as
     /// contou e, quando não houve conta, o motivo. `None` é "nenhum codificador
     /// carregado nesta execução" — a mesma distinção que `Acelerador` faz no
@@ -1560,6 +1845,10 @@ pub struct Custodio {
     models_root: PathBuf,
     caminho_indice: PathBuf,
     ajustes_path: PathBuf,
+    /// A pasta da base de conhecimento (`crate::ai::base`). Um caminho só, tomado
+    /// na abertura e nunca reescrito: é ele que a ferramenta, os comandos e a
+    /// varredura leem, então não há segunda verdade sobre onde as notas moram.
+    raiz_base: PathBuf,
     pastas: Arc<RwLock<Pastas>>,
     ajustes: Mutex<Ajustes>,
     carregado: Mutex<Option<Carregado>>,
@@ -1593,6 +1882,7 @@ impl Custodio {
         models_root: &Path,
         raiz_memoria: &Path,
         ajustes_path: PathBuf,
+        raiz_base: &Path,
         pastas: Arc<RwLock<Pastas>>,
     ) -> Self {
         // Lido antes de o caminho virar campo do custódio: é o mesmo arquivo, e
@@ -1603,6 +1893,7 @@ impl Custodio {
             models_root: models_root.to_path_buf(),
             caminho_indice: raiz_memoria.join("indice.aether"),
             ajustes_path,
+            raiz_base: raiz_base.to_path_buf(),
             pastas,
             ajustes: Mutex::new(ajustes),
             carregado: Mutex::new(None),
@@ -1797,9 +2088,13 @@ impl Custodio {
 
     /// Busca com o índice travado só para leitura. As pastas são lidas vivas,
     /// no momento da busca: revogar uma pasta tira o conteúdo dela da resposta
-    /// antes de tirar do índice.
+    /// antes de tirar do índice. As notas também: a lista é a pasta `base/` como
+    /// ela está no disco agora, e apagar um `.md` por fora o esconde da resposta
+    /// na busca seguinte sem que ninguém precise chamar comando nenhum.
     fn procurar(&self, busca: &Busca) -> Result<Resposta> {
         let raizes = trava_leitura(&self.pastas).raizes.clone();
+        let documentos = crate::ai::base::ids(&self.raiz_base).unwrap_or_default();
+        let busca = &Busca { documentos: &documentos, ..*busca };
         {
             let guard = trava_leitura(&self.indice);
             if let Some(indice) = guard.as_ref() {
@@ -2051,12 +2346,236 @@ impl Custodio {
             piso: ajustes.piso,
             modo: ajustes.modo,
             ignorar,
+            // Espaços reservados, não uma decisão: quem responde pela lista é
+            // `procurar`, que lê a pasta `base/` no instante da busca.
+            documentos: &[],
         })
+    }
+
+    /// Onde a base de conhecimento mora. Um caminho só, decidido na abertura.
+    pub fn raiz_base(&self) -> &Path {
+        &self.raiz_base
+    }
+
+    /// As notas como o disco as responde agora, com o censo da pasta.
+    pub fn notas(&self) -> Result<crate::ai::base::Lista> {
+        crate::ai::base::listar(&self.raiz_base)
+    }
+
+    /// As primeiras peças das notas presas, na ordem da última escrita — e só das
+    /// que ainda estão na pasta.
+    ///
+    /// Não é busca: não há vetor, não há piso, não há `k`. O que existe é a
+    /// decisão de um dono registrada no arquivo, e ela entra no prompt inteira ou
+    /// não entra — dizer "aqui está o que você prendeu" custa ler a metadata, e é
+    /// só isso que este número mede.
+    ///
+    /// A lista de notas é lida no disco pela mesma razão da busca: apagar o `.md`
+    /// por fora tem de tirar a nota do turno no instante seguinte, e sem
+    /// codificador carregado não há sincronização nenhuma para reescrever o índice
+    /// e dizer que ela saiu.
+    pub fn fixados(&self) -> Vec<Achado> {
+        let Some(indice) = self.indice_na_memoria() else { return Vec::new() };
+        let vivas = crate::ai::base::ids(&self.raiz_base).unwrap_or_default();
+        indice
+            .pecas_fixadas()
+            .into_iter()
+            .filter(|achado| vivas.iter().any(|id| *id == achado.arquivo))
+            .collect()
+    }
+
+    /// O bloco de memória que entra neste turno: o que o dono prendeu primeiro, e
+    /// depois o que a busca achou.
+    ///
+    /// Uma lista só, um teto só. `ajustes.trechos == 0` desliga **tudo** — as
+    /// presas junto — porque uma chave que desliga a busca e deixa passar um
+    /// conteúdo que ninguém pediu não é um desligamento, é uma segunda porta.
+    /// O zero fecha em dois pontos de propósito: o retorno abaixo, que não paga
+    /// o vetor de uma busca que não pode responder, e o `teto` que o laço obedece,
+    /// que é o mesmo número. Fechar um dos dois ainda deixa o bloco vazio — foi o
+    /// que a mutação mediu, cada metade sozinha e depois as duas juntas.
+    /// O teto é `TRECHOS_MAX` somado, não por fonte: o que o modelo relê a cada
+    /// rodada é o bloco inteiro, e a conta que dói é a de tokens no prompt.
+    ///
+    /// Repetido não entra duas vezes: uma nota presa que a busca também achou
+    /// aparece uma vez, na frente, com a origem que diz por que ela está ali.
+    ///
+    /// Devolve uma [`Resposta`] — o mesmo tipo da ferramenta — porque o cartão do
+    /// turno precisa do modo que ordenou a lista. `alcancados` é o número da
+    /// busca, e não o do bloco: as presas não passaram por lista nenhuma, e
+    /// somá-las ali seria medir uma coisa com o nome de outra.
+    pub fn bloco_do_turno(&self, consulta: &str, ignorar: &[String]) -> Resposta {
+        let ajustes = self.ajustes();
+        if ajustes.trechos == 0 || consulta.trim().is_empty() {
+            return Resposta {
+                achados: Vec::new(),
+                alcancados: 0,
+                modo: ajustes.modo.nome(),
+            };
+        }
+        let teto = ajustes.trechos.min(TRECHOS_MAX) as usize;
+        // A busca é tentativa, não pré-condição: um índice que já está em disco
+        // responde pelas presas mesmo na execução em que o codificador não abriu,
+        // e o motivo de a busca ter falhado já está na tela pelo `auto` do
+        // `estado` — copiá-lo para cá seria a mesma pergunta respondida em dois
+        // lugares. Quem nunca teve peça nenhuma não entra: a presa é lida do
+        // índice como tudo nesta memória, e um cartão escrito sobre uma nota que
+        // ninguém vetorou seria a tela prometendo memória que não existe.
+        let (buscados, alcancados, modo) = match self.buscar(consulta, teto as u32, ignorar) {
+            Ok(resposta) => (resposta.achados, resposta.alcancados, resposta.modo),
+            Err(_) => (Vec::new(), 0, ajustes.modo.nome()),
+        };
+        let mut bloco: Vec<Achado> = Vec::with_capacity(teto);
+        // O repetido não entra duas vezes. A lista tem no máximo `TRECHOS_MAX`
+        // itens, então varrer é mais claro que uma chave nova sobre um tipo que
+        // não é `Hash` — e é o par, fonte + chave + linha, que diz o que é o mesmo
+        // trecho: dois arquivos diferentes podem ter a mesma linha.
+        let mut chaves: Vec<(Fonte, String, usize)> = Vec::new();
+        for achado in self.fixados().into_iter().chain(buscados) {
+            if bloco.len() >= teto {
+                break;
+            }
+            let chave = (achado.fonte, achado.arquivo.clone(), achado.linha);
+            if chaves.contains(&chave) {
+                continue;
+            }
+            chaves.push(chave);
+            bloco.push(achado);
+        }
+        Resposta { achados: bloco, alcancados, modo }
+    }
+
+    /// Põe a pasta `base/` dentro do índice.
+    ///
+    /// É o ciclo completo em uma chamada: o que mudou de texto entra (peças novas
+    /// no lugar das antigas), o que não mudou não custa um vetor, e o que sumiu da
+    /// pasta sai do índice junto com a ficha — apagar o `.md` apaga a memória da
+    /// nota, do mesmo jeito que apagar a conversa apaga a lembrança dela.
+    ///
+    /// A trava é a mesma da revalidação de conversas e na mesma ordem documentada
+    /// (`escritores → carregado → indice`): dois escritores concorrentes lendo a
+    /// mesma cópia publicariam, no fim, um índice em que o trabalho um do outro não
+    /// existe. E a varredura em curso tem a prioridade: ela regrava o índice no fim
+    /// e escrever por cima agora seria perder o que ela está lendo.
+    pub fn sincronizar_base(&self, notas: &[Nota]) -> Result<Sincronia> {
+        let inicio = Instant::now();
+        let visto = notas.len();
+        // A resposta de "não fiz nada" tem três motivos diferentes e um número só,
+        // porque os três medem a mesma coisa: quantas notas a lista tinha.
+        let parada = |notas: usize| Sincronia {
+            notas,
+            pecas: 0,
+            removidas: 0,
+            tokens: 0,
+            ms: inicio.elapsed().as_millis() as u64,
+        };
+        if self.esta_indexando() {
+            return Ok(parada(visto));
+        }
+        let _trava = trava_estado(&self.escritores);
+        // A pendência é lida só na metadata, antes de qualquer lock de motor: sem
+        // ela, cada turno carregaria um codificador de duzentos milhões de
+        // parâmetros para descobrir que nenhuma nota mudou. Sob a trava dos
+        // escritores, como em `fundir_conversas`: lida fora dela, uma publicação
+        // concorrente poderia ser contada como "já vista" por engano.
+        let pendente = {
+            let guard = trava_leitura(&self.indice);
+            match guard.as_ref() {
+                Some(indice) => indice.notas_pendentes(notas),
+                None => visto,
+            }
+        };
+        if pendente == 0 {
+            return Ok(parada(visto));
+        }
+        let Some(spec) = self.spec() else {
+            // Sem codificador não há tokenizador nem vetor, e sem vetor a nota não
+            // entra. A resposta é zero peças, não um erro: a nota está no disco, a
+            // base está na lista e o `estado` diz, por `auto`, que falta o modelo.
+            return Ok(parada(visto));
+        };
+        let (escritas, removidas, tokens) = {
+            let mut trava = self.carregado()?;
+            let carregado = trava.as_mut().expect("carregado acabou de ser garantido");
+            let ajustes = self.ajustes();
+            let mut indice = self.indice_na_memoria().unwrap_or_else(|| {
+                Indice::vazio(
+                    spec.id,
+                    carregado.embutidor.dimensao(),
+                    carregado.embutidor.agrupamento,
+                    ajustes.peca,
+                    ajustes.sobreposicao,
+                )
+            });
+            if indice.refatiar(ajustes.peca, ajustes.sobreposicao) {
+                indice.salvar(&self.caminho_indice)?;
+                *trava_escrita(&self.indice) = Some(copiar(&indice));
+            }
+            let trabalho = self.escrever_notas(&mut indice, carregado, notas)?;
+            indice.salvar(&self.caminho_indice)?;
+            *trava_escrita(&self.indice) = Some(indice);
+            trabalho
+        };
+        Ok(Sincronia {
+            notas: visto,
+            pecas: escritas,
+            removidas,
+            tokens,
+            ms: inicio.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// O trabalho em si, com o codificador e o índice já na mão — a mesma razão de
+    /// `escrever_conversas` existir separado: quem segura `carregado` e chama
+    /// `carregado()` de novo morre ali, e o mutex não é reentrante.
+    ///
+    /// Devolve as peças escritas, as removidas e os tokens vetorizados: os três
+    /// números que a interface mostra como "o índice aprendeu".
+    fn escrever_notas(
+        &self,
+        indice: &mut Indice,
+        carregado: &mut Carregado,
+        notas: &[Nota],
+    ) -> Result<(usize, usize, usize)> {
+        let (alvo, sobre) = indice.fatiamento();
+        let (alvo, sobre) = (alvo as usize, sobre as usize);
+        let limite = carregado.embutidor.limite();
+        // Primeiro sai o que não é mais pasta: apagar o arquivo apaga a
+        // lembrança dele, e tirar da memória não custa um vetor.
+        let removidas = indice.reter_notas(notas);
+        let mut escritas = 0usize;
+        let mut tokens = 0usize;
+        for nota in notas {
+            let prova = prova_da_nota(nota);
+            if indice.nota_vista(&nota.id, &prova) {
+                continue;
+            }
+            if indice.trechos() >= LIMITE_TRECHOS {
+                break;
+            }
+            let corpo = nota.para_indexar();
+            let lidas = pecas(&corpo, alvo, sobre, limite, &carregado.tokenizador)?;
+            let total_lidas = lidas.len();
+            let mut prontas: Vec<(Peca, Vec<f32>)> = Vec::with_capacity(lidas.len());
+            for peca in lidas {
+                if indice.trechos() + prontas.len() >= LIMITE_TRECHOS {
+                    break;
+                }
+                tokens += peca.ids.len();
+                let mut vetor = carregado.embutidor.embutir(&peca.ids)?;
+                Indice::normalizar(&mut vetor)?;
+                prontas.push((peca, vetor));
+            }
+            escritas += prontas.len();
+            indice.substituir_documento(nota, prova, &prontas, prontas.len() < total_lidas);
+        }
+        Ok((escritas, removidas, tokens))
     }
 
     /// O texto que o modelo lê: cabeçalho e trechos, cada um com a origem de
     /// onde ele saiu — caminho e linha num arquivo, conversa e mensagem numa
-    /// lembrança de papo — para a citação sair certa.
+    /// lembrança de papo, nota e parágrafo num pedaço da base — para a citação
+    /// sair certa.
     pub fn texto_do_bloco(achados: &[Achado]) -> String {
         let mut saida = String::from(tr("memoria.blocoCabecalho", &[]).as_str());
         for (numero, achado) in achados.iter().enumerate() {
@@ -2064,6 +2583,10 @@ impl Custodio {
                 Fonte::Arquivo => format!("{}:{}", achado.arquivo, achado.linha),
                 Fonte::Conversa => tr(
                     "memoria.blocoConversa",
+                    &[("titulo", &achado.nome), ("linha", &achado.linha.to_string())],
+                ),
+                Fonte::Documento => tr(
+                    "memoria.blocoNota",
                     &[("titulo", &achado.nome), ("linha", &achado.linha.to_string())],
                 ),
             };
@@ -2110,6 +2633,9 @@ impl Custodio {
             arquivos: disco.arquivos,
             conversas: disco.conversas,
             trechos_conversas: disco.trechos_conversas,
+            notas: disco.notas,
+            trechos_notas: disco.trechos_notas,
+            fixadas: disco.fixadas,
             despacho: vivo.as_ref().map(|c| c.despacho.clone()),
             bytes: std::fs::metadata(&self.caminho_indice).map(|m| m.len()).unwrap_or(0),
             indexando: self.esta_indexando(),
@@ -2136,8 +2662,9 @@ impl Custodio {
         }
     }
 
-    /// Constrói ou atualiza o índice das pastas concedidas e das conversas
-    /// salvas. Bloqueante: quem chama roda isto fora do runtime assíncrono.
+    /// Constrói ou atualiza o índice das pastas concedidas, das conversas salvas e
+    /// da base de conhecimento. Bloqueante: quem chama roda isto fora do runtime
+    /// assíncrono.
     pub fn indexar(&self, conversas: &[ConversaViva], mut emitir: impl FnMut(Evento)) -> Result<Resumo> {
         if self.ocupado.swap(true, Ordering::SeqCst) {
             bail!(tr("erros.memoriaOcupada", &[]));
@@ -2181,7 +2708,12 @@ impl Custodio {
     ) -> Result<Resumo> {
         let spec = self.spec().ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
         let raizes = trava_leitura(&self.pastas).raizes.clone();
-        if raizes.is_empty() && conversas.is_empty() {
+        // A base é lida antes da conta do que há a fazer: uma pasta `base/` com
+        // notas é memória suficiente para o varrer ter trabalho, do mesmo jeito que
+        // conversa salva é — e um `.md` escrito à mão sem pasta concedida nenhuma
+        // não pode ficar sem caminho nenhum para entrar no índice.
+        let notas = crate::ai::base::listar(&self.raiz_base).unwrap_or_default();
+        if raizes.is_empty() && conversas.is_empty() && notas.itens.is_empty() {
             // Nada para ler em lugar nenhum. Mas conversa salva já é memória:
             // sem pasta concedida o varrer ainda lembrado o histórico.
             bail!(tr("erros.semPastas", &[]));
@@ -2320,6 +2852,14 @@ impl Custodio {
         // para o dono ver o índice subir.
         self.escrever_conversas(&mut indice, carregado, conversas, usize::MAX)?;
 
+        // A base entra no mesmo ponto, pela mesma razão: o codificador já está na
+        // mão, o trabalho corre fora da conversa e a barra de progresso existe para
+        // o dono ver o índice subir. Ler a pasta agora, e não no começo, é o que faz
+        // uma nota escrita durante a varredura entrar nela em vez de esperar a
+        // próxima.
+        let notas = crate::ai::base::listar(&self.raiz_base).unwrap_or_default();
+        self.escrever_notas(&mut indice, carregado, &notas.itens)?;
+
         let resumo = Resumo {
             arquivos: indice.arquivos(),
             relidos,
@@ -2389,7 +2929,7 @@ mod testes {
     /// texto da pergunta fica em branco porque o que se verifica aqui é o cosseno
     /// e o piso, não a palavra.
     fn por_vetor(vetor: &[f32], k: usize, piso: f32) -> Busca<'_> {
-        Busca { vetor, texto: "", k, piso, modo: Modo::Vetorial, ignorar: &[] }
+        Busca { vetor, texto: "", k, piso, modo: Modo::Vetorial, ignorar: &[], documentos: &[] }
     }
 
     #[test]
@@ -2564,6 +3104,7 @@ mod testes {
             &base,
             &base,
             base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
             pastas,
         );
 
@@ -2597,7 +3138,14 @@ mod testes {
             std::env::temp_dir().join(format!("aether-memoria-despacho-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let pastas = Arc::new(RwLock::new(Pastas::default()));
-        let custodio = Custodio::novo(&[], &base, &base, base.join("rag.json"), pastas);
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            pastas,
+        );
 
         // Sem codificador carregado não há veredito nenhum, e a tela não pode
         // inventar um: `None` é a resposta, não um zero ou um `-1`.
@@ -2677,7 +3225,14 @@ mod testes {
             .join(format!("aether-memoria-escritores-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let pastas = Arc::new(RwLock::new(Pastas::default()));
-        let custodio = Custodio::novo(&[], &base, &base, base.join("rag.json"), pastas);
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            pastas,
+        );
 
         let semear = |custodio: &Custodio| {
             let mut indice = Indice::vazio("m", 1, "último", 64, 0);
@@ -2802,7 +3357,7 @@ mod testes {
         let vetor = [0.0f32, 1.0];
         let buscar = |modo: Modo| {
             indice.buscar(
-                &Busca { vetor: &vetor, texto: "ds18b20", k: 2, piso: 0.5, modo, ignorar: &[] },
+                &Busca { vetor: &vetor, texto: "ds18b20", k: 2, piso: 0.5, modo, ignorar: &[], documentos: &[] },
                 &raizes,
             )
             .unwrap()
@@ -2844,7 +3399,7 @@ mod testes {
         let raizes = [PathBuf::from("C:/concedida")];
         let vetor = [1.0f32, 0.0];
         let resposta = indice
-            .buscar(&Busca { vetor: &vetor, texto: "norte", k: 3, piso: 0.5, modo: Modo::Hibrido, ignorar: &[] }, &raizes)
+            .buscar(&Busca { vetor: &vetor, texto: "norte", k: 3, piso: 0.5, modo: Modo::Hibrido, ignorar: &[], documentos: &[] }, &raizes)
             .unwrap();
         assert_eq!(
             resposta
@@ -2878,6 +3433,7 @@ mod testes {
                 piso: 0.9,
                 modo: Modo::Lexico,
                 ignorar: &[],
+                documentos: &[],
             }, &raizes)
             .unwrap();
         assert_eq!(resposta.achados.len(), 1);
@@ -2886,7 +3442,7 @@ mod testes {
         // Sem nenhuma palavra em comum, a lista léxica fica vazia — ausência não
         // entra em lista nenhuma como "nota baixa".
         let vazio = indice
-            .buscar(&Busca { vetor: &vetor, texto: "tubulação", k: 1, piso: 0.0, modo: Modo::Lexico, ignorar: &[] }, &raizes)
+            .buscar(&Busca { vetor: &vetor, texto: "tubulação", k: 1, piso: 0.0, modo: Modo::Lexico, ignorar: &[], documentos: &[] }, &raizes)
             .unwrap();
         assert!(vazio.achados.is_empty());
     }
@@ -3115,6 +3671,7 @@ mod testes {
                         piso: 0.0,
                         modo: Modo::Hibrido,
                         ignorar,
+                        documentos: &[],
                     },
                     &raizes,
                 )
@@ -3204,6 +3761,253 @@ mod testes {
         assert_eq!(indice.trechos(), 0);
         assert_eq!(indice.conversas(), 0);
         assert_eq!(indice.conversas_pendentes(&[conversa("c1", "Troca da bomba", 2, 1_700_000_000_000)]), 1);
+    }
+
+    // --- a terceira fonte: a base curada -------------------------------------
+
+    fn nota(id: &str, titulo: &str, corpo: &str, atualizada: u64, fixada: bool) -> Nota {
+        Nota {
+            id: id.into(),
+            titulo: titulo.into(),
+            texto: corpo.into(),
+            criado: atualizada,
+            atualizado: atualizada,
+            fixada,
+        }
+    }
+
+    /// Põe uma nota dentro do índice com o fatiamento que o codificador teria
+    /// dado. Nada aqui depende de vetor: o que os testes abaixo medem é a política
+    /// da terceira fonte — entrada, troca, esquecimento e o marcador de presa —
+    /// e as peças entram com texto e um vetor de duas pontas, como em `adicionar`.
+    fn nota_no_indice(indice: &mut Indice, nota: &Nota, pecas: &[&str], truncada: bool) {
+        let prontas: Vec<(Peca, Vec<f32>)> = pecas
+            .iter()
+            .enumerate()
+            .map(|(i, texto)| {
+                (
+                    Peca { linha: i + 1, texto: (*texto).to_string(), ids: vec![] },
+                    vec![1.0, 0.0],
+                )
+            })
+            .collect();
+        indice.substituir_documento(nota, prova_da_nota(nota), &prontas, truncada);
+    }
+
+    /// A nota presa entra no turno por decisão do dono, e não por proximidade: a
+    /// lista das presas é lida da ficha, na ordem da última escrita, e uma busca
+    /// que não achou nada não tem poder nenhum sobre ela.
+    #[test]
+    fn a_nota_presa_entra_na_frente_sem_ninguem_ter_perguntado() {
+        let velha = nota("regra", "Regra da casa", "p0 p1", 1_700_000_000_000, true);
+        let nova = nota("dieta", "Dieta do gato", "p2 p3", 1_700_000_000_002, true);
+        let solta = nota("solto", "Nota solta", "p4 p5", 1_700_000_000_009, false);
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &velha, &[&velha.texto], false);
+        nota_no_indice(&mut indice, &nova, &[&nova.texto], false);
+        nota_no_indice(&mut indice, &solta, &[&solta.texto], false);
+
+        let presas = indice.pecas_fixadas();
+        assert_eq!(
+            presas.iter().map(|a| a.arquivo.as_str()).collect::<Vec<_>>(),
+            vec!["dieta", "regra"],
+            "a mais mexida primeiro, e nada da nota que ninguém prendeu"
+        );
+        assert!(presas.iter().all(|a| a.fonte == Fonte::Documento));
+        assert!(presas.iter().all(|a| a.origem == Origem::Fixada));
+        assert_eq!(presas[0].nome, "Dieta do gato", "o cartão chama a nota pelo título dela");
+        assert_eq!(presas[0].pontuacao, 0.0, "presa não é medida: ninguém procurou este trecho");
+        assert_eq!(presas[0].quando, Some(1_700_000_000_002), "a data do cartão é a do arquivo");
+
+        // A prova de que prender não é buscar: a mesma pergunta, com o piso alto e
+        // um vetor ortogonal, não achou trecho nenhum — e as presas continuam lá.
+        let raizes: [PathBuf; 0] = [];
+        let resposta = indice
+            .buscar(
+                &Busca {
+                    vetor: &[0.0, 1.0],
+                    texto: "zzz",
+                    k: 3,
+                    piso: 0.9,
+                    modo: Modo::Hibrido,
+                    ignorar: &[],
+                    documentos: &["regra".to_string(), "dieta".to_string(), "solto".to_string()],
+                },
+                &raizes,
+            )
+            .expect("buscou");
+        assert_eq!(resposta.achados.len(), 0, "nenhum trecho passa do piso contra um vetor ortogonal");
+        assert_eq!(indice.pecas_fixadas().len(), 2);
+    }
+
+    /// Reescrever a nota troca as peças dela. Deixar as de antes seria o índice
+    /// citando uma linha que não existe mais no `.md`.
+    #[test]
+    fn reescrever_a_nota_troca_as_pecas_delas_e_nao_deixa_orfa() {
+        let antes = nota("plano", "Plano A", "p0 p1\np2 p3", 1, false);
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &antes, &["p0 p1", "p2 p3"], false);
+        assert_eq!(indice.trechos_de(Fonte::Documento), 2);
+        assert_eq!(indice.notas_pendentes(&[antes.clone()]), 0, "o índice viu esta nota como ela está");
+
+        let depois = nota("plano", "Plano A", "p0 p1", 2, false);
+        nota_no_indice(&mut indice, &depois, &["p0 p1"], false);
+        assert_eq!(indice.trechos_de(Fonte::Documento), 1, "a peça que saiu do texto saiu do índice");
+        assert_eq!(indice.documentos(), 1, "duas fichas para o mesmo id é uma nota fantasma");
+        assert_eq!(indice.vetores.len(), 2, "vetor órfão é cosseno de um texto que não existe mais");
+        assert_eq!(indice.notas_pendentes(&[depois.clone()]), 0);
+        assert_eq!(indice.notas_pendentes(&[antes]), 1, "a prova de ontem não vale para o texto de hoje");
+    }
+
+    /// Apagar o `.md` apaga a lembrança: as peças, a ficha e o marcador de presa.
+    #[test]
+    fn a_nota_que_sai_da_pasta_sai_do_indice_e_da_ficha() {
+        let n = nota("plano", "Plano A", "p0 p1", 5, true);
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &n, &["p0 p1"], false);
+        assert_eq!(indice.fixadas(), 1);
+        assert_eq!(indice.reter_notas(&[]), 1);
+        assert_eq!(indice.documentos(), 0);
+        assert_eq!(indice.fixadas(), 0);
+        assert_eq!(indice.trechos_de(Fonte::Documento), 0);
+        assert_eq!(indice.pecas_fixadas().len(), 0, "o marcador de uma nota apagada não entra no prompt");
+    }
+
+    /// Ficha truncada nunca está vista: o índice lembra só o começo da nota, e se
+    /// ele se anunciasse inteiro a parte que falta nunca voltaria para a fila.
+    #[test]
+    fn uma_nota_cortada_pelo_teto_volta_para_a_fila() {
+        let n = nota("longa", "Longa", "p0 p1\np2 p3", 1, false);
+        let mut parada = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut parada, &n, &["p0 p1"], true);
+        assert_eq!(parada.notas_pendentes(&[n.clone()]), 1, "truncada não se anuncia inteira");
+
+        let mut inteira = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut inteira, &n, &["p0 p1", "p2 p3"], false);
+        assert_eq!(inteira.notas_pendentes(&[n]), 0);
+    }
+
+    /// O título entra no texto indexado, então entrar na prova também: trocar o
+    /// título de uma nota indexada tem de pôr a nota de volta na fila, senão a
+    /// busca continuaria respondendo pelo vocabulário de um título que sumiu.
+    #[test]
+    fn mudar_o_titulo_e_mudar_a_nota_porque_o_titulo_tambem_indexa() {
+        let velho = nota("id", "Título velho", "p0 p1 p2", 7, false);
+        let novo = nota("id", "Título novo", "p0 p1 p2", 7, false);
+        assert_ne!(prova_da_nota(&velho).bytes, prova_da_nota(&novo).bytes);
+        assert_eq!(prova_da_nota(&velho).modificado, prova_da_nota(&novo).modificado, "só o texto mudou");
+
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &velho, &["p0 p1 p2"], false);
+        assert_eq!(indice.notas_pendentes(&[velho]), 0);
+        assert_eq!(indice.notas_pendentes(&[novo]), 1, "a pessoa trocou o título; a busca ainda não sabe dele");
+    }
+
+    /// As três fontes não emprestam política uma para a outra, e a da nota é a
+    /// lista da pasta: apagou o `.md` por fora, a peça sai da resposta sem que
+    /// ninguém precise ter tocado no índice. O arquivo de mesma chave responde por
+    /// outra regra, no mesmo índice.
+    #[test]
+    fn apagar_o_md_por_fora_tira_a_nota_da_resposta_sem_tocar_no_indice() {
+        let n = nota("politica", "Política", "devolver em sete dias", 1, false);
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        indice.adicionar(
+            "politica",
+            Assinatura { bytes: 1, modificado: 1 },
+            &[(Peca { linha: 4, texto: "devolver em sete dias".into(), ids: vec![] }, vec![1.0, 0.0])],
+        );
+        nota_no_indice(&mut indice, &n, &["devolver em sete dias"], false);
+        assert_eq!(indice.trechos(), 2, "a mesma chave em duas fontes são dois trechos");
+
+        let raizes: [PathBuf; 0] = [];
+        let responder = |documentos: &[String]| {
+            indice
+                .buscar(
+                    &Busca {
+                        vetor: &[1.0, 0.0],
+                        texto: "devolver",
+                        k: 4,
+                        piso: 0.0,
+                        modo: Modo::Hibrido,
+                        ignorar: &[],
+                        documentos,
+                    },
+                    &raizes,
+                )
+                .map(|r| {
+                    r.achados
+                        .iter()
+                        .map(|a| (a.fonte, a.arquivo.clone(), a.linha))
+                        .collect::<Vec<_>>()
+                })
+        };
+        // A nota está na pasta: ela responde. O arquivo de mesma chave não — não há
+        // pasta concedida nesta busca, e quem manda no arquivo são as raízes.
+        assert_eq!(
+            responder(&["politica".to_string()]).unwrap(),
+            vec![(Fonte::Documento, "politica".to_string(), 1)]
+        );
+        // A nota saiu da pasta: some da resposta, continua no índice.
+        assert_eq!(responder(&[]).unwrap(), Vec::<(Fonte, String, usize)>::new());
+        assert_eq!(indice.trechos_de(Fonte::Documento), 1, "esconder da resposta não é apagar a memória");
+    }
+
+    /// O bloco do turno é o que a conversa injeta: a presa vem do índice (não do
+    /// codificador desta rodada), obedece à pasta como a busca obedece, e a mesma
+    /// chave que desliga a busca (`trechos == 0`) desliga a presa junto — uma
+    /// porta que deixa passar conteúdo com a busca fechada não é um desligamento,
+    /// é uma segunda porta. O assert do zero só cai com as duas metades do
+    /// desligamento abertas (o retorno antecipado e o `teto` do laço): mutar uma
+    /// delas continua verde, e é isso que prova que o zero fecha por dois caminhos.
+    #[test]
+    fn o_bloco_do_turno_leva_a_presa_e_o_trechos_zero_fecha_as_duas_portas() {
+        let base = std::env::temp_dir().join(format!("aether-memoria-bloco-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        // A nota entra pelo caminho real: a loja escreve o `.md` com o marcador de
+        // presa, e o índice recebe a nota que ela devolveu — id, título e prova.
+        let registro = crate::ai::base::escrever(
+            custodio.raiz_base(),
+            "Regra da casa",
+            "nao abrir o app",
+            None,
+            Some(true),
+        )
+        .expect("escreveu");
+        let arquivo = base
+            .join(crate::ai::base::PASTA)
+            .join(format!("{}.{}", registro.nota.id, crate::ai::base::EXTENSAO));
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &registro.nota, &["nao abrir o app"], false);
+        *trava_escrita(&custodio.indice) = Some(indice);
+
+        let bloco = custodio.bloco_do_turno("o que vale aqui?", &[]);
+        assert_eq!(bloco.achados.len(), 1, "a nota presa não depende da busca para entrar");
+        assert_eq!(bloco.achados[0].origem, Origem::Fixada);
+        assert_eq!(bloco.achados[0].nome, "Regra da casa");
+        assert_eq!(bloco.alcancados, 0, "as presas não passaram por lista nenhuma");
+        assert_eq!(custodio.estado(true).auto, "semModelo", "e a tela diz por que a busca não respondeu");
+
+        custodio.ajustar(Ajustes { trechos: 0, ..custodio.ajustes() }).expect("ajustou");
+        assert!(custodio.bloco_do_turno("o que vale aqui?", &[]).achados.is_empty());
+        assert_eq!(custodio.estado(true).auto, "trechosZero");
+        // Reaberta a porta, a presa volta: o zero desligou, não apagou.
+        custodio.ajustar(Ajustes { trechos: 4, ..custodio.ajustes() }).expect("reabriu");
+        assert_eq!(custodio.bloco_do_turno("o que vale aqui?", &[]).achados.len(), 1);
+        // O `.md` saiu da pasta por fora, sem pedido nenhum ao núcleo: some do
+        // turno na chamada seguinte, e o índice continua com a peça — a busca é que
+        // consultou o disco, a memória não foi editada.
+        std::fs::remove_file(&arquivo).expect("removeu");
+        assert!(custodio.bloco_do_turno("o que vale aqui?", &[]).achados.is_empty());
+        assert_eq!(custodio.estado(true).trechos_notas, 1, "a peça ficou no índice");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

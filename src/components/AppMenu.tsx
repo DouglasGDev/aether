@@ -13,6 +13,7 @@ export type TelaAjuste =
   | "bancos"
   | "pastas"
   | "memoria"
+  | "base"
   | "voz"
   | "idioma"
   | "bancada";
@@ -59,6 +60,7 @@ const SECOES: { chave: string; itens: Item[] }[] = [
     itens: [
       { tela: "pastas", chave: "pastas.titulo", icon: "folder" },
       { tela: "memoria", chave: "memoria.titulo", icon: "memoria" },
+      { tela: "base", chave: "base.titulo", icon: "file" },
       { tela: "voz", chave: "voz.titulo", icon: "wave" },
     ],
   },

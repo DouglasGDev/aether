@@ -188,6 +188,51 @@ export function ToolCard({ vista, falha = false }: Props) {
         </div>
       );
 
+    case "base": {
+      /// O cartão tem dois números porque a chamada tem duas metades: o arquivo
+      /// que o disco respondeu e o que o índice aprendeu dele. Somá-los numa
+      /// palavra diria "lembrado" onde só houve escrita.
+      const fatos = [
+        bytes(vista.bytes, id),
+        t("base.caracteres", { n: inteiro(vista.caracteres, id) }),
+        `${inteiro(vista.linhas, id)} ${t("geral.linhas")}`,
+      ];
+      return (
+        <div className={classe}>
+          <Cabecalho
+            icone={vista.nova ? "plus" : "pencil"}
+            tipo={vista.nova ? t("cartao.criado") : t("cartao.atualizado")}
+            alvo={vista.titulo}
+            fatos={fatos}
+          />
+          <p className="card-at">{`${vista.id} · ${vista.arquivo}`}</p>
+          <p className="card-note">
+            {t("base.naPasta", { n: inteiro(vista.notas, id) })}
+          </p>
+          <p className="card-note">
+            {vista.pecas > 0
+              ? t("base.aprendeu", {
+                  pecas: inteiro(vista.pecas, id),
+                  tokens: inteiro(vista.tokens, id),
+                  ms: inteiro(vista.ms, id),
+                })
+              : t("base.semPeca", { notas: inteiro(vista.notas, id) })}
+          </p>
+          {vista.removidas > 0 && (
+            <p className="card-note">
+              {t("base.removidas", { n: inteiro(vista.removidas, id) })}
+            </p>
+          )}
+          {vista.fixada && (
+            <p className="card-flag">
+              <Icon name="lock" />
+              {t("base.presa")}
+            </p>
+          )}
+        </div>
+      );
+    }
+
     case "pasta":
       return (
         <div className={classe}>

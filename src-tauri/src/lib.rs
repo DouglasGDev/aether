@@ -43,6 +43,14 @@ pub fn run() {
             // ausente é desligado — o estado de fábrica do aplicativo.
             let rede_path = app.path().app_config_dir()?.join(local::web::ARQUIVO);
             local::web::carregar(&rede_path);
+            // A base de conhecimento nasce ao lado das escolhas de RAG: `rag.json`
+            // diz como o índice é montado, `base/` é o material que ele lê. Um
+            // caminho só, decidido aqui e entregue ao custódio — a ferramenta, os
+            // comandos e a varredura leem todos o mesmo, porque um segundo
+            // interruptor em memória é o que `CONTRIBUTING.md` proíbe. A pasta não
+            // é criada na abertura, como em `conversas.rs`: pasta ausente é base
+            // vazia, e a primeira escrita é quem a faz existir.
+            let base_path = app.path().app_config_dir()?.join(ai::base::PASTA);
             let models_root = app.path().app_local_data_dir()?.join("models");
             // A mesma lista serve os dois motores nativos: é ao lado do
             // executável que `build.rs` publica a ggml e a sherpa-onnx.
@@ -74,6 +82,7 @@ pub fn run() {
                 &models_root,
                 &models_root.join("memoria"),
                 app.path().app_config_dir()?.join("rag.json"),
+                &base_path,
                 Arc::clone(&pastas),
             ));
             let manager = Arc::new(McpManager::new(
@@ -110,6 +119,7 @@ pub fn run() {
                 pastas,
                 pastas_path,
                 rede_path,
+                base_path: base_path.clone(),
                 memoria,
                 servidores_root,
                 instalacoes: mcp::instalador::Instalacoes::novo(),
@@ -223,6 +233,11 @@ pub fn run() {
             commands::rag_indexar_cancelar,
             commands::rag_apagar,
             commands::memoria_buscar,
+            commands::base_estado,
+            commands::base_listar,
+            commands::base_escrever,
+            commands::base_apagar,
+            commands::base_fixar,
             commands::adaptadores_estado,
             commands::adaptadores_ajustar,
             commands::adaptador_adicionar,

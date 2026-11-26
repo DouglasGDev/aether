@@ -60,11 +60,14 @@ export const MODO_KEY: Record<ModoMemoria, string> = {
   lexico: "memoria.modoLexico",
 };
 
-/// O que trouxe um achado: o vetor, a palavra escrita ou os dois.
+/// O que trouxe um achado: o vetor, a palavra escrita, os dois — ou nenhuma
+/// busca: a nota presa entra no turno por decisão do dono, e o cartão diz isso em
+/// vez de mostrar o zero de uma medida que ninguém fez.
 export const ORIGEM_KEY: Record<OrigemMemoria, string> = {
   vetorial: "memoria.origemVetorial",
   lexica: "memoria.origemLexica",
   ambas: "memoria.origemAmbas",
+  fixada: "memoria.origemFixada",
 };
 
 /// De onde saiu um achado. Um trecho de conversa não se cita como um de
@@ -72,6 +75,7 @@ export const ORIGEM_KEY: Record<OrigemMemoria, string> = {
 export const FONTE_KEY: Record<FonteMemoria, string> = {
   arquivo: "memoria.fonteArquivo",
   conversa: "memoria.fonteConversa",
+  documento: "memoria.fonteDocumento",
 };
 
 /// Por que o motor parou. A palavra é nossa; o motivo vem medido do motor.

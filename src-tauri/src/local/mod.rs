@@ -7,6 +7,7 @@
 //! que falhou volta com o código de saída real.
 
 pub mod arquivos;
+pub mod base;
 pub mod memoria;
 pub mod pastas;
 pub mod sistema;
@@ -234,6 +235,24 @@ fn catalogo_base() -> Vec<Ferramenta> {
             Destructive,
             objeto(json!({ "caminho": campo("string", "caminho") }), &["caminho"]),
         ),
+        // Escrever na base é `Mutating`, e não `Destructive`: a nota nova não tira
+        // nada do que estava lá, e reescrever pelo id que o pedido diz é decisão
+        // do dono, não acidente. O arquivo cai na pasta do aplicativo, nunca numa
+        // pasta concedida — a porta não recebe caminho nenhum como argumento.
+        ferramenta(
+            "escrever_na_base",
+            "escreverNaBase",
+            Mutating,
+            objeto(
+                json!({
+                    "titulo": campo("string", "titulo"),
+                    "corpo": campo("string", "corpo"),
+                    "nota": campo("string", "nota"),
+                    "fixar": campo("boolean", "fixar"),
+                }),
+                &["titulo", "corpo"],
+            ),
+        ),
         ferramenta(
             "executar_comando",
             "executarComando",
@@ -338,6 +357,7 @@ pub fn executar(
         "criar_pasta" => arquivos::criar_pasta(&args, pastas),
         "mover" => arquivos::mover(&args, pastas),
         "apagar" => arquivos::apagar(&args, pastas),
+        "escrever_na_base" => base::escrever(&args, memoria),
         "executar_comando" => terminal::executar(&args, pastas),
         "info_sistema" => sistema::informacoes(pastas),
         // A única que fala com o mundo. Sem `rede.json` ligado ela não está no
@@ -379,6 +399,7 @@ mod tests {
             &raiz.join("modelos"),
             &raiz.join("memoria"),
             raiz.join("rag.json"),
+            &raiz.join(crate::ai::base::PASTA),
             std::sync::Arc::new(std::sync::RwLock::new(pastas::Pastas::default())),
         )
     }
@@ -410,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn o_catalogo_cobre_arquivos_memoria_resultados_terminal_e_sistema() {
+    fn o_catalogo_cobre_arquivos_memoria_base_resultados_terminal_e_sistema() {
         let nomes: Vec<&str> = catalogo().iter().map(|f| f.nome).collect();
         for esperado in [
             "ler_arquivo",
@@ -423,15 +444,16 @@ mod tests {
             "criar_pasta",
             "mover",
             "apagar",
+            "escrever_na_base",
             "executar_comando",
             "info_sistema",
         ] {
             assert!(nomes.contains(&esperado), "falta {esperado}");
         }
-        // Doze, e não treze: `buscar_na_web` não está aqui porque a rede está
+        // Treze, e não catorze: `buscar_na_web` não está aqui porque a rede está
         // desligada neste processo. O número é a prova de que desligado significa
         // ausente, e não presente-e-recusando.
-        assert_eq!(nomes.len(), 12);
+        assert_eq!(nomes.len(), 13);
         assert!(!nomes.contains(&"buscar_na_web"), "a rede ligou sozinha no catálogo");
     }
 
@@ -442,8 +464,8 @@ mod tests {
     fn a_rede_ligada_e_a_unica_ferramenta_que_entre_e_saia_do_catalogo() {
         let desligada = catalogo_com_rede(&web::Rede { ativa: false });
         let ligada = catalogo_com_rede(&web::Rede { ativa: true });
-        assert_eq!(desligada.len(), 12, "catálogo com a rede desligada");
-        assert_eq!(ligada.len(), 13, "a rede ligada não acrescentou uma ferramenta");
+        assert_eq!(desligada.len(), 13, "catálogo com a rede desligada");
+        assert_eq!(ligada.len(), 14, "a rede ligada não acrescentou uma ferramenta");
         let novas: Vec<&str> = ligada
             .iter()
             .map(|f| f.nome)
@@ -630,6 +652,27 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert_eq!(erro, tr("erros.memoriaSemModelo", &[]));
+    }
+
+    /// A base entra pela mesma porta das outras ferramentas, com o mesmo cartão e
+    /// o mesmo depósito de caminho: não existe uma `executar` paralela para nota.
+    /// O que este teste prova é o despacho, e ele roda sem codificador nenhum —
+    /// a escrita da nota é disco, não placa.
+    #[test]
+    fn escrever_na_base_e_o_dispatch_que_a_executa() {
+        let pastas = pastas::Pastas::default();
+        let memoria = memoria();
+        let saida = executar(
+            "escrever_na_base",
+            json!({ "titulo": "Despacho", "corpo": "a porta é única" }),
+            &pastas,
+            &memoria,
+            &deposito("base"),
+        )
+        .expect("despachou");
+        assert!(matches!(saida.vista, Vista::Base { .. }), "{:?}", saida.vista);
+        let _ = crate::ai::base::apagar(memoria.raiz_base(), "despacho");
+        let _ = std::fs::remove_dir_all(memoria.raiz_base());
     }
 
     /// O depósito não é uma porta paralela: o que o laço guardou sai pela mesma

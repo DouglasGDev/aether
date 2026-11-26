@@ -21,6 +21,7 @@ const TIPOS_VISTA: Record<Vista["type"], true> = {
   memoria: true,
   escrita: true,
   edicao: true,
+  base: true,
   pasta: true,
   movido: true,
   apagado: true,

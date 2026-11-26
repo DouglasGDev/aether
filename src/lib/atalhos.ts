@@ -39,6 +39,7 @@ export function listaDeAtalhos(maos: Mãos): Atalho[] {
     { nome: "modelos", chave: "modelos.titulo", icon: "cube", onDisparar: () => maos.abrir("modelos") },
     { nome: "bancos", chave: "bancos.titulo", icon: "banco", onDisparar: () => maos.abrir("bancos") },
     { nome: "memoria", chave: "memoria.titulo", icon: "memoria", onDisparar: () => maos.abrir("memoria") },
+    { nome: "base", chave: "base.titulo", icon: "file", onDisparar: () => maos.abrir("base") },
     { nome: "grafo", chave: "app.grafo", icon: "nodes", onDisparar: maos.grafico },
   ];
 }

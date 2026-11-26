@@ -162,6 +162,33 @@ pub enum Vista {
         total: usize,
         truncado: bool,
     },
+    /// A nota escrita na base de conhecimento e o que o índice aprendeu dela.
+    /// Variante própria, e não um `escrita` com sobrenome: aqui o número que
+    /// importa não é o do arquivo, é o das peças que entraram — e o arquivo é só
+    /// o depósito de uma nota que tem id, título e decisão de ficar presa.
+    Base {
+        /// O nome do arquivo sem a extensão: a identidade da nota.
+        id: String,
+        /// O arquivo da nota, `id.md`, como ele está na pasta `base/`.
+        arquivo: String,
+        titulo: String,
+        /// Bytes do arquivo, medidos pelo disco depois da escrita.
+        bytes: u64,
+        caracteres: usize,
+        linhas: usize,
+        /// Notas na pasta, contadas depois desta escrita.
+        notas: usize,
+        fixada: bool,
+        /// `false` quando a chamada reescreveu uma nota que já estava lá.
+        nova: bool,
+        /// Peças que o índice aprendeu nesta sincronização — zero é o índice
+        /// parado (varredura em curso, sem codificador, ou nada pendente).
+        pecas: usize,
+        /// Peças soltas de notas que saíram da pasta.
+        removidas: usize,
+        tokens: usize,
+        ms: u64,
+    },
     Escrita {
         caminho: String,
         nome: String,

@@ -2653,6 +2653,7 @@ details[open] > .talk-tool-head .talk-tool-seta {
 
 .card-escrita,
 .card-edicao,
+.card-base,
 .card-pasta,
 .card-movido {
   --tone: var(--write);
@@ -5007,4 +5008,173 @@ button.icon-only.falta {
 .chats-limpar .icon {
   width: 14px;
   height: 14px;
+}
+
+/* ─── Folha da base de conhecimento ───────────────────────────────────────
+   Uma linha por nota do disco: o título é o que a pessoa lê, o id é o que o
+   arquivo é, e o pino aparece na linha porque prender não é editar. As duas
+   contagens do topo (pasta e índice) ficam separadas de propósito — somá-las
+   diria "lembrado" onde só houve escrita. */
+.base {
+  display: grid;
+  gap: 14px;
+}
+
+.base-memoria {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.base-memoria .icon {
+  width: 15px;
+  height: 15px;
+}
+
+.base-lista {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  align-content: start;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.base-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 6px 5px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(24, 32, 47, 0.6);
+}
+
+/* Presa é estado do arquivo, não escolha do cursor: a borda mostra a nota que
+   entra no turno sem ser buscada. */
+.base-row.presa {
+  border-color: color-mix(in srgb, var(--write) 40%, transparent);
+}
+
+.base-abrir {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.base-nome {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: #cfe0f2;
+}
+
+.base-meta {
+  display: flex;
+  gap: 8px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.base-meta span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.base-id {
+  color: color-mix(in srgb, var(--accent) 60%, var(--muted));
+}
+
+.base-acoes {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.base-acoes .icon-only {
+  padding: 5px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.base-acoes .icon-only:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(34, 44, 62, 0.6);
+}
+
+.base-acoes .icon-only .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.base-acoes .icon-only.preso {
+  color: var(--write);
+}
+
+.base-acoes .icon-only.danger {
+  color: var(--danger);
+}
+
+.base-acoes .icon-only.danger:hover:not(:disabled) {
+  color: #ffd7dd;
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+/* A identidade da nota aberta: o id é o nome do arquivo sem extensão, e as duas
+   datas são as do disco — zero no nascimento não é hoje, então sai. */
+.base-arquivo {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* O eco de uma chamada: o disco numa linha, o índice na outra. */
+.base-eco {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(6, 10, 17, 0.55);
+}
+
+.base-eco-kind {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--write);
+}
+
+.base-eco-linha {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.base-eco-linha.ok {
+  color: color-mix(in srgb, var(--read) 80%, var(--text));
 }

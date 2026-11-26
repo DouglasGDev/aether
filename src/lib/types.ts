@@ -616,6 +616,23 @@ export type Vista =
       criado: boolean;
     }
   | { type: "edicao"; caminho: string; nome: string; trocas: VistaTroca[]; aplicadas: number }
+  | {
+      /** A nota escrita na base de conhecimento e o que o índice aprendeu dela. */
+      type: "base";
+      id: string;
+      arquivo: string;
+      titulo: string;
+      bytes: number;
+      caracteres: number;
+      linhas: number;
+      notas: number;
+      fixada: boolean;
+      nova: boolean;
+      pecas: number;
+      removidas: number;
+      tokens: number;
+      ms: number;
+    }
   | { type: "pasta"; caminho: string; nome: string }
   | { type: "movido"; origem: string; destino: string; nome: string }
   | { type: "apagado"; caminho: string; nome: string; pasta: boolean }
@@ -806,12 +823,12 @@ export type ModoMemoria = "vetorial" | "hibrido" | "lexico";
 
 /// O que trouxe um achado: a proximidade entre vetores, a palavra escrita ou os
 /// dois caminhos na fusão.
-export type OrigemMemoria = "vetorial" | "lexica" | "ambas";
+export type OrigemMemoria = "vetorial" | "lexica" | "ambas" | "fixada";
 
 /// De onde saiu um trecho: um arquivo das pastas concedidas ou uma conversa
 /// salva. As duas fontes se citam de jeitos diferentes — caminho e linha contra
 /// conversa e fala — e a tela não pode usar uma só etiqueta para as duas.
-export type FonteMemoria = "arquivo" | "conversa";
+export type FonteMemoria = "arquivo" | "conversa" | "documento";
 
 /// O que a tela da memória edita, e que vale em `rag.json`.
 export interface AjustesMemoria {
@@ -882,6 +899,14 @@ export interface EstadoMemoria {
   conversas: number;
   /// Dos `indexados`, quantos saíram de conversa e não de arquivo.
   trechosConversas: number;
+  /// Notas que o índice lembra, lidas na última sincronização. O censo da pasta é
+  /// `base_estado.notas`: os dois diferem exatamente quando a base foi escrita com
+  /// o codificador descarregado, e a tela diz isso com os dois números.
+  notas: number;
+  /// Dos `indexados`, quantos são peças de nota.
+  trechosNotas: number;
+  /// Notas presas na ficha do índice — o que a memória sabia estar preso.
+  fixadas: number;
   /// Quantas camadas do codificador foram para a placa, com a conta que as
   /// contou ou o motivo de não ter havido conta. `null` é "nenhum codificador
   /// carregado nesta execução" — não é zero, e não é placa.
@@ -917,6 +942,79 @@ export type MemoriaEvento =
   | { type: "concluido"; resumo: ResumoMemoria }
   | { type: "cancelado"; resumo: ResumoMemoria }
   | { type: "falhou"; erro: string };
+
+/// Uma nota da base de conhecimento, como o arquivo `.md` a guarda. O `id` é o
+/// nome do arquivo sem extensão e é a identidade: trocar o título não troca o id.
+export interface NotaBase {
+  id: string;
+  titulo: string;
+  /// O corpo, sem a linha de título e sem o marcador de fixada. Vazio é válido.
+  texto: string;
+  /// Zero é o disco dizendo que não sabe a data de nascimento — não é hoje.
+  criado: number;
+  /// Ordena a lista: a nota mexida por último vem na frente.
+  atualizado: number;
+  fixada: boolean;
+}
+
+/// O que uma escrita devolve: a nota e as medidas lidas do disco depois dela.
+export interface RegistroNota {
+  nota: NotaBase;
+  bytes: number;
+  caracteres: number;
+  linhas: number;
+  /// Notas na pasta agora, contadas no disco depois da escrita.
+  notas: number;
+}
+
+/// O que uma leitura da pasta devolve.
+export interface ListaNotas {
+  itens: NotaBase[];
+  notas: number;
+  bytes: number;
+  fixadas: number;
+}
+
+/// O que uma remoção devolve.
+export interface NotaRemovida {
+  id: string;
+  titulo: string;
+  /// Bytes do arquivo que estava lá, lidos antes de ele sair.
+  bytes: number;
+  notas: number;
+}
+
+/// O que uma sincronização da base fez, medido durante ela. `pecas` zero com
+/// `notas` maior que zero tem duas respostas no estado: pasta já lembrada ou
+/// codificador ausente.
+export interface Sincronia {
+  notas: number;
+  pecas: number;
+  removidas: number;
+  tokens: number;
+  ms: number;
+}
+
+/// O disco e o índice juntos: uma escrita pela tela é o ciclo inteiro, e mostrar
+/// só a primeira metade diria "salvo" quando nenhuma peça entrou.
+export interface Sincronizada {
+  registro: RegistroNota;
+  sincronia: Sincronia;
+  /// `false` quando a chamada reescreveu ou apenas prendeu uma nota que já estava lá.
+  nova: boolean;
+}
+
+/// O censo da pasta `base/` com o que o índice hoje sabe dela.
+export interface EstadoBase {
+  notas: number;
+  bytes: number;
+  fixadas: number;
+  /// Peças de nota que têm vetor no índice.
+  trechosNotas: number;
+  /// A varredura está segurando o índice: sincronizar agora daria zero peças.
+  indexando: boolean;
+  auto: AutoMemoria;
+}
 
 /// O que um arquivo de adaptador declara no próprio cabeçalho GGUF. Nada aqui é
 /// catálogo: nome, tipo, base e contagem de deltas saem do arquivo, e o tamanho

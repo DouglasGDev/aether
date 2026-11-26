@@ -52,6 +52,9 @@ const BancadaDialog = lazy(() =>
 const BancosDialog = lazy(() =>
   import("./components/BancosDialog").then((m) => ({ default: m.BancosDialog })),
 );
+const BaseDialog = lazy(() =>
+  import("./components/BaseDialog").then((m) => ({ default: m.BaseDialog })),
+);
 const GeracaoDialog = lazy(() =>
   import("./components/GeracaoDialog").then((m) => ({ default: m.GeracaoDialog })),
 );
@@ -133,6 +136,7 @@ export default function App() {
   const [showModels, setShowModels] = useState(false);
   const [showPastas, setShowPastas] = useState(false);
   const [showMemoria, setShowMemoria] = useState(false);
+  const [showBase, setShowBase] = useState(false);
   const [showAjuste, setShowAjuste] = useState(false);
   const [showIdioma, setShowIdioma] = useState(false);
   const [showVoz, setShowVoz] = useState(false);
@@ -861,6 +865,7 @@ export default function App() {
       bancos: () => setShowBancos(true),
       pastas: () => setShowPastas(true),
       memoria: () => setShowMemoria(true),
+      base: () => setShowBase(true),
       voz: () => setShowVoz(true),
       idioma: () => setShowIdioma(true),
       bancada: () => setShowBancada(true),
@@ -1135,6 +1140,17 @@ export default function App() {
               <MemoriaDialog
                 onClose={() => setShowMemoria(false)}
                 onChange={() => void refresh()}
+              />
+            )}
+
+            {showBase && (
+              <BaseDialog
+                onClose={() => setShowBase(false)}
+                onChange={() => void refresh()}
+                onAbrirMemoria={() => {
+                  setShowBase(false);
+                  setShowMemoria(true);
+                }}
               />
             )}
 

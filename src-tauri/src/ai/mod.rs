@@ -1,5 +1,6 @@
 pub mod adaptadores;
 pub mod alojamento;
+pub mod base;
 pub mod cabecalho;
 pub mod catalog;
 pub mod chat;

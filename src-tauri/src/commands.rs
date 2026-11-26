@@ -1,4 +1,5 @@
 use crate::ai::adaptadores;
+use crate::ai::base::{self, Nota};
 use crate::ai::catalog::{self, ModelSpec, ModelStatus};
 use crate::ai::download;
 use crate::ai::geracao;
@@ -1036,22 +1037,25 @@ fn run_chat_turn(
         // chama, responde por ela também — aí a pergunta é sobre o que a janela
         // já perdeu.
         let ignorar = [conversa.to_string()];
-        let resposta = memoria.buscar(text, 0, &ignorar).ok();
-        match resposta.filter(|r| !r.achados.is_empty()) {
-            Some(resposta) => {
-                let Resposta { achados, alcancados, modo } = resposta;
-                let texto = Custodio::texto_do_bloco(&achados);
-                emit(SessionEvent::Memoria {
-                    ferramenta: sinapse,
-                    consulta: text.to_string(),
-                    modo,
-                    achados,
-                    total: alcancados,
-                    ms: inicio.elapsed().as_millis() as u64,
-                });
-                Some(texto)
-            }
-            None => None,
+        // O bloco do turno, e não a busca crua: é aqui que a nota presa entra, na
+        // frente e sem precisar ser achada, dividindo com o resto o mesmo teto de
+        // `trechos`. Chamar `buscar` diretamente deixaria o marcador do dono como
+        // um enfeite gravado no arquivo — e "preso" só é real se mudar o prompt.
+        let resposta = memoria.bloco_do_turno(text, &ignorar);
+        if resposta.achados.is_empty() {
+            None
+        } else {
+            let Resposta { achados, alcancados, modo } = resposta;
+            let texto = Custodio::texto_do_bloco(&achados);
+            emit(SessionEvent::Memoria {
+                ferramenta: sinapse,
+                consulta: text.to_string(),
+                modo,
+                achados,
+                total: alcancados,
+                ms: inicio.elapsed().as_millis() as u64,
+            });
+            Some(texto)
         }
     } else {
         None
@@ -1573,6 +1577,141 @@ pub async fn memoria_buscar(
         .await
         .map_err(|e| tr("erros.memoriaBuscaNaoTerminou", &[("detalhe", &e.to_string())]))?
         .map_err(report)
+}
+
+// ---------------------------------------------------------------------------
+// Base de conhecimento
+// ---------------------------------------------------------------------------
+
+/// O censo da pasta `base/` com o que o índice hoje sabe dela. Os dois números
+/// não se igualam por acaso: nota escrita com o codificador descarregado está na
+/// pasta e fora do índice, e é a tela dizendo isso em voz alta que evita o
+/// "escrevi e ele não lembra".
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstadoBase {
+    /// Notas no disco agora, contidas na pasta.
+    pub notas: usize,
+    /// Bytes somados desses arquivos.
+    pub bytes: u64,
+    pub fixadas: usize,
+    /// Peças de nota que têm vetor no índice. Menor que `notas` é a base escrita
+    /// e ainda não aprendida, e é este par que a tela mostra junto.
+    pub trechos_notas: usize,
+    /// A varredura está segurando o índice: uma sincronização agora devolveria
+    /// zero peças sem que nada esteja errado.
+    pub indexando: bool,
+    /// Por que a injeção automática vale ou não. A mesma palavra de `rag_estado`,
+    /// porque é o mesmo motor decidindo.
+    pub auto: &'static str,
+}
+
+/// O que o disco respondeu e o que o índice aprendeu, juntos de propósito: uma
+/// escrita pela tela é o ciclo inteiro, e devolver só a primeira metade deixaria
+/// a interface dizer "salvo" quando nenhuma peça entrou.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sincronizada {
+    pub registro: base::Registro,
+    pub sincronia: memoria::Sincronia,
+    /// `true` só quando o id não estava na pasta antes da escrita. Prender uma
+    /// nota que já estava lá responde `false`, e a tela não anuncia novidade.
+    pub nova: bool,
+}
+
+#[tauri::command]
+pub fn base_estado(state: State<'_, AppState>) -> Result<EstadoBase, String> {
+    let lista = state.memoria.notas().map_err(report)?;
+    let fio = state.manager.ferramenta_ativa(local::CONECTOR, "buscar_memoria");
+    let estado = state.memoria.estado(fio);
+    Ok(EstadoBase {
+        notas: lista.notas,
+        bytes: lista.bytes,
+        fixadas: lista.fixadas,
+        trechos_notas: estado.trechos_notas,
+        indexando: estado.indexando,
+        auto: estado.auto,
+    })
+}
+
+/// As notas com o corpo delas, da mais mexida para a menos. É a lista que a tela
+/// mostra e o editor abre; o censo vem junto, medido na mesma leitura.
+#[tauri::command]
+pub fn base_listar(state: State<'_, AppState>) -> Result<base::Lista, String> {
+    state.memoria.notas().map_err(report)
+}
+
+/// O ciclo completo de uma nota escrita pela tela: grava o arquivo e põe o índice
+/// atrás dele. Roda fora da thread do comando porque a segunda metade pode
+/// carregar o codificador — a mesma razão de `memoria_buscar` ser assim.
+#[tauri::command]
+pub async fn base_escrever(
+    state: State<'_, AppState>,
+    titulo: String,
+    corpo: String,
+    nota: Option<String>,
+    fixar: Option<bool>,
+) -> Result<Sincronizada, String> {
+    let memoria = Arc::clone(&state.memoria);
+    tauri::async_runtime::spawn_blocking(move || -> Result<Sincronizada, String> {
+        let raiz = memoria.raiz_base();
+        // Lido antes da escrita: depois de o arquivo existir não há mais como
+        // saber se a pasta já o conhecia.
+        let antes = base::ids(raiz).map_err(report)?;
+        let registro =
+            base::escrever(raiz, &titulo, &corpo, nota.as_deref(), fixar).map_err(report)?;
+        let nova = !antes.iter().any(|id| *id == registro.nota.id);
+        let itens = lista_de_notas(&memoria)?;
+        let sincronia = memoria.sincronizar_base(&itens).map_err(report)?;
+        Ok(Sincronizada { registro, sincronia, nova })
+    })
+    .await
+    .map_err(|e| tr("erros.baseNaoTerminou", &[("detalhe", &e.to_string())]))?
+}
+
+/// Apaga uma nota e tira as peças dela do índice na mesma viagem. Sem a
+/// segunda metade, apagar o arquivo deixaria o texto lembrado — e memória que o
+/// dono mandou esquecer não pode voltar na busca seguinte.
+#[tauri::command]
+pub async fn base_apagar(state: State<'_, AppState>, id: String) -> Result<base::Removida, String> {
+    let memoria = Arc::clone(&state.memoria);
+    tauri::async_runtime::spawn_blocking(move || -> Result<base::Removida, String> {
+        let raiz = memoria.raiz_base();
+        let removida = base::apagar(raiz, &id).map_err(report)?;
+        let itens = lista_de_notas(&memoria)?;
+        // A lista que entra já não tem o arquivo, e é por diferença que a peça sai.
+        memoria.sincronizar_base(&itens).map_err(report)?;
+        Ok(removida)
+    })
+    .await
+    .map_err(|e| tr("erros.baseNaoTerminou", &[("detalhe", &e.to_string())]))?
+}
+
+/// Prende ou solta uma nota. Presa, ela entra no turno sem ser buscada, e é o
+/// índice quem carrega essa decisão junto com a ficha da nota — por isso a
+/// fixação sincroniza também, em vez de mexer só no arquivo.
+#[tauri::command]
+pub async fn base_fixar(
+    state: State<'_, AppState>,
+    id: String,
+    fixada: bool,
+) -> Result<Sincronizada, String> {
+    let memoria = Arc::clone(&state.memoria);
+    tauri::async_runtime::spawn_blocking(move || -> Result<Sincronizada, String> {
+        let registro = base::fixar(memoria.raiz_base(), &id, fixada).map_err(report)?;
+        let itens = lista_de_notas(&memoria)?;
+        let sincronia = memoria.sincronizar_base(&itens).map_err(report)?;
+        Ok(Sincronizada { registro, sincronia, nova: false })
+    })
+    .await
+    .map_err(|e| tr("erros.baseNaoTerminou", &[("detalhe", &e.to_string())]))?
+}
+
+/// As notas como o disco as responde agora. Uma função só para os três comandos
+/// acima porque a lista que entra no índice tem de ser a lida depois da escrita,
+/// e não a que o pedido trouxe.
+fn lista_de_notas(memoria: &Custodio) -> Result<Vec<Nota>, String> {
+    Ok(memoria.notas().map_err(report)?.itens)
 }
 
 // ---------------------------------------------------------------------------

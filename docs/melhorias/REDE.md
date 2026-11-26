@@ -168,7 +168,7 @@ todos os outros arquivos do aplicativo.
   recusa antes de ler argumento, `web.rs:622-625`). `a_rede_desligada_recusa_a_
   ferramenta` e `chamar_a_rede_pelo_nome_com_a_porta_desligada_devolve_a_recusa`
   conferem as duas últimas; `a_rede_ligada_e_a_unica_ferramenta_que_entre_e_saia_
-  do_catalogo` confere 12 → 13 e que a diferença é uma ferramenta só.
+  do_catalogo` confere 13 → 14 e que a diferença é uma ferramenta só.
 
 ## 7. O cartão diz de onde os bytes vieram
 
@@ -284,7 +284,7 @@ todas as mutações ativas de uma vez, e cada mutação tem o seu nome:
 | efeito `ReadOnly` na ferramenta | `a_ferramenta_declara_o_efeito_de_rede_e_nao_aceita_endereco`, `a_ferramenta_de_rede_tem_o_efeito_que_o_gate_nao_deixa_passar` |
 | `hosts_permitidos` pela metade | `a_lista_de_hosts_e_a_que_o_codigo_usa` |
 | `PRAZO_GERAL = 30 s` | `os_prazos_declarados_sao_menores_que_a_soma_dos_pulos` |
-| catálogo sempre com a rede | `o_catalogo_cobre_arquivos_memoria_resultados_terminal_e_sistema`, `a_rede_ligada_e_a_unica_ferramenta_que_entre_e_saia_do_catalogo` |
+| catálogo sempre com a rede | `o_catalogo_cobre_arquivos_memoria_base_resultados_terminal_e_sistema`, `a_rede_ligada_e_a_unica_ferramenta_que_entre_e_saia_do_catalogo` |
 | despacho sem o braço `buscar_na_web` | `chamar_a_rede_pelo_nome_com_a_porta_desligada_devolve_a_recusa` |
 | `Plan` liberando a rede | `plan_mode_is_read_only` |
 | `Auto`/`FullAccess` liberando a rede | `auto_and_full_access_bypass_prompts`, `nenhum_modo_aprova_a_rede` |
