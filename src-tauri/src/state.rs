@@ -200,9 +200,11 @@ pub struct AiRuntime {
     proximo_turno: AtomicU64,
     busy: AtomicBool,
     parado: tokio::sync::Notify,
-    /// Um cancelador por download em curso. A UI precisa poder interromper sem
-    /// esperar o turno de conversa, então isto não passa pelo Mutex do motor.
-    downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Um cancelador e a pasta por download em curso. A UI precisa poder
+    /// interromper sem esperar o turno de conversa, então isto não passa pelo
+    /// Mutex do motor. A pasta entra porque as quants a dividem: ver
+    /// `begin_download`.
+    downloads: Mutex<HashMap<String, (Arc<AtomicBool>, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,15 +306,16 @@ impl AiRuntime {
         }
     }
 
-    /// Registra um download. Devolve None se este modelo já está baixando: duas
-    /// tarefas escreveriam no mesmo `.part`.
-    pub fn begin_download(&self, id: &str) -> Option<Arc<AtomicBool>> {
+    /// Registra um download. Devolve None se este modelo já está baixando — ou
+    /// se outra quant da mesma pasta está: as quants dividem o `dir` e, com ele,
+    /// o `tokenizer.json.part`, e duas tarefas escreveriam no mesmo arquivo.
+    pub fn begin_download(&self, id: &str, dir: &str) -> Option<Arc<AtomicBool>> {
         let mut jobs = trava_estado(&self.downloads);
-        if jobs.contains_key(id) {
+        if jobs.contains_key(id) || jobs.values().any(|(_, pasta)| pasta == dir) {
             return None;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        jobs.insert(id.to_string(), Arc::clone(&cancel));
+        jobs.insert(id.to_string(), (Arc::clone(&cancel), dir.to_string()));
         Some(cancel)
     }
 
@@ -322,7 +325,7 @@ impl AiRuntime {
 
     pub fn cancel_download(&self, id: &str) -> bool {
         match trava_estado(&self.downloads).get(id) {
-            Some(cancel) => {
+            Some((cancel, _)) => {
                 cancel.store(true, Ordering::Relaxed);
                 true
             }
@@ -940,6 +943,39 @@ mod tests {
             raiz.join("geracao.json"),
             raiz.join("adaptadores.json"),
         ))
+    }
+
+    /// As duas quants do codificador dividem a pasta e, com ela, o
+    /// `tokenizer.json.part`. O guarda por id deixava as duas baixando juntas:
+    /// uma publicava o arquivo conferido e a outra, com o handle ainda aberto,
+    /// anexava a cauda que estava recebendo — o tokenizador publicado virava
+    /// JSON válido seguido de lixo, e o índice recusava abrir.
+    #[test]
+    fn duas_quants_da_mesma_pasta_nao_baixam_juntas() {
+        let ai = runtime_de_teste("downloads-pasta");
+        assert!(ai
+            .begin_download("qwen3-embedding-0.6b-q8_0", "qwen3-embedding-0.6b")
+            .is_some());
+        assert!(ai
+            .begin_download("qwen3-embedding-0.6b-f16", "qwen3-embedding-0.6b")
+            .is_none());
+        assert!(ai
+            .begin_download("qwen3-embedding-0.6b-q8_0", "qwen3-embedding-0.6b")
+            .is_none());
+        // Pasta diferente não é a mesma remessa: o guarda não pode virar fila
+        // global de um download por vez.
+        assert!(ai.begin_download("granite-4.2-3b-Q4_K_M", "granite-4.2-3b").is_some());
+
+        ai.end_download("qwen3-embedding-0.6b-q8_0");
+        let f16 = ai
+            .begin_download("qwen3-embedding-0.6b-f16", "qwen3-embedding-0.6b")
+            .expect("a pasta livre tem de aceitar a outra quant");
+        assert!(ai.cancel_download("qwen3-embedding-0.6b-f16"));
+        assert!(f16.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            ai.downloading(),
+            vec!["granite-4.2-3b-Q4_K_M", "qwen3-embedding-0.6b-f16"]
+        );
     }
 
     /// Vermelho-primeiro: o `esquecer` antigo fazia `loaded.lock()` e devolvia

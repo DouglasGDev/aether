@@ -47,17 +47,19 @@ void markdown();
 /// ocupam o mesmo lugar e nada some quando o markdown assume. Não há tela em
 /// branco nem esqueleto: o corpo pintado antes é o corpo real.
 export function RichText({ text }: { text: string }) {
-  const [Modulo, setModulo] = useState<ComponenteMarkdown | null>(resolvido);
+  /// Componente é função: sem o embrulho, o React a chamaria como inicializador
+  /// do useState (sem props) ou como updater do setModulo, em vez de guardá-la.
+  const [Modulo, setModulo] = useState<ComponenteMarkdown | null>(() => resolvido);
 
   useEffect(() => {
     if (resolvido !== null) {
-      setModulo(resolvido);
+      setModulo(() => resolvido);
       return;
     }
     if (falhou) return;
     let vivo = true;
     void markdown().then((componente) => {
-      if (vivo && componente !== null) setModulo(componente);
+      if (vivo && componente !== null) setModulo(() => componente);
     });
     return () => {
       vivo = false;

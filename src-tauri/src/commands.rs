@@ -664,7 +664,7 @@ pub async fn model_download(
         .ok_or_else(|| tr("erros.modeloNaoCatalogado", &[("id", &id)]))?;
     let ai = Arc::clone(&state.ai);
     let cancel = ai
-        .begin_download(&id)
+        .begin_download(&id, spec.dir)
         .ok_or_else(|| tr("erros.modeloBaixando", &[]))?;
     let root = ai.models_root.clone();
     let done = Arc::clone(&ai);
