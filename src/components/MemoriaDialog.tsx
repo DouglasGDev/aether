@@ -14,6 +14,7 @@ import type {
   RespostaMemoria,
 } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
+import { Esqueleto } from "./Esqueleto";
 import { Icon } from "./Icon";
 import { BarraDeTrabalho, Regua } from "./BarraDeTrabalho";
 
@@ -256,7 +257,10 @@ export function MemoriaDialog({ onClose, onChange }: Props) {
               {erro}
             </p>
           ) : (
-            <p className="sheet-note">{t("geral.carregando")}</p>
+            <>
+              <Esqueleto linhas={4} />
+              <p className="sheet-note">{t("geral.carregando")}</p>
+            </>
           )}
         </div>
       </div>

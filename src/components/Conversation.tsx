@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import {
   STOP_KEY,
   duracao,
@@ -28,6 +28,9 @@ export interface ToolRun {
   vista?: Vista | null;
   /// A entrada do catálogo, quando existe: dá o título no idioma atual.
   info?: ToolInfo;
+  /// Só o cancelamento explícito do turno marca isto. Uma ferramenta que
+  /// terminou sem resultado continua sendo uma falha, não um cancelamento.
+  cancelado?: boolean;
 }
 
 export interface Turn {
@@ -187,7 +190,7 @@ function LinhaDeRodada({
   );
 }
 
-export function Conversation({
+export const Conversation = memo(function Conversation({
   turns,
   aguardando,
   rodada,
@@ -198,8 +201,25 @@ export function Conversation({
   const end = useRef<HTMLDivElement>(null);
   const t = useT();
   const { id: idioma } = useIdioma();
+  /// `null` é a montagem: uma conversa aberta cai no fim sem passar pela régua,
+  /// porque ali ainda não existe leitura em curso para respeitar.
+  const quantidade = useRef<number | null>(null);
+
+  /// O turno novo chega em rajada de token, e o efeito abaixo rodava uma vez por
+  /// delta: cada um forçava layout e arrancava de volta ao fim quem tinha subido
+  /// para reler. A régua é a posição do rodapé — perto dele se persegue, longe
+  /// não; e uma virada de turno é perseguida sozinha, porque a mensagem recém-
+  /// escrita deve ir para a frente dos olhos mesmo com a tela rolada para cima.
+  /// O `requestAnimationFrame` junta os deltas que caem no mesmo quadro.
   useEffect(() => {
-    end.current?.scrollIntoView({ block: "end" });
+    const alvo = end.current;
+    if (alvo === null) return;
+    const novaRajada = quantidade.current === null || turns.length !== quantidade.current;
+    quantidade.current = turns.length;
+    const abaixo = alvo.getBoundingClientRect().bottom - window.innerHeight;
+    if (!novaRajada && abaixo > 160) return;
+    const quadro = requestAnimationFrame(() => alvo.scrollIntoView({ block: "end" }));
+    return () => cancelAnimationFrame(quadro);
   }, [turns]);
 
   return (
@@ -281,7 +301,13 @@ export function Conversation({
                 <span className="talk-tools-label">{t("conversa.ferramentas")}</span>
                 {turn.tools.map((tool, at) => {
                   const estado =
-                    tool.ok === undefined ? "running" : tool.ok ? "ok" : "fail";
+                    tool.ok === undefined
+                      ? turn.streaming
+                        ? "running"
+                        : "fail"
+                      : tool.ok
+                        ? "ok"
+                        : "fail";
                   const cartao =
                     tool.vista !== null && tool.vista !== undefined ? (
                       <ToolCard vista={tool.vista} falha={tool.ok === false} />
@@ -300,9 +326,15 @@ export function Conversation({
                       </span>
                       <span className="talk-tool-state">
                         {tool.ok === undefined ? (
-                          aguardando ? t("conversa.aguardando") : t("geral.executando")
+                          turn.streaming
+                            ? aguardando
+                              ? t("conversa.aguardando")
+                              : t("geral.executando")
+                            : t("geral.erro")
                         ) : tool.ok ? (
                           <Icon name="check" />
+                        ) : tool.cancelado ? (
+                          t("erros.pedidoCancelado")
                         ) : (
                           <Icon name="cross" />
                         )}
@@ -413,4 +445,4 @@ export function Conversation({
       <div ref={end} />
     </div>
   );
-}
+});

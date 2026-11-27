@@ -9,6 +9,7 @@ import type {
 } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
 import { Regua } from "./BarraDeTrabalho";
+import { Esqueleto } from "./Esqueleto";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -152,7 +153,10 @@ export function AdaptadoresDialog({ onClose, onChange }: Props) {
               {erro}
             </p>
           ) : (
-            <p className="sheet-note">{t("geral.carregando")}</p>
+            <>
+              <Esqueleto />
+              <p className="sheet-note">{t("geral.carregando")}</p>
+            </>
           )}
         </div>
       </div>

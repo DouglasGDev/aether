@@ -41,6 +41,55 @@ body {
   overflow: hidden;
 }
 
+/* O trecho marcado e o cursor de escrita usam a mesma cor do núcleo: sem isso o
+   selection cai no azul do sistema, que não pertence a nenhuma tela daqui. */
+::selection {
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
+  color: var(--text);
+}
+
+input,
+textarea {
+  caret-color: var(--accent);
+}
+
+/* A barra de rolagem é uma só na casa inteira: quatro grupos repetiam os mesmos
+   três valores e as janelas de diálogo, que também rolam, não tinham nenhuma. */
+.stage-sheet::-webkit-scrollbar,
+.modal-card::-webkit-scrollbar,
+.model-card::-webkit-scrollbar,
+.chats-lista::-webkit-scrollbar,
+.card-code::-webkit-scrollbar,
+.card-out::-webkit-scrollbar,
+.card-rows::-webkit-scrollbar,
+.card-diffs::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.stage-sheet::-webkit-scrollbar-thumb,
+.modal-card::-webkit-scrollbar-thumb,
+.model-card::-webkit-scrollbar-thumb,
+.chats-lista::-webkit-scrollbar-thumb,
+.card-code::-webkit-scrollbar-thumb,
+.card-out::-webkit-scrollbar-thumb,
+.card-rows::-webkit-scrollbar-thumb,
+.card-diffs::-webkit-scrollbar-thumb {
+  background: rgba(130, 160, 205, 0.22);
+  border-radius: 8px;
+}
+
+.stage-sheet::-webkit-scrollbar-track,
+.modal-card::-webkit-scrollbar-track,
+.model-card::-webkit-scrollbar-track,
+.chats-lista::-webkit-scrollbar-track,
+.card-code::-webkit-scrollbar-track,
+.card-out::-webkit-scrollbar-track,
+.card-rows::-webkit-scrollbar-track,
+.card-diffs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 button {
   font: inherit;
   color: inherit;
@@ -50,6 +99,17 @@ button {
 button:disabled {
   cursor: default;
   opacity: 0.45;
+}
+
+/* O anel de foco existe para quem não usa mouse: sem ele o teclado percorre o
+   aplicativo inteiro sem saber onde está. Fica em `:focus-visible` para não
+   pipocar em cada clique. */
+button:focus-visible,
+[role="button"]:focus-visible,
+[role="checkbox"]:focus-visible,
+a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 75%, transparent);
+  outline-offset: 2px;
 }
 
 input,
@@ -152,19 +212,6 @@ textarea {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 2px;
-}
-
-.stage-sheet::-webkit-scrollbar {
-  width: 8px;
-}
-
-.stage-sheet::-webkit-scrollbar-thumb {
-  background: rgba(130, 160, 205, 0.22);
-  border-radius: 8px;
-}
-
-.stage-sheet::-webkit-scrollbar-track {
-  background: transparent;
 }
 
 .core {
@@ -977,6 +1024,44 @@ button.model-roteador .icon {
   text-align: center;
   color: var(--muted);
   font-size: 14px;
+}
+
+/* O corpo que ainda não chegou segura o lugar que vai ocupar: uma frase
+   centralizada sozinha faz a janela saltar de altura quando a leitura volta. A
+   linha que varre é o único trabalho daqui — transform, nada de reflow. */
+.skeleton {
+  display: grid;
+  gap: 10px;
+  padding: 4px 0 10px;
+}
+
+.skeleton-row {
+  position: relative;
+  overflow: hidden;
+  height: 44px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--glass-soft);
+}
+
+.skeleton-row::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--text) 8%, transparent),
+    transparent
+  );
+  animation: skeleton-varre 1.5s ease-in-out infinite;
+}
+
+@keyframes skeleton-varre {
+  to {
+    transform: translateX(100%);
+  }
 }
 
 .sheet-fields {
@@ -2284,7 +2369,16 @@ details[open] > .talk-tool-head .talk-tool-seta {
 @media (prefers-reduced-motion: reduce) {
   .core-ring,
   .core-heart,
-  .core-halo {
+  .core-halo,
+  /* `.core-awaiting .core-halo` é mais específico que `.core-halo` sozinho: sem
+     repetir a dupla, o alarme continuaria pulsando na tela de espera. */
+  .core-awaiting .core-halo,
+  .app-menu-sinal-pulso,
+  .app-menu-marca-pulso,
+  .talk-caret,
+  .talk-wait span,
+  .talk-loading,
+  .skeleton-row::after {
     animation: none;
   }
 
@@ -2292,14 +2386,12 @@ details[open] > .talk-tool-head .talk-tool-seta {
     transition: none;
   }
 
-  .talk-caret,
-  .talk-wait span,
-  .talk-loading {
-    animation: none;
-  }
-
   .talk-caret {
     opacity: 0.7;
+  }
+
+  .skeleton-row::after {
+    opacity: 0;
   }
 }
 
@@ -2307,19 +2399,6 @@ details[open] > .talk-tool-head .talk-tool-seta {
   width: min(720px, 100%);
   display: flex;
   flex-direction: column;
-}
-
-.model-card::-webkit-scrollbar {
-  width: 8px;
-}
-
-.model-card::-webkit-scrollbar-thumb {
-  background: rgba(130, 160, 205, 0.22);
-  border-radius: 8px;
-}
-
-.model-card::-webkit-scrollbar-track {
-  background: transparent;
 }
 
 .model-tabs {
@@ -2747,29 +2826,6 @@ details[open] > .talk-tool-head .talk-tool-seta {
   max-height: 260px;
   margin: 0;
   overscroll-behavior: contain;
-}
-
-.card-code::-webkit-scrollbar,
-.card-out::-webkit-scrollbar,
-.card-rows::-webkit-scrollbar,
-.card-diffs::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-.card-code::-webkit-scrollbar-thumb,
-.card-out::-webkit-scrollbar-thumb,
-.card-rows::-webkit-scrollbar-thumb,
-.card-diffs::-webkit-scrollbar-thumb {
-  background: rgba(130, 160, 205, 0.22);
-  border-radius: 8px;
-}
-
-.card-code::-webkit-scrollbar-track,
-.card-out::-webkit-scrollbar-track,
-.card-rows::-webkit-scrollbar-track,
-.card-diffs::-webkit-scrollbar-track {
-  background: transparent;
 }
 
 .card-code,
@@ -4856,19 +4912,6 @@ button.icon-only.falta {
   list-style: none;
   overflow-y: auto;
   overscroll-behavior: contain;
-}
-
-.chats-lista::-webkit-scrollbar {
-  width: 8px;
-}
-
-.chats-lista::-webkit-scrollbar-thumb {
-  background: rgba(130, 160, 205, 0.22);
-  border-radius: 8px;
-}
-
-.chats-lista::-webkit-scrollbar-track {
-  background: transparent;
 }
 
 .chats-item {

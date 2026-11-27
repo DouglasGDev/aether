@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useT } from "../lib/i18n";
 import type { Connector } from "../lib/types";
 import { Icon } from "./Icon";
@@ -10,7 +11,7 @@ interface Props {
   onAdd: () => void;
 }
 
-export function ConnectorNodes({
+export const ConnectorNodes = memo(function ConnectorNodes({
   connectors,
   connected,
   busy,
@@ -53,4 +54,4 @@ export function ConnectorNodes({
       </button>
     </div>
   );
-}
+});

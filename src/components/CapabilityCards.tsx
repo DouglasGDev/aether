@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { EFFECT_ICON, EFFECT_KEY, toolTitle } from "../lib/display";
 import { useT } from "../lib/i18n";
 import type { Connector, ToolInfo } from "../lib/types";
@@ -40,7 +40,7 @@ function grupos(tools: ToolInfo[], connectors: Connector[]): Grupo[] {
   return saida;
 }
 
-export function CapabilityCards({ tools, connectors, onPick }: Props) {
+export const CapabilityCards = memo(function CapabilityCards({ tools, connectors, onPick }: Props) {
   const t = useT();
   const [recolhidas, setRecolhidas] = useState<string[]>([]);
   const alternar = (id: string) =>
@@ -48,9 +48,14 @@ export function CapabilityCards({ tools, connectors, onPick }: Props) {
       atual.includes(id) ? atual.filter((outro) => outro !== id) : [...atual, id],
     );
 
+  /// A grouped by server is rebuilt here, not in the caller: `tools` and
+  /// `connectors` are already stable state from `App`, so the grouping rides
+  /// the same memo and only pays for itself when a tool actually arrives.
+  const lista = useMemo(() => grupos(tools, connectors), [tools, connectors]);
+
   return (
     <div className="capabilities">
-      {grupos(tools, connectors).map((grupo) => {
+      {lista.map((grupo) => {
         const recolhida = recolhidas.includes(grupo.id);
         return (
           <section className="cap-grupo" key={grupo.id}>
@@ -92,4 +97,4 @@ export function CapabilityCards({ tools, connectors, onPick }: Props) {
       })}
     </div>
   );
-}
+});

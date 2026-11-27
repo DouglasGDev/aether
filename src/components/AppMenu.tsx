@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useT } from "../lib/i18n";
 import { Icon } from "./Icon";
 
@@ -78,7 +78,7 @@ interface Props {
   marcas: Partial<Record<TelaAjuste, Marca>>;
 }
 
-export function AppMenu({ onAbrir, marcas }: Props) {
+export const AppMenu = memo(function AppMenu({ onAbrir, marcas }: Props) {
   const t = useT();
   const [aberto, setAberto] = useState(false);
   const raiz = useRef<HTMLSpanElement | null>(null);
@@ -168,4 +168,4 @@ export function AppMenu({ onAbrir, marcas }: Props) {
       )}
     </span>
   );
-}
+});

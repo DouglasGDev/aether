@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { AppMenu, type Marca, type TelaAjuste } from "./components/AppMenu";
 import { ApprovalCard } from "./components/ApprovalCard";
@@ -24,6 +24,7 @@ import type {
   BancadaRodada,
   CallToolResult,
   ChatEvent,
+  ConexaoBanco,
   Connector,
   EstadoConversas,
   EstadoVoz,
@@ -80,9 +81,22 @@ const VozDialog = lazy(() =>
   import("./components/VozDialog").then((m) => ({ default: m.VozDialog })),
 );
 
+/// `Chats` é a folha que o item de performance pede memoizada, mas o arquivo é
+/// de outro front e editá-lo abriria conflito. O `memo` entra aqui, no import,
+/// sem tocar no componente: as props todas já vêm de estado ou de callbacks
+/// estáveis, então é o wrapper que falta para o `memo` pegar.
+const ChatsMemo = memo(Chats);
+
 const SEM_MEDIDOR: MedidorVoz = { falando: false, ouvindo: false, nivel: 0 };
 
 const SEM_RODADA: BancadaRodada = { resultados: {}, andando: false, atual: null, modelo: null };
+
+interface TurnoEmCurso {
+  sequencia: number;
+  chave: string;
+  turnId: number | null;
+  conversationId: string | null;
+}
 
 /// Import dinâmico é leitura de disco: se o chunk não vier, o throw do React
 /// desmontaria a árvore inteira e a tela ficaria branca no meio de um turno. A
@@ -122,6 +136,10 @@ export default function App() {
   const [capabilities, setCapabilities] = useState<ToolInfo[]>([]);
   const [pastas, setPastas] = useState<GrantedFolder[]>([]);
   const [concedidas, setConcedidas] = useState<string[]>([]);
+  /// As conexões de banco cadastradas, para o `@` saber nomear o que as
+  /// ferramentas de consulta já sabem abrir. Não entram no refresh geral: o
+  /// cadastro muda num só lugar — a folha de bancos — e é ali que ele é relido.
+  const [bancos, setBancos] = useState<ConexaoBanco[]>([]);
 
   const [query, setQuery] = useState("");
   const [chosen, setChosen] = useState<ToolInfo | null>(null);
@@ -183,6 +201,35 @@ export default function App() {
   // O ouvinte da conversa é montado uma vez e vive mais que qualquer troca de
   // catálogo: ele resolve a ferramenta por aqui, não por um valor capturado.
   const ferramentas = useRef<Map<string, ToolInfo>>(new Map());
+  const conversaVisivel = useRef<string | null>(null);
+  const turnoEmCurso = useRef<TurnoEmCurso | null>(null);
+  const ultimoTurno = useRef(0);
+  const submissao = useRef(0);
+  /// Parar solta a pintura na hora, mas outro envio só começa quando o
+  /// `chatSend` anterior assenta. Sem isto, um `started` atrasado do turno
+  /// cancelado ainda poderia vincular o próximo turno.
+  const submissaoPendente = useRef<number | null>(null);
+  const parando = useRef(false);
+  /// Só uma operação de conversa por vez. O objeto é o token da operação: o
+  /// `finally` de um pedido antigo não pode liberar o de um pedido novo.
+  const operacaoConversa = useRef<object | null>({});
+
+  const atualizarAssistente = useCallback(
+    (chave: string, update: (turn: Turn) => Turn) => {
+      setTurns((current) => {
+        const indice = current.findIndex(
+          (turn) => turn.role === "assistant" && turn.chave === chave,
+        );
+        if (indice < 0) return current;
+        return [
+          ...current.slice(0, indice),
+          update(current[indice]),
+          ...current.slice(indice + 1),
+        ];
+      });
+    },
+    [],
+  );
 
   /// Cada evento MCP e cada fim de turno dispara um refresh concorrente: sem
   /// ordem, um snapshot mais antigo e mais lento atropela `pending`/`connected`/
@@ -246,7 +293,13 @@ export default function App() {
       setAjustes(nextAi.ajustes);
       setRuntime(nextAi.runtime);
       setAjustado(nextAjuste.itens.some((item) => item.aplicada));
-      setChats(nextChats);
+      /// O snapshot renova a lista, mas não escolhe outra conversa. A identidade
+      /// vem do turno vinculado ou da última escolha explícita da tela; assim um
+      /// pedido lento não troca `chats.ativa` por um estado anterior do disco.
+      setChats((current) => {
+        const ativa = turnoEmCurso.current?.conversationId ?? conversaVisivel.current ?? current.ativa;
+        return nextChats.ativa === ativa ? nextChats : { ...nextChats, ativa };
+      });
       ferramentas.current = new Map(nextTools.map((tool) => [tool.qualifiedName, tool]));
     } catch (cause) {
       // A falha de um pedido já superado não é a falha do estado atual: um
@@ -267,6 +320,20 @@ export default function App() {
     }
   }, []);
 
+  /// O cadastro de bancos é lido uma vez na abertura e de novo quando a folha
+  /// fecha: é o único lugar onde ele muda, e o `@` tem de nomear o que existe.
+  const atualizarBancos = useCallback(async () => {
+    try {
+      setBancos(await api.bancosListar());
+    } catch (cause) {
+      setError(message(cause));
+    }
+  }, []);
+
+  useEffect(() => {
+    void atualizarBancos();
+  }, [atualizarBancos]);
+
   // Trocar o idioma remonta o catálogo no núcleo: os nomes que voltam daqui já
   // vêm na língua nova, e os cartões se redrawem com eles.
   useEffect(() => {
@@ -282,20 +349,38 @@ export default function App() {
     }
   }, []);
 
-  // O pulso da voz só é lido enquanto há alguma coisa acontecendo: fala viva,
-  // microfone aberto, tela de voz aberta, ou o auto-falar ligado — que pode
-  // começar a falar sem nenhum clique na tela.
+  /// O medidor de voz é um IPC de leitura, e ele só serve para desenhar o pulso.
+  /// A regra do relógio tem três andares, e o critério é sempre o mesmo — existe
+  /// um medidor a mostrar?
+  ///   • `falando`/`ouvindo`: 250 ms, porque aí a barra e o orbe mostram o nível a
+  ///     cada quadro e um pulso lento seria o medidor mentindo;
+  ///   • ocioso armado (folha de voz aberta ou auto-falar ligado, sem áudio):
+  ///     1000 ms, só para não perder o instante em que a fala começa sozinha;
+  ///   • janela oculta: parado. Não há o que mostrar, e nenhuma das duas
+  ///     perguntas faz sentido contra um WebView que ninguém está vendo.
+  /// `visibilitychange` reacende o efeito quando a aba volta; o `interval` é
+  /// desmontado no cleanup, então fechar a folha de voz também desliga.
   const vivo =
     medidor.falando ||
     medidor.ouvindo ||
     showVoz ||
     voz?.ajustes.autoFalar === true;
+  const [aparecendo, setAparecendo] = useState(
+    typeof document === "undefined" ? true : document.visibilityState === "visible",
+  );
   useEffect(() => {
-    if (!vivo) return;
+    const marcar = () =>
+      setAparecendo(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", marcar);
+    return () => document.removeEventListener("visibilitychange", marcar);
+  }, []);
+  useEffect(() => {
+    if (!vivo || !aparecendo) return;
+    const cadencia = medidor.falando || medidor.ouvindo ? 250 : 1000;
     void pulsar();
-    const relogio = setInterval(() => void pulsar(), 250);
+    const relogio = setInterval(() => void pulsar(), cadencia);
     return () => clearInterval(relogio);
-  }, [vivo, pulsar]);
+  }, [vivo, aparecendo, medidor.falando, medidor.ouvindo, pulsar]);
 
   // O download de um modelo de voz termina por evento, não por consulta: a
   // lista de discos precisa voltar a ser lida quando ele chega ou falha.
@@ -324,23 +409,80 @@ export default function App() {
   // Ao abrir, a conversa ativa volta do disco: o histórico sobreviveu à janela
   // fechada, e o núcleo põe o arquivo no buffer vivo antes do primeiro pedido.
   useEffect(() => {
+    let cancelled = false;
+    const operacao = {};
+    operacaoConversa.current = operacao;
     void (async () => {
       try {
         const estado = await api.conversasListar();
+        if (cancelled || operacaoConversa.current !== operacao) return;
+        // A lista é publicada pelo que o disco respondeu, antes de abrir a ativa:
+        // se aquele um arquivo estiver ilegível a janela ainda tem de mostrar as
+        // outras conversas. Perder a lista inteira seria dizer "você não tem
+        // conversas" quando a verdade é "não consegui abrir esta".
         setChats(estado);
-        if (estado.ativa !== null) {
-          setTurns(turnsDe(await api.conversaAbrir(estado.ativa)));
-        }
+        conversaVisivel.current = estado.ativa;
+        const historico =
+          estado.ativa !== null ? await api.conversaAbrir(estado.ativa) : [];
+        if (cancelled || operacaoConversa.current !== operacao) return;
+        setTurns(turnsDe(historico));
       } catch (cause) {
-        setError(message(cause));
+        if (!cancelled && operacaoConversa.current === operacao) {
+          setError(message(cause));
+        }
+      } finally {
+        if (operacaoConversa.current === operacao) operacaoConversa.current = null;
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     const handle = (event: ChatEvent) => {
+      /// Um `started` chegado depois de Parar não desenha nada, mas ainda
+      /// precisa entrar no piso dos IDs para não ser reutilizado no turno novo.
+      if (event.type === "started" && turnoEmCurso.current === null) {
+        ultimoTurno.current = Math.max(ultimoTurno.current, event.turnId);
+        return;
+      }
+      const ativo = turnoEmCurso.current;
+      if (ativo === null) return;
+      /// Nenhum evento anterior a `started` identifica o turno. O primeiro e
+      /// único `started` aceito faz a ligação; os demais já não podem rebindá-lo.
+      if (event.type === "started") {
+        if (ativo.turnId !== null || event.turnId <= ultimoTurno.current) return;
+        if (ativo.conversationId !== null && event.conversationId !== ativo.conversationId) {
+          return;
+        }
+        if (
+          conversaVisivel.current !== null &&
+          event.conversationId !== conversaVisivel.current
+        ) {
+          return;
+        }
+        ativo.turnId = event.turnId;
+        ativo.conversationId = event.conversationId;
+        ultimoTurno.current = Math.max(ultimoTurno.current, event.turnId);
+        conversaVisivel.current = event.conversationId;
+        setChats((current) =>
+          current.ativa === event.conversationId
+            ? current
+            : { ...current, ativa: event.conversationId },
+        );
+        return;
+      }
+      if (ativo.turnId === null || ativo.conversationId === null) return;
+      if (event.turnId !== ativo.turnId || event.conversationId !== ativo.conversationId) {
+        return;
+      }
+      if (conversaVisivel.current !== null && event.conversationId !== conversaVisivel.current) {
+        return;
+      }
+
       // O pulso do fio vem do mesmo evento que preenche o cartão da ferramenta:
       // o grafo não tem uma segunda fonte de verdade para inventar.
       if (event.type === "toolCall" || event.type === "toolResult") {
@@ -370,9 +512,11 @@ export default function App() {
         }));
       }
       setTurns((current) => {
-        const last = current[current.length - 1];
-        if (last === undefined || last.role !== "assistant") return current;
-        const turn: Turn = { ...last };
+        const indice = current.findIndex(
+          (turn) => turn.role === "assistant" && turn.chave === ativo.chave,
+        );
+        if (indice < 0) return current;
+        const turn: Turn = { ...current[indice] };
         switch (event.type) {
           case "choice":
             turn.choice = event.choice;
@@ -445,7 +589,11 @@ export default function App() {
             turn.streaming = false;
             break;
         }
-        return [...current.slice(0, -1), turn];
+        return [
+          ...current.slice(0, indice),
+          turn,
+          ...current.slice(indice + 1),
+        ];
       });
     };
     void onChatEvent(handle).then((un) => {
@@ -564,134 +712,250 @@ export default function App() {
                 ? "ready"
                 : "dormant";
 
-  async function submitQuery() {
-    const trimmed = query.trim();
-    if (trimmed === "" || talking) return;
-    /// Um atalho escrito por inteiro é uma ação, não um pedido: Enter sem
-    /// escolher na folha dispara o mesmo que a folha dispararia.
-    const atalho = resolverAtalho(atalhos, trimmed);
-    if (atalho !== null) {
-      setQuery("");
-      atalho.onDisparar();
+
+  /// O `/compactar` da barra: um turno sem pedido. A bolha não tem texto porque o
+  /// modelo não respondeu a nada — o que ela mostra é o resumo que a dobra
+  /// escreveu, pelo mesmo evento e pela mesma identidade que o turno usa quando a
+  /// janela aperta. Por isso o Parar vale aqui também.
+  const compactarAgora = useCallback(async () => {
+    if (
+      talking ||
+      parando.current ||
+      submissaoPendente.current !== null ||
+      turnoEmCurso.current !== null ||
+      operacaoConversa.current !== null
+    ) {
       return;
     }
     setError(null);
-    setResult(null);
-    setChosen(null);
     setQuery("");
-    setTurns((current) => [
-      ...current,
-      { ...emptyTurn("user"), text: trimmed },
-      { ...emptyTurn("assistant"), streaming: true },
-    ]);
+    const assistente = { ...emptyTurn("assistant"), streaming: true };
+    const sequencia = ++submissao.current;
+    submissaoPendente.current = sequencia;
+    turnoEmCurso.current = {
+      sequencia,
+      chave: assistente.chave,
+      turnId: null,
+      conversationId: conversaVisivel.current,
+    };
+    setTurns((current) => [...current, assistente]);
     setTalking(true);
     try {
-      const outcome = await api.chatSend(trimmed);
-      setTurns((current) => {
-        const last = current[current.length - 1];
-        if (last === undefined || last.role !== "assistant") return current;
-        return [
-          ...current.slice(0, -1),
-          {
-            ...last,
-            text: outcome.text,
-            thinking: outcome.thinking,
-            medicao: outcome.medicao,
-            loading: null,
-            streaming: false,
-          },
-        ];
-      });
+      const dobra = await api.chatCompactar();
+      if (sequencia !== submissao.current || turnoEmCurso.current?.sequencia !== sequencia) {
+        return;
+      }
+      ultimoTurno.current = Math.max(ultimoTurno.current, dobra.turnId);
+      /// O evento já pintou a folha; isto assenta a mesma bolha quando o `started`
+      /// atrasado não chegou (conversa aberta por outro caminho, evento perdido).
+      atualizarAssistente(assistente.chave, (turn) => ({
+        ...turn,
+        resumo: { texto: dobra.texto, mensagens: dobra.lidas, descartadas: dobra.descartadas },
+        loading: null,
+        streaming: false,
+      }));
     } catch (cause) {
+      if (sequencia !== submissao.current || turnoEmCurso.current?.sequencia !== sequencia) {
+        return;
+      }
       setError(message(cause));
       setTurns((current) => {
-        const last = current[current.length - 1];
-        if (last === undefined || last.role !== "assistant") return current;
-        const rest = current.slice(0, -1);
-        const settled = { ...last, loading: null, streaming: false };
-        const empty =
-          settled.text === "" &&
-          settled.thinking === "" &&
-          settled.tools.length === 0;
-        return empty ? rest : [...rest, settled];
+        const indice = current.findIndex((turn) => turn.chave === assistente.chave);
+        if (indice < 0) return current;
+        const settled = { ...current[indice], loading: null, streaming: false };
+        return settled.resumo === null
+          ? [...current.slice(0, indice), ...current.slice(indice + 1)]
+          : [...current.slice(0, indice), settled, ...current.slice(indice + 1)];
       });
     } finally {
-      setTalking(false);
+      if (sequencia === submissao.current && turnoEmCurso.current?.sequencia === sequencia) {
+        turnoEmCurso.current = null;
+        setTalking(false);
+      }
+      if (submissaoPendente.current === sequencia) {
+        submissaoPendente.current = null;
+      }
       await refresh();
     }
-  }
+  }, [atualizarAssistente, refresh, talking]);
 
-  async function cancelTalk() {
+  const cancelTalk = useCallback(async () => {
+    if (parando.current || operacaoConversa.current !== null) return;
+    parando.current = true;
+    const ativo = turnoEmCurso.current;
+    /// Invalida a submissão antes de qualquer await: o resultado antigo não pode
+    /// reabrir a UI nem escrever no assistente novo enquanto o cancelamento voa.
+    submissao.current += 1;
+    turnoEmCurso.current = null;
+    setTalking(false);
+    if (ativo !== null) {
+      atualizarAssistente(ativo.chave, (turn) => ({
+        ...turn,
+        loading: null,
+        streaming: false,
+        tools: turn.tools.map((tool) =>
+          tool.ok === undefined
+            ? {
+                ...tool,
+                ok: false,
+                cancelado: true,
+                text: t("erros.pedidoCancelado"),
+              }
+            : tool,
+        ),
+      }));
+    }
+    setDisparos((atual) => {
+      const proximo = { ...atual };
+      for (const [chave, disparo] of Object.entries(proximo)) {
+        if (disparo.emCurso) proximo[chave] = { ...disparo, emCurso: false, ok: false };
+      }
+      return proximo;
+    });
     try {
       await api.chatCancel();
     } catch (cause) {
       setError(message(cause));
+    } finally {
+      parando.current = false;
+      await refresh();
     }
-  }
+  }, [atualizarAssistente, refresh, t]);
 
-  async function resetTalk() {
+  const resetTalk = useCallback(async () => {
+    if (
+      parando.current ||
+      submissaoPendente.current !== null ||
+      turnoEmCurso.current !== null ||
+      operacaoConversa.current !== null
+    ) {
+      return;
+    }
+    const operacao = {};
+    operacaoConversa.current = operacao;
     setError(null);
+    submissao.current += 1;
+    turnoEmCurso.current = null;
+    setTalking(false);
     try {
       await api.chatReset();
+      if (operacaoConversa.current !== operacao) return;
       setTurns([]);
       await refresh();
     } catch (cause) {
-      setError(message(cause));
+      if (operacaoConversa.current === operacao) setError(message(cause));
+    } finally {
+      if (operacaoConversa.current === operacao) operacaoConversa.current = null;
     }
-  }
+  }, [refresh]);
 
-  async function novaConversa() {
+  const novaConversa = useCallback(async () => {
+    if (
+      talking ||
+      parando.current ||
+      submissaoPendente.current !== null ||
+      turnoEmCurso.current !== null ||
+      operacaoConversa.current !== null
+    ) {
+      return;
+    }
+    const operacao = {};
+    operacaoConversa.current = operacao;
     setError(null);
+    submissao.current += 1;
+    turnoEmCurso.current = null;
     try {
-      setChats(await api.conversaNova());
+      const estado = await api.conversaNova();
+      if (operacaoConversa.current !== operacao) return;
+      conversaVisivel.current = estado.ativa;
+      setChats(estado);
       setTurns([]);
       setResult(null);
       setChosen(null);
     } catch (cause) {
-      setError(message(cause));
+      if (operacaoConversa.current === operacao) setError(message(cause));
+    } finally {
+      if (operacaoConversa.current === operacao) operacaoConversa.current = null;
     }
-  }
+  }, []);
 
-  async function abrirConversa(id: string) {
+  const abrirConversa = useCallback(async (id: string) => {
     // Um turno em curso anexa cada delta ao último turno assistant do buffer
     // vivo: trocar a conversa agora faria o handler escrever na história de
     // outra. O núcleo recusa a troca e a tela já esconde o botão (Chats
     // desabilita com `ocupado`); esta guarda cobre quem chamar direto.
-    if (talking) return;
+    if (
+      talking ||
+      parando.current ||
+      submissaoPendente.current !== null ||
+      turnoEmCurso.current !== null ||
+      operacaoConversa.current !== null
+    ) {
+      return;
+    }
+    const operacao = {};
+    operacaoConversa.current = operacao;
     setError(null);
+    submissao.current += 1;
+    turnoEmCurso.current = null;
     try {
-      setTurns(turnsDe(await api.conversaAbrir(id)));
+      const historico = await api.conversaAbrir(id);
+      if (operacaoConversa.current !== operacao) return;
+      const estado = await api.conversasListar();
+      if (operacaoConversa.current !== operacao) return;
+      conversaVisivel.current = estado.ativa ?? id;
+      setTurns(turnsDe(historico));
       setResult(null);
       setChosen(null);
-      setChats(await api.conversasListar());
+      setChats(estado);
     } catch (cause) {
-      setError(message(cause));
+      if (operacaoConversa.current === operacao) setError(message(cause));
+    } finally {
+      if (operacaoConversa.current === operacao) operacaoConversa.current = null;
     }
-  }
+  }, []);
 
-  async function renomearConversa(id: string, titulo: string) {
+  const renomearConversa = useCallback(async (id: string, titulo: string) => {
     setError(null);
     try {
       await api.conversaRenomear(id, titulo);
-      setChats(await api.conversasListar());
+      await refresh();
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [refresh]);
 
-  async function apagarConversa(id: string) {
+  const apagarConversa = useCallback(async (id: string) => {
+    if (
+      talking ||
+      parando.current ||
+      submissaoPendente.current !== null ||
+      turnoEmCurso.current !== null ||
+      operacaoConversa.current !== null
+    ) {
+      return;
+    }
+    const operacao = {};
+    operacaoConversa.current = operacao;
     setError(null);
-    const eraAtiva = chats.ativa === id;
+    const eraAtiva = conversaVisivel.current === id;
+    submissao.current += 1;
+    turnoEmCurso.current = null;
     try {
-      setChats(await api.conversaApagar(id));
+      const estado = await api.conversaApagar(id);
+      if (operacaoConversa.current !== operacao) return;
+      conversaVisivel.current = estado.ativa;
+      setChats(estado);
       if (eraAtiva) setTurns([]);
     } catch (cause) {
-      setError(message(cause));
+      if (operacaoConversa.current === operacao) setError(message(cause));
+    } finally {
+      if (operacaoConversa.current === operacao) operacaoConversa.current = null;
     }
-  }
+  }, []);
 
   /// Abre o microfone; a transcrição vem depois, no segundo clique.
-  async function startMic() {
+  const startMic = useCallback(async () => {
     setError(null);
     try {
       await api.vozOuvir();
@@ -699,11 +963,11 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [pulsar]);
 
   /// Solta o microfone e traz o texto. O Whisper roda na máquina e leva mais
   /// tempo que um clique: a barra fica sabendo que está transcrevendo.
-  async function stopMic() {
+  const stopMic = useCallback(async () => {
     setTranscrevendo(true);
     setError(null);
     try {
@@ -714,10 +978,10 @@ export default function App() {
       setTranscrevendo(false);
       await Promise.all([pulsar(), refreshVoz()]);
     }
-  }
+  }, [pulsar, refreshVoz]);
 
   /// Botão solto em cancelamento: o áudio vai fora e o microfone fecha.
-  async function discardMic() {
+  const discardMic = useCallback(async () => {
     setError(null);
     try {
       await api.vozCancelarEscuta();
@@ -726,15 +990,15 @@ export default function App() {
     } finally {
       await pulsar();
     }
-  }
+  }, [pulsar]);
 
-  function pick(tool: ToolInfo) {
+  const pick = useCallback((tool: ToolInfo) => {
     setError(null);
     setResult(null);
     setChosen(tool);
-  }
+  }, []);
 
-  async function run(tool: ToolInfo, args: Record<string, unknown>) {
+  const run = useCallback(async (tool: ToolInfo, args: Record<string, unknown>) => {
     setCalling(true);
     setError(null);
     setResult(null);
@@ -751,9 +1015,9 @@ export default function App() {
     } finally {
       setCalling(false);
     }
-  }
+  }, [refresh]);
 
-  async function toggleConnector(id: string) {
+  const toggleConnector = useCallback(async (id: string) => {
     setBusy(id);
     setError(null);
     try {
@@ -765,9 +1029,9 @@ export default function App() {
     } finally {
       setBusy(null);
     }
-  }
+  }, [connected, refresh]);
 
-  async function removeConnector(id: string) {
+  const removeConnector = useCallback(async (id: string) => {
     setError(null);
     try {
       await api.removeConnector(id);
@@ -775,9 +1039,9 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [refresh]);
 
-  async function changeMode(next: AgentMode) {
+  const changeMode = useCallback(async (next: AgentMode) => {
     setError(null);
     try {
       await api.setPermissionMode(next);
@@ -785,9 +1049,9 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [refresh]);
 
-  async function resolveApproval(id: string, approved: boolean) {
+  const resolveApproval = useCallback(async (id: string, approved: boolean) => {
     setError(null);
     try {
       await api.resolveApproval(id, approved);
@@ -795,11 +1059,11 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [refresh]);
 
   /// Confiar na sessão é a aprovação deste pedido e o fim das perguntas para
   /// este servidor até a conversa recomeçar.
-  async function trustSession(approvalId: string, connectorId: string) {
+  const trustSession = useCallback(async (approvalId: string, connectorId: string) => {
     setError(null);
     try {
       await api.grantSession(connectorId);
@@ -808,9 +1072,9 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [refresh]);
 
-  async function revokeSession(id: string) {
+  const revokeSession = useCallback(async (id: string) => {
     setError(null);
     try {
       await api.revokeSession(id);
@@ -818,7 +1082,7 @@ export default function App() {
     } catch (cause) {
       setError(message(cause));
     }
-  }
+  }, [refresh]);
 
   const approval = pending[0] ?? null;
 
@@ -837,21 +1101,28 @@ export default function App() {
   const runtimeFalta = runtime.some((pacote) => !pacote.completo);
 
   /// O que está valendo agora, levado ao menu para que o estado não suma junto
-  /// com os botões que mostravam cada ajuste na barra.
-  const marcasMenu: Partial<Record<TelaAjuste, Marca>> = {};
-  if (runtimeFalta) marcasMenu.runtime = "aviso";
-  if (medidor.falando) marcasMenu.voz = "pulso";
-  if (ajustado) marcasMenu.ajuste = "ligada";
-  if (
-    ajustes !== null &&
-    (ajustes.modelo !== "" || ajustes.pensamento || ajustes.semente !== 0)
-  )
-    marcasMenu.geracao = "ligada";
-  // A bancada também se vê daqui: uma rodada em curso continuava correndo sem
-  // ninguém olhando, e uma reprovada some quando a folha fecha.
-  if (bancada.andando) marcasMenu.bancada = "pulso";
-  else if (Object.values(bancada.resultados).some((r) => r.estado === "reprovado"))
-    marcasMenu.bancada = "aviso";
+  /// com os botões que mostravam cada ajuste na barra. Memoizado porque o
+  /// `AppMenu` é uma folha: um Record novo a cada passe desfaria o `memo` dele
+  /// por nada — e é o mesmo Record que a barra já não pinta mais.
+  const marcasMenu = useMemo<Partial<Record<TelaAjuste, Marca>>>(() => {
+    const marcas: Partial<Record<TelaAjuste, Marca>> = {};
+    if (runtimeFalta) marcas.runtime = "aviso";
+    if (medidor.falando) marcas.voz = "pulso";
+    if (ajustado) marcas.ajuste = "ligada";
+    if (
+      ajustes !== null &&
+      (ajustes.modelo !== "" || ajustes.pensamento || ajustes.semente !== 0)
+    )
+      marcas.geracao = "ligada";
+    // A bancada também se vê daqui: uma rodada em curso continuava correndo sem
+    // ninguém olhando, e uma reprovada some quando a folha fecha.
+    if (bancada.andando) marcas.bancada = "pulso";
+    else if (
+      Object.values(bancada.resultados).some((r) => r.estado === "reprovado")
+    )
+      marcas.bancada = "aviso";
+    return marcas;
+  }, [runtimeFalta, medidor.falando, ajustado, ajustes, bancada]);
 
   /// Uma linha por tela: o Record completo é o que impede o menu de anunciar
   /// uma porta que o app não abre. É a mesma mão que o atalho da barra aperta.
@@ -882,13 +1153,103 @@ export default function App() {
         grafico: () => setPalco("grafo"),
         rodarBancada: () => void rodarBancada(),
         pararBancada: () => void pararBancada(),
+        compactar: () => void compactarAgora(),
       }),
-    [abrirAjuste, rodarBancada, pararBancada],
+    [abrirAjuste, rodarBancada, pararBancada, compactarAgora],
   );
 
-  /// O que `@` sabe nomear: as pastas que o agente pode ler agora e o modelo em
-  /// memória. É a conta que a tela já tem — nenhuma consulta nova, e o pedido
-  /// sai com a menção escrita como texto, para o agente ler.
+  /// O envio mora depois de `atalhos` porque é ali que ele resolve o atalho
+  /// escrito por inteiro — `atalhos` é um `const`, então a ordem é a que o
+  /// closures respeitam. A barra pertence ao `App` por fora: o texto sobe a cada
+  /// tecla e é daqui que ele volta quando um atalho é aceito ou enviado.
+  async function submitQuery() {
+    const trimmed = query.trim();
+    if (
+      trimmed === "" ||
+      talking ||
+      parando.current ||
+      submissaoPendente.current !== null ||
+      turnoEmCurso.current !== null ||
+      operacaoConversa.current !== null
+    ) {
+      return;
+    }
+    /// Um atalho escrito por inteiro é uma ação, não um pedido: Enter sem
+    /// escolher na folha dispara o mesmo que a folha dispararia.
+    const atalho = resolverAtalho(atalhos, trimmed);
+    if (atalho !== null) {
+      setQuery("");
+      atalho.onDisparar();
+      return;
+    }
+    setError(null);
+    setResult(null);
+    setChosen(null);
+    setQuery("");
+    const usuario = { ...emptyTurn("user"), text: trimmed };
+    const assistente = { ...emptyTurn("assistant"), streaming: true };
+    const sequencia = ++submissao.current;
+    submissaoPendente.current = sequencia;
+    turnoEmCurso.current = {
+      sequencia,
+      chave: assistente.chave,
+      turnId: null,
+      conversationId: conversaVisivel.current,
+    };
+    setTurns((current) => [...current, usuario, assistente]);
+    setTalking(true);
+    try {
+      const outcome = await api.chatSend(trimmed);
+      if (sequencia !== submissao.current || turnoEmCurso.current?.sequencia !== sequencia) {
+        return;
+      }
+      ultimoTurno.current = Math.max(ultimoTurno.current, outcome.turnId);
+      atualizarAssistente(assistente.chave, (turn) => ({
+        ...turn,
+        text: outcome.text,
+        thinking: outcome.thinking,
+        medicao: outcome.medicao,
+        loading: null,
+        streaming: false,
+      }));
+    } catch (cause) {
+      if (sequencia !== submissao.current || turnoEmCurso.current?.sequencia !== sequencia) {
+        return;
+      }
+      setError(message(cause));
+      setTurns((current) => {
+        const indice = current.findIndex((turn) => turn.chave === assistente.chave);
+        if (indice < 0) return current;
+        const settled = { ...current[indice], loading: null, streaming: false };
+        const empty =
+          settled.text === "" &&
+          settled.thinking === "" &&
+          settled.tools.length === 0;
+        return empty
+          ? [...current.slice(0, indice), ...current.slice(indice + 1)]
+          : [
+              ...current.slice(0, indice),
+              settled,
+              ...current.slice(indice + 1),
+            ];
+      });
+    } finally {
+      if (sequencia === submissao.current && turnoEmCurso.current?.sequencia === sequencia) {
+        turnoEmCurso.current = null;
+        setTalking(false);
+      }
+      if (submissaoPendente.current === sequencia) {
+        submissaoPendente.current = null;
+      }
+      await refresh();
+    }
+  }
+
+  /// O que `@` sabe nomear: as pastas que o agente pode ler, os bancos que as
+  /// ferramentas de consulta abrem e o modelo em memória. É a conta que a tela já
+  /// tem — nenhuma consulta nova, e o pedido sai com a menção escrita como texto,
+  /// para o agente ler. O nome é o que a ferramenta cobra: `conexao` é o nome do
+  /// cadastro, e o detalhe diz onde ele aponta.
   const mencoes = useMemo<Mencao[]>(
     () => [
       ...pastas.map((pasta) => ({
@@ -897,35 +1258,86 @@ export default function App() {
         icon: "folder",
         detalhe: pasta.caminho,
       })),
+      ...bancos.map((conexao) => ({
+        nome: conexao.nome,
+        chave: "bancos.titulo",
+        icon: "banco",
+        detalhe:
+          conexao.tipo === "sqlite"
+            ? conexao.arquivo
+            : `${conexao.host} · ${conexao.banco}`,
+      })),
       ...(loaded === null
         ? []
         : [{ nome: loaded, chave: "modelos.titulo", icon: "cube" }]),
     ],
-    [pastas, loaded],
+    [pastas, bancos, loaded],
   );
 
   /// A linha da rodada só existe quando a bancada mediu alguma coisa nesta
-  /// janela; antes do primeiro `iniciou` não há número a mostrar.
-  const rodada =
-    rodadaOculta ||
-    (!bancada.andando &&
-      bancada.modelo === null &&
-      Object.keys(bancada.resultados).length === 0)
-      ? null
-      : bancada;
+  /// janela; antes do primeiro `iniciou` não há número a mostrar. Memoizada pelo
+  /// mesmo motivo do menu: `Conversation` é folha, e a prop nova a cada passe
+  /// anularia o `memo` mesmo sem a bancada ter se mexido.
+  const rodada = useMemo(
+    () =>
+      rodadaOculta ||
+      (!bancada.andando &&
+        bancada.modelo === null &&
+        Object.keys(bancada.resultados).length === 0)
+        ? null
+        : bancada,
+    [rodadaOculta, bancada],
+  );
+
+  /// As mãos das folhas. Um `() => void fn()` escrito no JSX nasce novo a cada
+  /// passe e desfaz o `memo` da folha por nada — estas sete linhas são o que
+  /// faz a folha parar de redesenhar quando o que mudou foi só outra parte da
+  /// tela. `void` dentro porque o handler do componente filho espera `() => void`.
+  const aoNova = useCallback(() => {
+    void novaConversa();
+  }, [novaConversa]);
+  const aoAbrir = useCallback(
+    (id: string) => {
+      void abrirConversa(id);
+    },
+    [abrirConversa],
+  );
+  const aoRenomear = useCallback(
+    (id: string, titulo: string) => {
+      void renomearConversa(id, titulo);
+    },
+    [renomearConversa],
+  );
+  const aoApagar = useCallback(
+    (id: string) => {
+      void apagarConversa(id);
+    },
+    [apagarConversa],
+  );
+  const aoLimpar = useCallback(() => {
+    void resetTalk();
+  }, [resetTalk]);
+  const aoFecharChats = useCallback(() => setShowChats(false), []);
+  const aoToggle = useCallback((id: string) => {
+    void toggleConnector(id);
+  }, [toggleConnector]);
+  const aoAbrirServidores = useCallback(() => setShowServers(true), []);
+  const aoAbrirBancada = useCallback(() => setShowBancada(true), []);
+  const aoDispensarRodada = useCallback(() => setRodadaOculta(true), []);
+  const aoDispensarErro = useCallback(() => setError(null), []);
 
   return (
     <div className={showChats ? "app app--chats" : "app"}>
       {showChats && (
-        <Chats
+        <ChatsMemo
           estado={chats}
           ocupado={talking || calling}
-          onNova={() => void novaConversa()}
-          onAbrir={(id) => void abrirConversa(id)}
-          onRenomear={(id, titulo) => void renomearConversa(id, titulo)}
-          onApagar={(id) => void apagarConversa(id)}
-          onLimpar={() => void resetTalk()}
-          onFechar={() => setShowChats(false)}
+          onNova={aoNova}
+          onAbrir={aoAbrir}
+          onRenomear={aoRenomear}
+          onApagar={aoApagar}
+          onLimpar={aoLimpar}
+          onFechar={aoFecharChats}
         />
       )}
       <div className={palco === "grafo" ? "stage stage--grafo" : "stage"}>
@@ -1009,6 +1421,7 @@ export default function App() {
             />
           ) : chosen !== null ? (
             <ArgumentForm
+              key={chosen.qualifiedName}
               tool={chosen}
               busy={calling}
               onCancel={() => setChosen(null)}
@@ -1026,8 +1439,8 @@ export default function App() {
               aguardando={pending.length > 0}
               rodada={rodada}
               totalDeCasos={bancadaCasos.length}
-              onAbrirRodada={() => setShowBancada(true)}
-              onDispensarRodada={() => setRodadaOculta(true)}
+              onAbrirRodada={aoAbrirBancada}
+              onDispensarRodada={aoDispensarRodada}
             />
           ) : capabilities.length > 0 ? (
             <CapabilityCards
@@ -1068,8 +1481,8 @@ export default function App() {
             connectors={connectors}
             connected={connected}
             busy={busy}
-            onToggle={(id) => void toggleConnector(id)}
-            onAdd={() => setShowServers(true)}
+            onToggle={aoToggle}
+            onAdd={aoAbrirServidores}
           />
         )}
 
@@ -1096,7 +1509,7 @@ export default function App() {
                 <button
                   type="button"
                   className="icon-only"
-                  onClick={() => setError(null)}
+                  onClick={aoDispensarErro}
                   aria-label={t("geral.dispensar")}
                 >
                   <Icon name="cross" />
@@ -1185,7 +1598,16 @@ export default function App() {
               />
             )}
 
-            {showBancos && <BancosDialog onClose={() => setShowBancos(false)} />}
+            {showBancos && (
+              <BancosDialog
+                onClose={() => {
+                  setShowBancos(false);
+                  // A folha é o único lugar onde o cadastro muda; fechar é o
+                  // momento em que o `@` precisa saber o que existe agora.
+                  void atualizarBancos();
+                }}
+              />
+            )}
 
             {showVoz && (
               <VozDialog

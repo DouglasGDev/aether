@@ -30,12 +30,16 @@ export interface Mãos {
   grafico: () => void;
   rodarBancada: () => void;
   pararBancada: () => void;
+  /// O atalho age: é o turno de dobra que o núcleo já faz sozinho quando a
+  /// janela aperta, adiantado para a hora em que a pessoa quiser.
+  compactar: () => void;
 }
 
 export function listaDeAtalhos(maos: Mãos): Atalho[] {
   return [
     { nome: "bancada", chave: "bancada.rodar", icon: "bancada", onDisparar: maos.rodarBancada },
     { nome: "parar", chave: "bancada.cancelar", icon: "stop", onDisparar: maos.pararBancada },
+    { nome: "compactar", chave: "compactacao.atalho", icon: "camadas", onDisparar: maos.compactar },
     { nome: "modelos", chave: "modelos.titulo", icon: "cube", onDisparar: () => maos.abrir("modelos") },
     { nome: "bancos", chave: "bancos.titulo", icon: "banco", onDisparar: () => maos.abrir("bancos") },
     { nome: "memoria", chave: "memoria.titulo", icon: "memoria", onDisparar: () => maos.abrir("memoria") },

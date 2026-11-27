@@ -1,3 +1,5 @@
+import { memo } from "react";
+
 export type CorePhase =
   | "dormant"
   | "ready"
@@ -10,7 +12,7 @@ interface Props {
   phase: CorePhase;
 }
 
-export function Core({ phase }: Props) {
+export const Core = memo(function Core({ phase }: Props) {
   return (
     <div className={`core core-${phase}`} aria-hidden="true">
       <svg viewBox="0 0 200 200" className="core-svg">
@@ -23,4 +25,4 @@ export function Core({ phase }: Props) {
       </svg>
     </div>
   );
-}
+});

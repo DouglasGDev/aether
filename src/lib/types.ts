@@ -228,8 +228,10 @@ export type Alojamento =
 
 export interface Alojado {
   previsto: Alojamento;
-  /// Bytes de VRAM que sumiram do livre entre antes e depois da carga.
-  cedido: number;
+  /// Bytes de VRAM que sumiram do livre entre antes e depois da carga. `null` é
+  /// a carga que não pousou em placa nenhuma — o degrau de CPU, ou a sonda de
+  /// depois que não respondeu — e nunca um zero lido.
+  cedido: number | null;
 }
 
 /// O despacho de um carregamento: o `n_gpu_layers` entregue à biblioteca, a
@@ -250,12 +252,18 @@ export interface Acelerador {
   dispositivo: string;
   /** Por que a placa não serviu, quando ela não serviu. */
   motivo: string | null;
-  /** Onde os bytes ficaram; `null` só na CPU, onde não há placa. */
+  /**
+   * Onde os bytes ficaram: na placa que serviu ou, no degrau sem placa, o
+   * `soSistema` com os bytes que pousaram na RAM. `null` é a carga sem ficha —
+   * sem cabeçalho GGUF lido não há conta de alojamento a mostrar.
+   */
   alojado: Alojado | null;
   /**
-   * A maior janela de potência de dois em que o modelo ainda iria inteiro para a
-   * placa, medida com a VRAM livre desta máquina. `null` é a CPU, ou o modelo
-   * que não cabe inteiro em janela nenhuma.
+   * A maior janela de potência de dois em que a carga inteira cabe na memória onde
+   * ela de fato pousa: VRAM livre medida na placa, RAM livre medida no degrau sem
+   * placa — o mesmo número, duas moedas, e `modelos`/`geracao` dizem qual. `null`
+   * é a memória que não segura nem os pesos, ou a sonda que não respondeu; nunca
+   * um zero.
    */
   janelaInteira: number | null;
 }
@@ -450,6 +458,7 @@ export interface Resumo {
 }
 
 export interface TurnOutcome {
+  turnId: number;
   text: string;
   thinking: string;
   rounds: number;
@@ -457,7 +466,26 @@ export interface TurnOutcome {
   resumo: Resumo | null;
 }
 
-export type ChatEvent =
+/// O que uma dobra pedida com `/compactar` fez. Os números são os do evento
+/// `resumo` — o mesmo que o turno emite quando a janela aperta — e `ordem` é
+/// quantas dobras esta conversa já tem no registro da `.aether`.
+export interface Compactacao {
+  turnId: number;
+  conversa: string;
+  texto: string;
+  lidas: number;
+  descartadas: number;
+  tokens: number;
+  ordem: number;
+}
+
+interface ChatEventIdentity {
+  turnId: number;
+  conversationId: string;
+}
+
+export type ChatEvent = ChatEventIdentity & (
+  | { type: "started" }
   | { type: "choice"; choice: Choice }
   | { type: "loading"; model: string }
   | { type: "thinking"; text: string }
@@ -500,7 +528,8 @@ export type ChatEvent =
       total: number;
       ms: number;
     }
-  | { type: "done"; text: string; rounds: number; medicao: Medicao };
+  | { type: "done"; text: string; rounds: number; medicao: Medicao }
+);
 
 export interface VistaEntrada {
   nome: string;

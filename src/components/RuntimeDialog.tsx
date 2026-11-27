@@ -9,6 +9,7 @@ import type {
   RuntimeVeredito,
 } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
+import { Esqueleto } from "./Esqueleto";
 import { Icon } from "./Icon";
 import { BarraDeTrabalho } from "./BarraDeTrabalho";
 
@@ -196,7 +197,10 @@ export function RuntimeDialog({ onClose, onChange }: Props) {
         </div>
 
         {!lido && erro === null && (
-          <p className="sheet-note">{t("geral.carregando")}</p>
+          <>
+            <Esqueleto linhas={5} />
+            <p className="sheet-note">{t("geral.carregando")}</p>
+          </>
         )}
 
         <ul className="runtime-lista">

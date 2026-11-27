@@ -5,6 +5,7 @@ import { useIdioma, useT, type Traduzir } from "../lib/i18n";
 import { useJobs, type Job } from "../lib/jobs";
 import type { Acelerador, Alojado, ModelEvent, ModelStatus } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
+import { Esqueleto } from "./Esqueleto";
 import { Icon } from "./Icon";
 import { BarraDeTrabalho } from "./BarraDeTrabalho";
 
@@ -20,15 +21,19 @@ type Fase = "preparando" | "pesos" | "apoio";
 /// Onde os bytes ficaram, nas palavras do dono da máquina. O texto é a previsão
 /// feita com o cabeçalho do GGUF antes da carga — a mesma formulação da tela de
 /// memória; o título é a VRAM que a carga de fato levou, medida nos dois lados
-/// do `llama_load_model_from_file`.
+/// do `llama_load_model_from_file`. No degrau sem placa não há este segundo
+/// lado, e o chip fica sem título em vez de mentir um zero.
 function alojamento(
   alojado: Alojado,
   traduzir: Traduzir,
   idioma: string,
-): { texto: string; medida: string } {
+): { texto: string; medida?: string } {
   return {
     texto: previsao(alojado.previsto, traduzir, idioma),
-    medida: traduzir("modelos.vramCedida", { cedido: bytes(alojado.cedido, idioma) }),
+    medida:
+      alojado.cedido === null
+        ? undefined
+        : traduzir("modelos.vramCedida", { cedido: bytes(alojado.cedido, idioma) }),
   };
 }
 
@@ -371,7 +376,10 @@ export function ModelManager({ onClose, onLoaded }: Props) {
                 );
               })}
               {!lido && error === null && (
-                <p className="sheet-note">{t("geral.carregando")}</p>
+                <>
+                  <Esqueleto />
+                  <p className="sheet-note">{t("geral.carregando")}</p>
+                </>
               )}
               {lido && families.length === 0 && (
                 <p className="sheet-note">{t("modelos.nadaEncontrado")}</p>
@@ -382,7 +390,10 @@ export function ModelManager({ onClose, onLoaded }: Props) {
           <div className="model-variants">
             {mine.map(row)}
             {!lido && error === null && (
-              <p className="sheet-note">{t("geral.carregando")}</p>
+              <>
+                <Esqueleto />
+                <p className="sheet-note">{t("geral.carregando")}</p>
+              </>
             )}
             {lido && mine.length === 0 && (
               <p className="sheet-note">{t("modelos.nenhumDisco")}</p>

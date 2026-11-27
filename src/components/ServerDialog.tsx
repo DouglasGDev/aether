@@ -28,7 +28,7 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
   useFecharComEscape(onClose);
   const t = useT();
   const { id: idioma } = useIdioma();
-  const [catalogo, setCatalogo] = useState<ServidorCatalogo[]>([]);
+  const [catalogo, setCatalogo] = useState<ServidorCatalogo[] | null>(null);
   const [obras, setObras] = useState<Record<string, Obra>>({});
   const [falhas, setFalhas] = useState<Record<string, string>>({});
   const [erro, setErro] = useState<string | null>(null);
@@ -176,7 +176,9 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
   // O conector embutido não é um servidor que o usuário cadastrou, e os do
   // catálogo já têm linha própria: aqui sobram só os cadastrados à mão.
   const ids = new Set(
-    catalogo.filter((servidor) => servidor.cadastrado).map((servidor) => servidor.id),
+    (catalogo ?? [])
+      .filter((servidor) => servidor.cadastrado)
+      .map((servidor) => servidor.id),
   );
   const manuais = connectors.filter(
     (connector) => connector.kind !== "builtin" && !ids.has(connector.id),
@@ -199,7 +201,15 @@ export function ServerDialog({ connectors, onRemove, onSaved, onClose }: Props) 
 
         <p className="sheet-sep">{t("servidores.catalogo")}</p>
         <ul className="server-rows">
-          {catalogo.map((servidor) => {
+          {catalogo === null && (
+            /* `<ul>` só aceita `<li>`: aqui o esqueleto é um item, não a janela. */
+            <li className="skeleton" aria-hidden="true">
+              <span className="skeleton-row" />
+              <span className="skeleton-row" />
+              <span className="skeleton-row" />
+            </li>
+          )}
+          {catalogo?.map((servidor) => {
             const obra = obras[servidor.id];
             const falha = falhas[servidor.id];
             const atualizada = servidor.instalada === servidor.versao;

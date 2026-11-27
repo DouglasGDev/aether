@@ -5,6 +5,7 @@ import { useIdioma, useT } from "../lib/i18n";
 import type { AjustesGeracao, AiStatus, ModelStatus } from "../lib/types";
 import { useFecharComEscape } from "../lib/teclado";
 import { Regua } from "./BarraDeTrabalho";
+import { Esqueleto } from "./Esqueleto";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -71,9 +72,20 @@ function degraus(teto: number): number[] {
 /// de um modelo não vale para o outro. Um acelerador ausente não é uma medição
 /// nova — é o modelo fora da memória, que é exatamente o estado de quem acabou de
 /// aplicar a janela e espera a próxima carga.
-function inteiraMedida(status: AiStatus): { modelo: string; tokens: number } | null {
-  const tokens = status.acelerador?.janelaInteira ?? null;
-  return tokens === null ? null : { modelo: status.ajustes.modelo, tokens };
+///
+/// O `tipo` viaja junto porque a mesma grandeza tem duas moedas: na placa o teto
+/// é VRAM e, no degrau sem placa, é a RAM do sistema. A frase que oferece o
+/// número tem de dizer qual das duas a pessoa está aceitando.
+function inteiraMedida(
+  status: AiStatus,
+): { modelo: string; tokens: number; tipo: "gpu" | "cpu" } | null {
+  const acelerador = status.acelerador;
+  if (!acelerador || acelerador.janelaInteira === null) return null;
+  return {
+    modelo: status.ajustes.modelo,
+    tokens: acelerador.janelaInteira,
+    tipo: acelerador.tipo,
+  };
 }
 
 export function GeracaoDialog({ onClose, onChange }: Props) {
@@ -83,12 +95,14 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
   const [ajustes, setAjustes] = useState<AjustesGeracao | null>(null);
   const [modelos, setModelos] = useState<ModelStatus[]>([]);
   const [janela, setJanela] = useState<number | null>(null);
-  /// A maior janela que a placa em uso ainda leva inteira, medida na última carga
-  /// deste modelo. É número do motor, não da escala: mudar o cursor não muda a
-  /// placa.
-  const [inteira, setInteira] = useState<{ modelo: string; tokens: number } | null>(
-    null,
-  );
+  /// A maior janela que a memória em uso ainda leva inteira, medida na última
+  /// carga deste modelo. É número do motor, não da escala: mudar o cursor não
+  /// muda a placa — nem a RAM, no degrau onde não há placa.
+  const [inteira, setInteira] = useState<{
+    modelo: string;
+    tokens: number;
+    tipo: "gpu" | "cpu";
+  } | null>(null);
   const [ocupada, setOcupada] = useState(false);
   const [erro, setErro] = useState<string | null>(null);
 
@@ -167,7 +181,10 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
               {erro}
             </p>
           ) : (
-            <p className="sheet-note">{t("geral.carregando")}</p>
+            <>
+              <Esqueleto />
+              <p className="sheet-note">{t("geral.carregando")}</p>
+            </>
           )}
         </div>
       </div>
@@ -200,6 +217,9 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
   /// Só o que foi medido para o modelo que está selecionado agora.
   const inteiraDoModelo =
     inteira !== null && inteira.modelo === ajustes.modelo ? inteira.tokens : null;
+  /// O mesmo teto dito na moeda que o produziu: VRAM na placa, RAM no degrau onde
+  /// não há placa. A frase não pode prometer "na placa" a uma máquina sem placa.
+  const inteiraNoSistema = inteira?.tipo === "cpu";
 
   const campo = (escala: Escala) => (
     <Regua
@@ -272,17 +292,28 @@ export function GeracaoDialog({ onClose, onChange }: Props) {
               {inteiraDoModelo !== null && (
                 <>
                   <span className="geracao-chip">
-                    {t("geracao.janelaInteira", {
-                      n: numero(inteiraDoModelo, idioma, 0),
-                    })}
+                    {t(
+                      inteiraNoSistema
+                        ? "geracao.janelaInteiraSistema"
+                        : "geracao.janelaInteira",
+                      { n: numero(inteiraDoModelo, idioma, 0) },
+                    )}
                   </span>
                   <button
                     type="button"
                     className="icon-only"
                     disabled={ocupada || inteiraDoModelo === ajustes.contexto}
                     onClick={() => void gravar({ ...ajustes, contexto: inteiraDoModelo })}
-                    aria-label={t("geracao.janelaInteiraUsar")}
-                    title={t("geracao.janelaInteiraUsar")}
+                    aria-label={t(
+                      inteiraNoSistema
+                        ? "geracao.janelaInteiraUsarSistema"
+                        : "geracao.janelaInteiraUsar",
+                    )}
+                    title={t(
+                      inteiraNoSistema
+                        ? "geracao.janelaInteiraUsarSistema"
+                        : "geracao.janelaInteiraUsar",
+                    )}
                   >
                     <Icon name="arrow" />
                   </button>

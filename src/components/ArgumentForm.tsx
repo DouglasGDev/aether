@@ -49,17 +49,11 @@ export function ArgumentForm({ tool, busy, onCancel, onRun }: Props) {
   );
   const [missing, setMissing] = useState<string[]>([]);
   const [invalidos, setInvalidos] = useState<Record<string, string>>({});
-  const [ferramenta, setFerramenta] = useState(tool.name);
 
-  // O cartão é o mesmo formulário trocando de ferramenta: os valores nascem uma
-  // vez no estado, e sem este reset a segunda ferramenta receberia os argumentos
-  // da primeira — um caminho de arquivo onde devia ir um termo de busca.
-  if (ferramenta !== tool.name) {
-    setFerramenta(tool.name);
-    setValues(valoresIniciais(keys, properties));
-    setMissing([]);
-    setInvalidos({});
-  }
+  // O cartão é o mesmo formulário trocando de ferramenta, e quem troca é o
+  // `key={chosen.qualifiedName}` do chamador (`App.tsx:1424`): a montagem nova já
+  // traz os valores vazios, então o segundo argumento nunca recebe o caminho de
+  // arquivo do primeiro.
 
   function set(key: string, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
