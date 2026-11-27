@@ -308,11 +308,20 @@ fn colunas(config: &Config, args: &Map<String, Value>) -> Result<local::Saida> {
         .iter()
         .map(|(nome, tipo)| ColunaCartao { nome: nome.clone(), tipo: tipo.clone() })
         .collect();
-    let texto = lista
+    let mut texto = lista
         .iter()
         .map(|(nome, tipo)| format!("{nome} ({tipo})"))
         .collect::<Vec<_>>()
         .join(", ");
+    texto.push_str("\n\n");
+    texto.push_str(&tr(
+        "bancos.orientacaoColunas",
+        &[("tipo", conexao.tipo.rotulo())],
+    ));
+    if conexao.tipo == Tipo::Mongo {
+        texto.push(' ');
+        texto.push_str(&tr("bancos.colunasAmostraMongo", &[]));
+    }
     Ok(local::Saida::nova(
         texto,
         Vista::BancoEsquema { conexao: conexao.nome, fonte, colunas: cartoes },
@@ -341,6 +350,31 @@ fn colunas_pedidas(args: &Map<String, Value>) -> Result<Vec<String>> {
         }
         _ => bail!(tr("erros.argumentosInvalidos", &[])),
     }
+}
+
+/// `ordem` é um nome de coluna, com uma direção separada ou o sufixo legado
+/// `ASC`/`DESC`. O texto chega cru ao motor: só ele, com o schema já carregado,
+/// pode saber se o sufixo é direção ou parte de um nome literal. Tipo errado ou
+/// texto vazio é erro, não ordem ausente.
+fn ordem_pedida(args: &Map<String, Value>) -> Result<Option<(String, bool)>> {
+    let ordem_desc = match args.get("ordemDesc") {
+        None => false,
+        Some(Value::Bool(desc)) => *desc,
+        _ => bail!(tr("erros.bancoOrdemInvalida", &[])),
+    };
+    let Some(valor) = args.get("ordem") else {
+        return Ok(None);
+    };
+    if valor.is_null() {
+        return Ok(None);
+    }
+    let Value::String(texto) = valor else {
+        bail!(tr("erros.bancoOrdemInvalida", &[]));
+    };
+    if texto.trim().is_empty() {
+        bail!(tr("erros.bancoOrdemInvalida", &[]));
+    }
+    Ok(Some((texto.trim().to_string(), ordem_desc)))
 }
 
 /// A grelha serializada por referência: `json!` copiava cada `Vec<Value>` da
@@ -383,12 +417,18 @@ fn consultar(config: &Config, args: &Map<String, Value>) -> Result<local::Saida>
     let fonte = fonte_pedida(&conexao, args, Operacao::Ler)?;
     let filtro = motor::filtro_de(args.get("filtro"))?;
     let pedidas = colunas_pedidas(args)?;
-    let ordem_coluna = local::texto(args, "ordem");
-    let ordem =
-        ordem_coluna.as_deref().map(|c| (c, local::booleano(args, "ordemDesc", false)));
+    let ordem = ordem_pedida(args)?;
     let limite = teto_da_consulta(&conexao, args);
     let mut motor = motor::abrir_para(&conexao, Operacao::Ler)?;
-    let consulta = motor.consultar(&fonte, &pedidas, &filtro, ordem, limite)?;
+    let consulta = motor.consultar(
+        &fonte,
+        &pedidas,
+        &filtro,
+        ordem
+            .as_ref()
+            .map(|(coluna, desc)| (coluna.as_str(), *desc)),
+        limite,
+    )?;
     Ok(local::Saida::nova(
         texto_da_consulta(&consulta),
         vista_da_consulta(&conexao.nome, &fonte, consulta),
@@ -593,6 +633,46 @@ mod tests {
         Bancada { raiz, config_path }
     }
 
+    /// Uma tabela real com valores distintos para provar a direção da ordem.
+    /// Fica fora da bancada de `clientes` para não mudar as saídas existentes.
+    fn bancada_vendas() -> Bancada {
+        let b = bancada();
+        let sqlite = rusqlite::Connection::open(&b.raiz.join("estoque.db")).expect("abre o sqlite");
+        sqlite
+            .execute_batch(
+                "CREATE TABLE vendas (id INTEGER PRIMARY KEY, qt_venda INTEGER NOT NULL);
+                 INSERT INTO vendas (qt_venda) VALUES (10), (30), (20);",
+            )
+            .expect("cria a tabela de vendas");
+        drop(sqlite);
+        let mut config = Config::load(&b.config_path).expect("carrega");
+        config.conexoes[0]
+            .fontes
+            .insert("vendas".into(), Fonte::default());
+        config.save(&b.config_path).expect("salva o cadastro");
+        b
+    }
+
+    /// As duas colunas diferem só pelo sufixo. Os valores são incompatíveis de
+    /// propósito: ordenar pela coluna errada não produz o mesmo primeiro registro.
+    fn bancada_ordem_literal() -> Bancada {
+        let b = bancada();
+        let sqlite = rusqlite::Connection::open(&b.raiz.join("estoque.db")).expect("abre o sqlite");
+        sqlite
+            .execute_batch(
+                "CREATE TABLE ordens (id INTEGER PRIMARY KEY, status INTEGER NOT NULL, \"status DESC\" INTEGER NOT NULL);
+                 INSERT INTO ordens (status, \"status DESC\") VALUES (1, 30), (2, 10), (3, 20);",
+            )
+            .expect("cria colunas com e sem sufixo");
+        drop(sqlite);
+        let mut config = Config::load(&b.config_path).expect("carrega");
+        config.conexoes[0]
+            .fontes
+            .insert("ordens".into(), Fonte::default());
+        config.save(&b.config_path).expect("salva o cadastro");
+        b
+    }
+
     #[test]
     fn o_catalogo_e_o_nome_estatico_dizem_a_mesma_coisa() {
         let ferramentas = catalogo();
@@ -616,6 +696,26 @@ mod tests {
             assert!(!ferramenta.descricao.is_empty(), "{}", ferramenta.nome);
             assert!(!ferramenta.descricao.starts_with("ferramentas."), "{}", ferramenta.nome);
         }
+    }
+
+    #[test]
+    fn as_descricoes_de_ordem_explicam_as_duas_formas_sem_prometer_sql() {
+        let ferramenta = catalogo()
+            .into_iter()
+            .find(|f| f.nome == "bancos_consultar")
+            .expect("consulta no catálogo");
+        let propriedades = &ferramenta.esquema["properties"];
+        let ordem = propriedades["ordem"]["description"].as_str().unwrap();
+        let desc = propriedades["ordemDesc"]["description"].as_str().unwrap();
+        for trecho in [
+            "qt_venda DESC",
+            "qt_venda ASC",
+            "ordemDesc",
+            "uma única coluna",
+        ] {
+            assert!(ordem.contains(trecho), "{ordem}");
+        }
+        assert!(desc.contains("ASC") && desc.contains("DESC"), "{desc}");
     }
 
     #[test]
@@ -646,6 +746,255 @@ mod tests {
         assert_eq!(json["linhas"][1][1], "Bruno");
         assert_eq!(json["truncado"], false);
         assert!(saida.texto.contains("Bruno"), "{}", saida.texto);
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn ordem_com_sufixo_desc_ordena_de_verdade() {
+        let b = bancada_vendas();
+        let saida = executar(
+            "bancos_consultar",
+            json!({ "conexao": "Estoque", "fonte": "vendas", "ordem": "qt_venda DESC" }),
+            &b.config_path,
+        )
+        .expect("ordem descendente legada");
+        assert_eq!(saida.vista.para_json()["linhas"][0][1], 30);
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn ordem_com_sufixo_asc_ordena_de_verdade() {
+        let b = bancada_vendas();
+        let saida = executar(
+            "bancos_consultar",
+            json!({ "conexao": "Estoque", "fonte": "vendas", "ordem": "qt_venda ASC" }),
+            &b.config_path,
+        )
+        .expect("ordem crescente legada");
+        assert_eq!(saida.vista.para_json()["linhas"][0][1], 10);
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn sufixo_de_ordem_aceita_minusculas_e_caixa_da_coluna() {
+        let b = bancada_vendas();
+        for (ordem, esperado) in [("qt_venda desc", 30), ("QT_VENDA asc", 10)] {
+            let saida = executar(
+                "bancos_consultar",
+                json!({ "conexao": "Estoque", "fonte": "vendas", "ordem": ordem }),
+                &b.config_path,
+            )
+            .expect("sufixo sem diferenciar caixa");
+            assert_eq!(saida.vista.para_json()["linhas"][0][1], esperado, "{ordem}");
+        }
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn coluna_valida_com_ordem_desc_continua_funcionando() {
+        let b = bancada_vendas();
+        for (desc, esperado) in [(true, 30), (false, 10)] {
+            let saida = executar(
+                "bancos_consultar",
+                json!({
+                    "conexao": "Estoque",
+                    "fonte": "vendas",
+                    "ordem": "qt_venda",
+                    "ordemDesc": desc,
+                }),
+                &b.config_path,
+            )
+            .expect("nome de coluna com direção separada");
+            assert_eq!(saida.vista.para_json()["linhas"][0][1], esperado);
+        }
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn sufixo_explicito_prevalece_sobre_ordem_desc() {
+        let b = bancada_vendas();
+        for (ordem, desc, esperado) in [("qt_venda ASC", true, 10), ("qt_venda DESC", false, 30)] {
+            let saida = executar(
+                "bancos_consultar",
+                json!({
+                    "conexao": "Estoque",
+                    "fonte": "vendas",
+                    "ordem": ordem,
+                    "ordemDesc": desc,
+                }),
+                &b.config_path,
+            )
+            .expect("direção explícita no argumento legado");
+            assert_eq!(saida.vista.para_json()["linhas"][0][1], esperado, "{ordem}");
+        }
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn coluna_literal_com_sufixo_usa_o_schema_sem_viagem_extra() {
+        let b = bancada_ordem_literal();
+        for (ordem, desc, primeiro_id) in [
+            ("status DESC", false, 2),
+            ("status DESC", true, 1),
+            ("status", false, 1),
+            ("status", true, 3),
+        ] {
+            crate::bancos::motor::sqlite::leitura_zerada();
+            let saida = executar(
+                "bancos_consultar",
+                json!({
+                    "conexao": "Estoque",
+                    "fonte": "ordens",
+                    "ordem": ordem,
+                    "ordemDesc": desc,
+                }),
+                &b.config_path,
+            )
+            .expect("ordem sobre coluna literal e direção separada");
+            assert_eq!(saida.vista.para_json()["linhas"][0][0], primeiro_id, "{ordem}");
+            assert_eq!(
+                crate::bancos::motor::sqlite::comandos_contados(),
+                2,
+                "schema e dado continuam sendo as duas únicas viagens"
+            );
+        }
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn ordem_desc_aceita_so_booleano_e_o_texto_chega_cru_ao_motor() {
+        for valor in [json!("DESC"), json!("true"), json!(1), json!({}), json!([]), json!(null)] {
+            let args = json!({ "ordem": "qt_venda", "ordemDesc": valor });
+            let erro = ordem_pedida(args.as_object().unwrap()).unwrap_err();
+            assert_eq!(erro.to_string(), tr("erros.bancoOrdemInvalida", &[]));
+        }
+        let args = json!({ "ordemDesc": 1 });
+        assert!(ordem_pedida(args.as_object().unwrap()).is_err());
+
+        for (valor, esperado) in [(json!(true), true), (json!(false), false)] {
+            let args = json!({ "ordem": " status DESC ", "ordemDesc": valor });
+            assert_eq!(
+                ordem_pedida(args.as_object().unwrap()).unwrap(),
+                Some(("status DESC".to_string(), esperado)),
+                "o sufixo não pode ser decidido antes do schema"
+            );
+        }
+        let args = json!({ "ordem": "status DESC" });
+        assert_eq!(
+            ordem_pedida(args.as_object().unwrap()).unwrap(),
+            Some(("status DESC".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn ordem_invalida_ou_injetada_e_recusada_com_orientacao_util() {
+        let b = bancada_vendas();
+        for entrada in [
+            "ORDER BY qt_venda",
+            "qt_venda, id",
+            "qt_venda + 1",
+            "qt_venda DESC, id ASC",
+            "qt_venda; DROP TABLE vendas",
+            "qt_venda DESC; DROP TABLE vendas",
+            "qt_venda DESC NULLS LAST",
+            "nao_existe DESC",
+            "$where",
+        ] {
+            let erro = executar(
+                "bancos_consultar",
+                json!({ "conexao": "Estoque", "fonte": "vendas", "ordem": entrada }),
+                &b.config_path,
+            )
+            .expect_err("ordem inválida não chega ao banco");
+            let texto = erro.to_string();
+            for trecho in ["id", "qt_venda", "ordem", "ordemDesc", "bancos_colunas"] {
+                assert!(texto.contains(trecho), "{entrada}: {texto}");
+            }
+        }
+        let contagem = executar(
+            "bancos_contar",
+            json!({ "conexao": "Estoque", "fonte": "vendas" }),
+            &b.config_path,
+        )
+        .expect("a tabela continua íntegra");
+        assert_eq!(contagem.vista.para_json()["linhas"], 3);
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn ordem_com_tipo_invalido_ou_vazia_nao_e_ignorada() {
+        let b = bancada_vendas();
+        for entrada in [json!([]), json!({}), json!(""), json!(42)] {
+            let erro = executar(
+                "bancos_consultar",
+                json!({ "conexao": "Estoque", "fonte": "vendas", "ordem": entrada }),
+                &b.config_path,
+            )
+            .expect_err("ordem inválida não vira ausência silenciosa");
+            assert!(erro.to_string().contains("ordem"), "{erro}");
+        }
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    #[test]
+    fn ordem_normalizada_mantem_o_filtro_como_parametro() {
+        let b = bancada_vendas();
+        crate::bancos::motor::sqlite::leitura_zerada();
+        let saida = executar(
+            "bancos_consultar",
+            json!({
+                "conexao": "Estoque",
+                "fonte": "vendas",
+                "filtro": { "id": 2 },
+                "ordem": "qt_venda DESC",
+            }),
+            &b.config_path,
+        )
+        .expect("filtro e ordem na mesma leitura");
+        let json = saida.vista.para_json();
+        assert_eq!(json["linhas"][0][1], 30);
+        assert_eq!(json["total"], 1);
+        let textos = crate::bancos::motor::sqlite::comandos_lidos();
+        let select = &textos[1];
+        assert!(
+            select.contains("WHERE \"id\" = ? ORDER BY \"qt_venda\" DESC"),
+            "o valor não pode entrar no SQL: {select}"
+        );
+        assert!(
+            !select.contains("= 2"),
+            "o valor do filtro foi interpolado: {select}"
+        );
+        std::fs::remove_dir_all(&b.raiz).ok();
+    }
+
+    /// A forma documentada do filtro mantém a comparação no banco, o valor
+    /// ligado e a alça de leitura: nada de SQL interpolado nem escrita no arquivo.
+    #[test]
+    fn filtro_com_op_e_valor_compara_como_parametro_em_leitura() {
+        let b = bancada_vendas();
+        let antes = std::fs::read(&b.raiz.join("estoque.db")).expect("lê o arquivo");
+        crate::bancos::motor::sqlite::leitura_zerada();
+        let saida = executar(
+            "bancos_consultar",
+            json!({
+                "conexao": "Estoque",
+                "fonte": "vendas",
+                "filtro": { "qt_venda": { "op": "maior", "valor": 10 } },
+            }),
+            &b.config_path,
+        )
+        .expect("filtro documentado");
+        let json = saida.vista.para_json();
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["linhas"][0][1], 30);
+        assert_eq!(json["linhas"][1][1], 20);
+        let textos = crate::bancos::motor::sqlite::comandos_lidos();
+        let select = &textos[1];
+        assert!(select.contains("WHERE \"qt_venda\" > ?"), "{select}");
+        assert!(!select.contains("> 10"), "o valor foi interpolado: {select}");
+        assert_eq!(crate::bancos::motor::sqlite::comandos_contados(), 2);
+        let depois = std::fs::read(&b.raiz.join("estoque.db")).expect("relê o arquivo");
+        assert_eq!(antes, depois, "a consulta não pode escrever");
         std::fs::remove_dir_all(&b.raiz).ok();
     }
 
@@ -808,6 +1157,20 @@ mod tests {
         let json = saida.vista.para_json();
         assert_eq!(json["colunas"][0]["nome"], "id");
         assert_eq!(json["colunas"][1]["nome"], "nome");
+        for trecho in [
+            "sqlite",
+            "bancos_colunas",
+            "ordem",
+            "ordemDesc",
+            "ASC",
+            "DESC",
+        ] {
+            assert!(
+                saida.texto.contains(trecho),
+                "orientação ausente: {}",
+                saida.texto
+            );
+        }
         std::fs::remove_dir_all(&b.raiz).ok();
     }
 

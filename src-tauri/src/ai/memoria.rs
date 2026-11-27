@@ -79,6 +79,40 @@ const LIMITE_TRECHOS: usize = 12_000;
 /// janela fechada no meio não pode jogar o trabalho fora.
 const SALVAR_A_CADA: usize = 24;
 
+/// Abaixo disto o pré-filtro por cluster não paga a si mesmo: varrer trezentos
+/// vetores custa menos que contar o teto de sessenta centroides e, num índice
+/// deste tamanho, cada turno pode mudar a partição — mantê-la viva custaria mais
+/// que a busca que ela economizaria. O caminho exaustivo continua sendo o
+/// caminho de verdade, e é ele que responde aqui.
+const CLUSTER_MINIMO: usize = 512;
+/// Teto de centroides. `raiz(n)` dá ~110 para o índice cheio; o teto existe para
+/// um índice que um dia passe de `LIMITE_TRECHOS` não gastar mais medindo o mapa
+/// da casa do que medindo a casa inteira.
+const CLUSTER_MAXIMO: usize = 256;
+/// Iterações de Lloyd na construção. Não é convergência — é o ponto em que a
+/// partição de texto já separa o que separa, e cada iteração custa
+/// `amostra × k × dimensão` multiplicações na máquina do dono, que é também a que
+/// responde à pergunta.
+const CLUSTER_ITERACOES: usize = 6;
+/// Vetores que treinam os centroides. A amostra é colhida por passo fixo sobre o
+/// índice inteiro, nunca por sorteio: uma partição escolhida ao acaso mudaria
+/// quais baldes são sondados e, com eles, a resposta da mesma pergunta em duas
+/// execuções — o mesmo motivo que obriga o empate do BM25 a cair para o índice
+/// menor.
+const CLUSTER_AMOSTRA: usize = 1024;
+/// Folga do teto de um balde. O teto é uma desigualdade de Cauchy–Schwarz contada
+/// em `f32`, e arredondar a soma pode deixar o cosseno verdadeiro uma fração
+/// ínfima acima do valor calculado. Sem folga, um trecho sairia da lista por
+/// morar num balde cortado por um bit — que é a perda que não se aceita aqui.
+const CLUSTER_FOLGA: f32 = 1e-5;
+/// Consultas cujo vetor fica na memória entre um turno e outro. Uma consulta é
+/// um lote de ~380 tokens atravessando um codificador de seiscentos milhões de
+/// parâmetros; sessenta e quatro vetores de mil e vinte e quatro `f32` são
+/// duzentos e sessenta kilobytes. Cobrir uma conversa com rodadas de ferramenta
+/// não pede mais que isso, e guardar consultas de ontem seria memória parada
+/// sem pergunta nenhuma.
+const CACHE_CONSULTAS: usize = 64;
+
 /// Quantas conversas a memória cobre, contadas da mais recente para trás. É a
 /// janela: o histórico na tela guarda tudo, a memória lembra as últimas. Passou
 /// da janela, o trecho sai do índice — e voltar depois é só o varrer de novo.
@@ -100,6 +134,92 @@ pub const TOKENS_POR_TURNO: usize = 8_192;
 /// tela mostra nunca se pagaria.
 fn acabou_a_verba(gastos: usize, tokens: usize, orcamento: usize) -> bool {
     gastos > 0 && gastos + tokens > orcamento
+}
+
+/// O produto escalar das duas metades que a casa compara. Os dois lados entram
+/// normatizados — é o contrato de `Indice::normalizar` e do `Embutidor` — então o
+/// resultado é o próprio cosseno, na faixa de −1 a 1, e é a única operação que a
+/// conta de [`Contagem::trechos`] mede: é ela, e não a leitura dos vetores, que
+/// decide o tempo de uma consulta.
+///
+/// A soma em `f64` não é preciosismo: somar mil termos de `f32` acumula erro do
+/// tamanho da própria folga que autoriza parar um balde, e um teto furado por
+/// arredondamento é a lista respondendo diferente da varredura exaustiva.
+fn produto(a: &[f32], b: &[f32]) -> f32 {
+    let menor = a.len().min(b.len());
+    let mut soma = 0f64;
+    for i in 0..menor {
+        soma += a[i] as f64 * b[i] as f64;
+    }
+    soma as f32
+}
+
+/// O balde de um vetor: o centroide de maior cosseno, desempatando pelo de índice
+/// menor. Usado na construção do mapa e em cada anexação, e é o mesmo cálculo que
+/// a consulta faz sobre os centroides — por isso a partição e a busca nunca
+/// discordam sobre onde um vetor mora.
+fn melhor_centroide(centroide: &[f32], x: &[f32], quantos: usize, dimensao: usize) -> usize {
+    let mut melhor = 0usize;
+    let mut maior = f32::NEG_INFINITY;
+    for balde in 0..quantos {
+        let inicio = balde * dimensao;
+        let valor = produto(&centroide[inicio..inicio + dimensao], x);
+        if valor > maior {
+            maior = valor;
+            melhor = balde;
+        }
+    }
+    melhor
+}
+
+/// Euclides sobre `usize`, pelo único uso que a casa tem: escolher um passo de
+/// amostragem coprimo com o tamanho do índice.
+fn mdc(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let resto = a % b;
+        a = b;
+        b = resto;
+    }
+    a
+}
+
+/// O passo da amostra de k-means: o quociente que entrega `alvo` pontos, corrigido
+/// para o primeiro valor coprimo com `total`. Coprimo é o que faz a caminhada
+/// `k × passo (mod total)` percorrer o índice inteiro num ciclo só, em vez de ficar
+/// presa numa classe de resto — e é o resto que decide se um grupo inteiro do
+/// índice entra ou não no mapa. Com `total ≤ alvo` o quociente é 1 e a amostra é o
+/// índice todo, como sempre foi.
+fn passo_da_amostra(total: usize, alvo: usize) -> usize {
+    let mut passo = total.div_ceil(alvo).max(1);
+    while mdc(passo, total) != 1 {
+        passo += 1;
+    }
+    passo
+}
+
+/// Guarda os `necessario` maiores valores vistos, do maior para o menor. Mantém a
+/// lista ordenada na inserção em vez de reordenar no fim: é o que deixa o corte do
+/// laço de sondagem (`melhores[necessario - 1]`) pronto a cada medição, sem passada
+/// extra sobre o resultado. Só interessa o valor do último, não quais empates o
+/// compõem, então um valor igual ao último entra pela porta da frente: ele não
+/// mudaria o corte e custaria uma reordenação.
+fn oferecer(melhores: &mut Vec<f32>, necessario: usize, valor: f32) {
+    if melhores.len() < necessario {
+        let posicao = melhores
+            .iter()
+            .position(|atual| valor > *atual)
+            .unwrap_or(melhores.len());
+        melhores.insert(posicao, valor);
+        return;
+    }
+    if valor > melhores[necessario - 1] {
+        melhores[necessario - 1] = valor;
+        let mut posicao = necessario - 1;
+        while posicao > 0 && melhores[posicao] > melhores[posicao - 1] {
+            melhores.swap(posicao, posicao - 1);
+            posicao -= 1;
+        }
+    }
 }
 
 /// O que a varredura aceita como texto, por extensão conhecida. "Tenta ler e vê"
@@ -482,6 +602,60 @@ struct Meta {
     /// vazio — que é a verdade sobre uma base que ainda não foi escrita.
     documentos: BTreeMap<String, FichaDocumento>,
     trechos: Vec<Trecho>,
+    /// A partição IVF dos vetores, gravada junto com o índice. Índice escrito antes
+    /// disto existir não tem a chave: `None`, e a busca dele continua exaustiva —
+    /// ver [`Clusteres`] e o porquê de não reclusterizar dentro de um turno.
+    #[serde(default)]
+    clusteres: Option<Clusteres>,
+}
+
+/// O mapa da casa: `k` centroides e o balde de cada trecho. Existe para a busca não
+/// precisar multiplicar os doze mil vetores pela pergunta de cada turno quando
+/// oitocentos deles não têm chance nenhuma de entrar na lista.
+///
+/// A correção não é uma aposta. Cada balde guarda o teto do cosseno que qualquer
+/// vetor dele pode ter contra uma consulta `q` normalizada:
+///
+/// ```text
+/// ⟨q, x⟩ = ⟨q, c⟩ + ⟨q, x − c⟩ ≤ ‖c‖·⟨q, ĉ‖ + max‖x − c‖
+/// ```
+///
+/// que é Cauchy–Schwarz sobre a residual, com `‖q‖ = 1`. Sondando os baldes do teto
+/// maior para o menor e parando quando o teto cai abaixo do que ainda interessa, o
+/// que fica de fora é provado impossível, não improvável: a lista sai igual à da
+/// varredura inteira. Daí as três invariantes que os mutadores de `Indice` têm de
+/// manter — `balde` com um item por trecho, `raio[b]` nunca menor que a distância
+/// real dos vetores que entraram naquele balde, e `centroide` normalizado com
+/// `norma` guardando o tamanho da média crua.
+///
+/// Grava no JSON da metadata, e não num acréscimo binário ao fim do arquivo, por
+/// duas razões: o `meta` já é a maior parte do `indice.aether` (é ele que guarda o
+/// texto de doze mil peças), e um campo novo com `#[serde(default)]` é exatamente
+/// como `fonte`, `sobreposicao` e `truncada` entraram — um índice antigo continua
+/// abrindo com a assinatura de sempre, que é o contrato que `ASSINATURA` protege.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Clusteres {
+    /// Quantos centroides. Os três vetores por-balde abaixo têm este comprimento.
+    quantos: usize,
+    /// Largura dos vetores na hora em que o mapa foi contado. Mudou o codificador,
+    /// mudou a largura, e o mapa velho não vale para o novo espaço.
+    dimensao: usize,
+    /// Quantos trechos havia quando o mapa foi contado. É o que diz se o índice
+    /// desde então dobrou de tamanho — caso em que os baldes deixam de ser um mapa
+    /// e viram uma adivinhação, e `Indice::reagrupar` refaz.
+    trechos: usize,
+    /// `quantos × dimensao` floats, cada centroide normalizado. A normalização é do
+    /// mapa, não do espaço: a média de vetores unitários não é unitária, e é por
+    /// isso que `norma` existe ao lado.
+    centroide: Vec<f32>,
+    /// `‖c‖` de cada centroide cru.
+    norma: Vec<f32>,
+    /// O maior `‖x − c‖` do balde. Apertado a cada anexação e a cada gravação;
+    /// afrouxado por uma remoção, o que só custa sondar um balde a mais.
+    raio: Vec<f32>,
+    /// O balde de cada trecho, na ordem de `meta.trechos`.
+    balde: Vec<u32>,
 }
 
 /// Um trecho devolvido por proximidade, com a medida que o classificou.
@@ -531,6 +705,31 @@ pub struct Resposta {
     pub alcancados: usize,
     /// O modo que produziu esta lista, em palavra de máquina.
     pub modo: &'static str,
+}
+
+/// Quanto custou uma busca, em produtos escalares. Não é um número para a tela: é
+/// a medição que a casa faz de si mesma, e por isso não mora dentro de `Resposta`.
+/// Os dois consumidores do contrato — `commands.rs` e a ferramenta `buscar_memoria`
+/// — desmontam a resposta campo por campo, e um campo novo ali seria a API pública
+/// mudando por causa de uma contagem interna; o número é devolvido por
+/// [`Indice::buscar_contando`] ao lado da resposta, para quem mede.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Contagem {
+    /// Produtos escalares entre a consulta e um trecho do índice. É o que a
+    /// varredura exaustiva faz `n` vezes, `n` sendo o tamanho do índice, e o que a
+    /// partição tenta não fazer.
+    pub trechos: usize,
+    /// Produtos escalares entre a consulta e um centroide — o preço de consultar o
+    /// mapa antes dos vetores. Entra separado porque é outra largura de vetor e
+    /// porque somar as duas coisas esconderia qual das duas a partição cortou.
+    pub centroides: usize,
+}
+
+impl Contagem {
+    /// O total de produtos escalares da consulta, que é o número que se cita.
+    pub fn total(&self) -> usize {
+        self.trechos + self.centroides
+    }
 }
 
 /// O que uma busca precisa, lido do `rag.json` vivo. Agrupado porque as
@@ -652,6 +851,7 @@ impl Indice {
                 conversas: BTreeMap::new(),
                 documentos: BTreeMap::new(),
                 trechos: Vec::new(),
+                clusteres: None,
             },
             vetores: Vec::new(),
             lexico: OnceLock::new(),
@@ -698,6 +898,9 @@ impl Indice {
         // em vez de ficar prometendo um texto que não existe mais.
         self.meta.documentos.clear();
         self.vetores.clear();
+        // Escala nova, texto novo, vetor novo: o mapa de baldes contado sobre as
+        // peças antigas não diz nada sobre as que vão entrar.
+        self.meta.clusteres = None;
         true
     }
 
@@ -867,13 +1070,15 @@ impl Indice {
     ) {
         self.remover(Fonte::Documento, &nota.id);
         for (peca, vetor) in pecas {
-            self.meta.trechos.push(Trecho {
-                arquivo: nota.id.clone(),
-                linha: peca.linha,
-                texto: peca.texto.clone(),
-                fonte: Fonte::Documento,
-            });
-            self.vetores.extend_from_slice(vetor);
+            self.anexar(
+                Trecho {
+                    arquivo: nota.id.clone(),
+                    linha: peca.linha,
+                    texto: peca.texto.clone(),
+                    fonte: Fonte::Documento,
+                },
+                vetor,
+            );
         }
         self.meta.documentos.insert(
             nota.id.clone(),
@@ -896,6 +1101,13 @@ impl Indice {
     /// Zero peças quando a nota ainda não foi indexada: preso é o que o índice
     /// sabe, e um cartão inventado sobre uma nota que ninguém vetorou seria a
     /// tela prometendo memória que não existe.
+    ///
+    /// A primeira peça de cada nota é achada numa passada só sobre os trechos,
+    /// guardando `(linha, índice)` por nota. Varrer o índice dentro do laço das
+    /// notas presas custava `presas × 12.000` comparações em cada turno — doze
+    /// notas presas eram a busca inteira de volta, e de graça, sem nem medir um
+    /// vetor. O `min` mantém o primeiro de cada linha repetida, que é o que
+    /// `min_by_key` sobre a ordem de varredura devolvia.
     pub fn pecas_fixadas(&self) -> Vec<Achado> {
         let mut presas: Vec<(&String, &FichaDocumento)> = self
             .meta
@@ -903,22 +1115,32 @@ impl Indice {
             .iter()
             .filter(|(_, ficha)| ficha.fixada)
             .collect();
+        if presas.is_empty() {
+            return Vec::new();
+        }
+        let fixadas: BTreeSet<&str> = presas.iter().map(|(id, _)| id.as_str()).collect();
+        let mut primeira: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for (indice, trecho) in self.meta.trechos.iter().enumerate() {
+            if trecho.fonte != Fonte::Documento || !fixadas.contains(trecho.arquivo.as_str()) {
+                continue;
+            }
+            let entrada = primeira
+                .entry(trecho.arquivo.as_str())
+                .or_insert((trecho.linha, indice));
+            if trecho.linha < entrada.0 {
+                *entrada = (trecho.linha, indice);
+            }
+        }
         presas.sort_by(|a, b| b.1.atualizada.cmp(&a.1.atualizada).then(a.0.cmp(b.0)));
         presas
             .into_iter()
             .filter_map(|(id, ficha)| {
-                let (indice, _) = self
-                    .meta
-                    .trechos
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.fonte == Fonte::Documento && &t.arquivo == id)
-                    .min_by_key(|(_, t)| t.linha)?;
+                let (linha, indice) = *primeira.get(id.as_str())?;
                 let trecho = &self.meta.trechos[indice];
                 Some(Achado {
                     nome: ficha.titulo.clone(),
                     arquivo: id.clone(),
-                    linha: trecho.linha,
+                    linha,
                     texto: trecho.texto.clone(),
                     // Não medido: ninguém procurou este trecho, ele estava preso.
                     pontuacao: 0.0,
@@ -938,17 +1160,32 @@ impl Indice {
         let antes = self.meta.trechos.len();
         let mut novos_trechos: Vec<Trecho> = Vec::with_capacity(antes);
         let mut novos_vetores: Vec<f32> = Vec::with_capacity(self.vetores.len());
+        // O balde acompanha o trecho que sai. Deslocar o índice de todos os que
+        // ficam sem deslocar o mapa deixaria cada vetor apontando para o vizinho —
+        // e o pré-filtro cortaria baldes pelo mapa de uma casa que não existe mais.
+        let grupo = self.meta.clusteres.take().filter(|g| g.balde.len() == antes);
+        let mut novo_balde: Vec<u32> = Vec::with_capacity(grupo.as_ref().map_or(0, |g| g.balde.len()));
         let dimensao = self.meta.dimensao;
         for (indice, trecho) in self.meta.trechos.iter().enumerate() {
             if trecho.fonte != fonte || trecho.arquivo != chave {
                 novos_trechos.push(trecho.clone());
                 let inicio = indice * dimensao;
                 novos_vetores.extend_from_slice(&self.vetores[inicio..inicio + dimensao]);
+                if let Some(mapa) = &grupo {
+                    novo_balde.push(mapa.balde[indice]);
+                }
             }
         }
         let saíram = antes - novos_trechos.len();
         self.meta.trechos = novos_trechos;
         self.vetores = novos_vetores;
+        if let Some(mut mapa) = grupo {
+            // Os `raios` ficam como estavam: são o máximo sobre um conjunto que
+            // agora é menor, então continuam teto. O preço de não recontar é
+            // sondar um balde a mais numa busca, nunca um trecho a menos.
+            mapa.balde = novo_balde;
+            self.meta.clusteres = Some(mapa);
+        }
         saíram
     }
 
@@ -980,15 +1217,48 @@ impl Indice {
     /// Também privado: a mesma razão de `esta_visto`.
     fn adicionar(&mut self, arquivo: &str, assinatura: Assinatura, pecas: &[(Peca, Vec<f32>)]) {
         for (peca, vetor) in pecas {
-            self.meta.trechos.push(Trecho {
-                arquivo: arquivo.to_string(),
-                linha: peca.linha,
-                texto: peca.texto.clone(),
-                fonte: Fonte::Arquivo,
-            });
-            self.vetores.extend_from_slice(vetor);
+            self.anexar(
+                Trecho {
+                    arquivo: arquivo.to_string(),
+                    linha: peca.linha,
+                    texto: peca.texto.clone(),
+                    fonte: Fonte::Arquivo,
+                },
+                vetor,
+            );
         }
         self.meta.assinaturas.insert(arquivo.to_string(), assinatura);
+    }
+
+    /// A única porta por que um trecho entra no índice. Existe para a partição IVF
+    /// poder continuar verdadeira entre duas escritas: vetor novo sem balde é vetor
+    /// invisível para o pré-filtro, e um `raio` que não cobre o recém-chegado faria
+    /// a busca parar antes de achá-lo — que é perda de resposta, não de tempo.
+    /// Sem mapa contado (índice pequeno, recém-criado ou vindo de um arquivo de
+    /// antes disto), anexar é só anexar: quem conta o mapa é `reagrupar`, no fim do
+    /// trabalho de escrita, nunca dentro de um turno.
+    fn anexar(&mut self, trecho: Trecho, vetor: &[f32]) {
+        self.meta.trechos.push(trecho);
+        self.vetores.extend_from_slice(vetor);
+        let dimensao = self.meta.dimensao;
+        // Um mapa contado noutra largura não diz nada deste vetor, e um mapa
+        // parcial é pior que nenhum: o trecho ficaria num balde que não existe
+        // enquanto o teto dele continuasse prometendo cobri-lo. Ficar sem mapa é
+        // voltar à varredura inteira — lenta, mas nunca mentiu sobre a lista.
+        let Some(mut grupo) = self.meta.clusteres.take().filter(|g| g.dimensao == dimensao) else {
+            return;
+        };
+        let melhor = melhor_centroide(&grupo.centroide, vetor, grupo.quantos, dimensao);
+        // A distância ao centroide cru sai de ‖x − c‖² = 1 − 2·‖c‖·⟨x, ĉ⟩ + ‖c‖², com
+        // ‖x‖ = 1: é a mesma conta que o teto da busca lê, então o balde nunca é
+        // bordado por um número que a busca não usaria.
+        let inicio = melhor * dimensao;
+        let proje = produto(&grupo.centroide[inicio..inicio + dimensao], vetor);
+        let norma = grupo.norma[melhor];
+        let residual = (1.0 - 2.0 * norma * proje + norma * norma).max(0.0).sqrt();
+        grupo.balde.push(melhor as u32);
+        grupo.raio[melhor] = grupo.raio[melhor].max(residual + CLUSTER_FOLGA);
+        self.meta.clusteres = Some(grupo);
     }
 
     /// Troca a memória de uma conversa inteira: sai o texto lembrado, entra o de
@@ -1011,13 +1281,15 @@ impl Indice {
     ) {
         self.remover(Fonte::Conversa, &viva.id);
         for (peca, vetor) in pecas {
-            self.meta.trechos.push(Trecho {
-                arquivo: viva.id.clone(),
-                linha: peca.linha + viva.a_partir_de,
-                texto: peca.texto.clone(),
-                fonte: Fonte::Conversa,
-            });
-            self.vetores.extend_from_slice(vetor);
+            self.anexar(
+                Trecho {
+                    arquivo: viva.id.clone(),
+                    linha: peca.linha + viva.a_partir_de,
+                    texto: peca.texto.clone(),
+                    fonte: Fonte::Conversa,
+                },
+                vetor,
+            );
         }
         self.meta.conversas.insert(
             viva.id.clone(),
@@ -1047,6 +1319,364 @@ impl Indice {
         Ok(())
     }
 
+    /// A política de cada fonte resolvida uma única vez por consulta, num vetor de
+    /// booleanos. Antes era um fecho chamado dentro do laço dos vetores e outra vez
+    /// sobre a lista léxica: `concedida` compara caminho byte a byte, e chamá-la duas
+    /// vezes por trecho, em cada pergunta, custava mais que a parte da busca que o
+    /// pré-filtro veio tirar.
+    ///
+    /// Quem responde se um trecho pode ser devolvido é a fonte dele: o arquivo obedece
+    /// às pastas concedidas, a conversa obedece à lista de conversas e ao `ignorar`
+    /// do turno, e a nota obedece à lista de notas da pasta `base/`. Nenhuma das três
+    /// empresta política para as outras duas.
+    fn liberados(&self, busca: &Busca, raizes: &[PathBuf]) -> Vec<bool> {
+        self.meta
+            .trechos
+            .iter()
+            .map(|trecho| match trecho.fonte {
+                Fonte::Arquivo => concedida(&trecho.arquivo, raizes),
+                Fonte::Conversa => !busca.ignorar.iter().any(|id| *id == trecho.arquivo),
+                // A nota ainda existe? O `ignorar` do turno não passa por aqui:
+                // ele corta o que a conversa já tem no buffer, e uma nota curada
+                // não está em buffer nenhum.
+                Fonte::Documento => busca
+                    .documentos
+                    .iter()
+                    .any(|id| *id == trecho.arquivo),
+            })
+            .collect()
+    }
+
+    /// O cosseno de um trecho contra a consulta, com a medição contabilizada. Os dois
+    /// lados estão normatizados — é o contrato de `normalizar` — então o produto
+    /// escalar é a similaridade que o cartão mostra.
+    fn medir(&self, indice: usize, consulta: &[f32], conta: &mut Contagem) -> f32 {
+        conta.trechos += 1;
+        let inicio = indice * self.meta.dimensao;
+        produto(&self.vetores[inicio..inicio + self.meta.dimensao], consulta)
+    }
+
+    /// O mapa de baldes que vale para este índice, se vale. As condições são de
+    /// correção, não de gosto:
+    ///
+    /// * o índice tem [`CLUSTER_MINIMO`] trechos ou mais — abaixo disto varrer é mais
+    ///   barato que consultar o mapa, e é o caso em que a partição mudaria a cada
+    ///   turno;
+    /// * o mapa cobre um balde por trecho existente, na largura de hoje: vetor sem
+    ///   balde é vetor que o pré-filtro cortaria da lista;
+    /// * o tanto que a busca precisa de candidatos cabe no índice — pedir mais que
+    ///   existe é pedir a casa inteira, e aí o mapa não economiza nada.
+    ///
+    /// `None` não é falha nenhuma: é o índice gravado antes disto existir, e o caminho
+    /// dele continua sendo a varredura exaustiva. Escolhemos **não** reconstruir o
+    /// mapa dentro de `buscar` de propósito: k-means sobre doze mil vetores de mil
+    /// dimensões custa segundos, e segundos não cabem na resposta a um usuário — a
+    /// varredura e a sincronização é que chamam [`Indice::reagrupar`], no fim do
+    /// trabalho de escrita, onde o custo já é invisível. Um índice antigo responde
+    /// devagar; um turno travado reorganizando a casa é outra coisa.
+    fn particao(&self, necessario: usize) -> Option<&Clusteres> {
+        let mapa = self.meta.clusteres.as_ref()?;
+        let total = self.meta.trechos.len();
+        if necessario == 0
+            || total < CLUSTER_MINIMO
+            || necessario >= total
+            || mapa.dimensao != self.meta.dimensao
+            || mapa.quantos == 0
+            || mapa.balde.len() != total
+            || mapa.centroide.len() != mapa.quantos * mapa.dimensao
+            || mapa.norma.len() != mapa.quantos
+            || mapa.raio.len() != mapa.quantos
+        {
+            return None;
+        }
+        Some(mapa)
+    }
+
+    /// A varredura particionada: ordena os baldes pelo teto que a borda de cada um
+    /// dá, sonda do mais promissor para o menos e para quando o teto cai abaixo do
+    /// que ainda pode entrar na lista. Preenche `proximidade` e `medido` só do que
+    /// sondou — o resto do índice fica provadamente de fora.
+    fn sondar(
+        &self,
+        mapa: &Clusteres,
+        busca: &Busca,
+        liberado: &[bool],
+        necessario: usize,
+        proximidade: &mut [f32],
+        medido: &mut [bool],
+        conta: &mut Contagem,
+    ) {
+        let dimensao = self.meta.dimensao;
+        // O teto de um balde, para todo `x` dele: `⟨q,x⟩ ≤ ‖c‖·⟨q,ĉ⟩ + max‖x − c‖`.
+        // É Cauchy–Schwarz sobre a residual, com `‖q‖ = 1`, e é a única coisa que
+        // autoriza parar sem ter olhado: o balde que fica para trás não
+        // *provavelmente* não tem ninguém bom — ele não tem. `CLUSTER_FOLGA` cobre o
+        // arredondamento dos dois termos, que pode deixar o valor verdadeiro um ticho
+        // acima do teto contado.
+        let mut tetos: Vec<(f32, usize)> = Vec::with_capacity(mapa.quantos);
+        for balde in 0..mapa.quantos {
+            let inicio = balde * dimensao;
+            conta.centroides += 1;
+            let proje = produto(&mapa.centroide[inicio..inicio + dimensao], busca.vetor);
+            tetos.push((mapa.norma[balde] * proje + mapa.raio[balde] + CLUSTER_FOLGA, balde));
+        }
+        // Empate de teto cai para o balde menor, a mesma regra dos empates de
+        // colocação e de cosseno: uma busca que escolhe a ordem de duas coisas iguais
+        // pelo acaso não é reproduzível.
+        tetos.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        // Os membros de cada balde, numa passada só e já filtrada pela concessão. O
+        // balde entrega candidatos, nunca resposta: a permissão continua decidindo
+        // item a item, e um balde inteiro revogado sai da contagem sem deixar rastro
+        // na lista — o que ele continha estaria fora também na varredura exaustiva.
+        let mut membros: Vec<Vec<u32>> = vec![Vec::new(); mapa.quantos];
+        for (indice, &balde) in mapa.balde.iter().enumerate() {
+            let balde = balde as usize;
+            if balde < mapa.quantos && liberado[indice] {
+                membros[balde].push(indice as u32);
+            }
+        }
+
+        // Os `necessario` maiores cossenos medidos até aqui, do maior para o menor. O
+        // último deles é o chão abaixo do qual ninguém mais entra na lista, e é contra
+        // ele — e contra o piso — que o teto de cada balde é testado.
+        let mut melhores: Vec<f32> = Vec::with_capacity(necessario + 1);
+        for (teto, balde) in tetos {
+            let corte = if melhores.len() >= necessario {
+                busca.piso.max(melhores[necessario - 1])
+            } else {
+                busca.piso
+            };
+            if teto < corte {
+                // Os tetos vêm em ordem decrescente: nem este balde nem os que ficam
+                // depois têm como conter alguém da lista.
+                break;
+            }
+            for &indice in &membros[balde] {
+                let indice = indice as usize;
+                let similaridade = self.medir(indice, busca.vetor, conta);
+                proximidade[indice] = similaridade;
+                medido[indice] = true;
+                oferecer(&mut melhores, necessario, similaridade);
+            }
+        }
+    }
+
+    /// Conta o mapa de baldes do índice. É k-means com semente determinística, e é
+    /// caro: por isso só é chamado no fim de um trabalho de escrita, pela varredura,
+    /// pela sincronização da base ou por uma revogação — nunca dentro de um turno.
+    ///
+    /// Reaproveita o mapa que já existe enquanto ele ainda cobre metade do índice:
+    /// recontar as bordas custa uma passada sobre os vetores, recontar o mapa inteiro
+    /// custa sete. Deixar o mapa velho apodrecer e serrar a busca em baldes que já não
+    /// contêm o que dizem é o que perderia resposta, e é contra isso que as três
+    /// checagens de `particao` trabalham.
+    fn reagrupar(&mut self) {
+        let total = self.meta.trechos.len();
+        let dimensao = self.meta.dimensao;
+        if dimensao == 0 || total < CLUSTER_MINIMO {
+            // Índice pequeno: sem mapa, sem pré-filtro, varredura inteira. O custo de
+            // manter um mapa vivo num índice que muda a cada turno não se paga.
+            self.meta.clusteres = None;
+            return;
+        }
+        let cobrindo = self
+            .meta
+            .clusteres
+            .as_ref()
+            .is_some_and(|g| g.dimensao == dimensao && g.balde.len() == total && g.trechos * 2 >= total);
+        if cobrindo {
+            self.reapertar();
+            return;
+        }
+        let quantos = ((total as f64).sqrt() as usize)
+            .clamp(2, CLUSTER_MAXIMO)
+            .min(total - 1);
+        let fatia = |indice: usize| &self.vetores[indice * dimensao..indice * dimensao + dimensao];
+        // Amostra por passo fixo sobre o índice inteiro. Doze mil vetores treinando
+        // custariam mais que a busca que o mapa acelera, e o passo — em vez de um
+        // sorteio — é o que faz a mesma casa dar o mesmo mapa em duas execuções.
+        //
+        // O passo tem de ser coprimo com o tamanho, e isto não é preciosismo: as peças
+        // se repetem num período (peças por arquivo, arquivos por pasta), e um passo
+        // múltiplo dele amostra sempre a mesma posição dentro de cada repetição.
+        // Medido com o passo ingênuo sobre doze mil peças em doze grupos — o quociente
+        // caía em 12, exatamente o período — os 1.024 pontos saíam todos de um grupo
+        // só, os baldes ficavam misturados, o raio de cada um virava a casca do índice
+        // inteiro e a sondagem refezia 11.647 dos 12.000 produtos: mapa existindo e não
+        // cortando nada.
+        let passo = passo_da_amostra(total, CLUSTER_AMOSTRA);
+        let amostra: Vec<usize> = (0..CLUSTER_AMOSTRA.min(total))
+            .map(|k| (k * passo) % total)
+            .collect();
+
+        // Semente: o primeiro da amostra e, um a um, o ponto menos coberto pelos já
+        // escolhidos. É a boca larga do k-means++ sem dado nenhum.
+        let mut centroide: Vec<f32> = Vec::with_capacity(quantos * dimensao);
+        centroide.extend_from_slice(fatia(amostra[0]));
+        let mut usado = vec![false; amostra.len()];
+        usado[0] = true;
+        let mais_perto = |centroide: &[f32], escolhido: usize| {
+            let inicio = escolhido * dimensao;
+            amostra
+                .iter()
+                .map(|&indice| produto(&centroide[inicio..inicio + dimensao], fatia(indice)))
+                .collect::<Vec<f32>>()
+        };
+        let mut cobertura = mais_perto(&centroide, 0);
+        for escolhido in 1..quantos {
+            let novo = (0..amostra.len())
+                .filter(|&p| !usado[p])
+                .min_by(|a, b| cobertura[*a].total_cmp(&cobertura[*b]).then(a.cmp(b)))
+                .unwrap_or(0);
+            usado[novo] = true;
+            centroide.extend_from_slice(fatia(amostra[novo]));
+            let novo_proje = mais_perto(&centroide, escolhido);
+            for (posicao, atual) in cobertura.iter_mut().enumerate() {
+                *atual = atual.max(novo_proje[posicao]);
+            }
+        }
+
+        // Lloyd esférico: os vetores são unitários, então a partição por cosseno é a
+        // mesma partição por distância euclidiana até um fator constante, e a direção
+        // média é o centroide que o teto da busca consulta.
+        for _ in 0..CLUSTER_ITERACOES {
+            let mut soma = vec![0f32; quantos * dimensao];
+            let mut contagem = vec![0u32; quantos];
+            for &indice in &amostra {
+                let vetor = fatia(indice);
+                let melhor = melhor_centroide(&centroide, vetor, quantos, dimensao);
+                let inicio = melhor * dimensao;
+                for (acumulada, v) in soma[inicio..inicio + dimensao].iter_mut().zip(vetor) {
+                    *acumulada += *v;
+                }
+                contagem[melhor] += 1;
+            }
+            for balde in 0..quantos {
+                if contagem[balde] == 0 {
+                    // Balde que a amostra esvaziou mantém a direção: descartá-la aqui
+                    // abriria um buraco no mapa, e o mapa tem de continuar cobrindo o
+                    // índice inteiro.
+                    continue;
+                }
+                let inicio = balde * dimensao;
+                let quadrado: f32 = soma[inicio..inicio + dimensao].iter().map(|v| v * v).sum();
+                let tamanho = quadrado.sqrt();
+                if !(tamanho > 1e-9) {
+                    continue;
+                }
+                for v in soma[inicio..inicio + dimensao].iter_mut() {
+                    *v /= tamanho;
+                }
+                centroide[inicio..inicio + dimensao].copy_from_slice(&soma[inicio..inicio + dimensao]);
+            }
+        }
+
+        // Atribuição e bordas sobre o índice inteiro. É aqui que o mapa deixa de ser
+        // a amostra: a busca só tem direito de parar antes de um balde se a borda
+        // daquele balde for contada sobre os vetores que realmente estão nele.
+        let mut balde = vec![0u32; total];
+        let mut soma = vec![0f32; quantos * dimensao];
+        let mut contagem = vec![0u32; quantos];
+        for indice in 0..total {
+            let vetor = fatia(indice);
+            let melhor = melhor_centroide(&centroide, vetor, quantos, dimensao);
+            balde[indice] = melhor as u32;
+            let inicio = melhor * dimensao;
+            for (acumulada, v) in soma[inicio..inicio + dimensao].iter_mut().zip(vetor) {
+                *acumulada += *v;
+            }
+            contagem[melhor] += 1;
+        }
+        let mut norma = vec![0f32; quantos];
+        let mut raio = vec![CLUSTER_FOLGA; quantos];
+        for direcao in 0..quantos {
+            let inicio = direcao * dimensao;
+            if contagem[direcao] == 0 {
+                // Nenhum vetor nesta direção: o teto sai `CLUSTER_FOLGA`, o balde é
+                // sondado uma vez por consulta e não mede nada. Mais honesto que
+                // sumir do mapa e deixar o índice com um buraco.
+                centroide[inicio..inicio + dimensao].fill(0.0);
+                continue;
+            }
+            let cont = contagem[direcao] as f32;
+            let membros = &mut soma[inicio..inicio + dimensao];
+            let mut quadrado = 0f32;
+            for v in membros.iter_mut() {
+                *v /= cont;
+                quadrado += *v * *v;
+            }
+            let tamanho = quadrado.sqrt();
+            norma[direcao] = tamanho;
+            if tamanho > 1e-9 {
+                for posicao in 0..dimensao {
+                    centroide[inicio + posicao] = membros[posicao] / tamanho;
+                }
+            }
+        }
+        for (indice, &b) in balde.iter().enumerate() {
+            let b = b as usize;
+            if norma[b] <= 0.0 {
+                continue;
+            }
+            let inicio = b * dimensao;
+            // `‖x − c‖` lido de `⟨x, ĉ⟩` e `‖c‖`, sem montar o vetor da média outra
+            // vez: `‖x‖ = 1`, então sai da mesma identidade usada em `anexar`.
+            let proje = produto(&centroide[inicio..inicio + dimensao], fatia(indice));
+            let tamanho = norma[b];
+            let residual = (1.0 - 2.0 * tamanho * proje + tamanho * tamanho).max(0.0).sqrt();
+            if residual + CLUSTER_FOLGA > raio[b] {
+                raio[b] = residual + CLUSTER_FOLGA;
+            }
+        }
+        self.meta.clusteres = Some(Clusteres {
+            quantos,
+            dimensao,
+            trechos: total,
+            centroide,
+            norma,
+            raio,
+            balde,
+        });
+    }
+
+    /// Reconta as bordas do mapa sem tocar nas direções: uma passada sobre os
+    /// vetores, sem k-means nenhum. É o que aperta o teto de um balde depois das
+    /// remoções — que só afrouxam o raio gravado — e das anexações que o enlargaram,
+    /// e é por isso que a busca continua sondando baldes apertados em vez de uma
+    /// casca grossa que a levaria a medir o índice todo de novo.
+    fn reapertar(&mut self) {
+        let dimensao = self.meta.dimensao;
+        let total = self.meta.trechos.len();
+        let Some(mut mapa) = self
+            .meta
+            .clusteres
+            .take()
+            .filter(|g| g.dimensao == dimensao && g.balde.len() == total && g.quantos > 0)
+        else {
+            return;
+        };
+        let mut raio = vec![CLUSTER_FOLGA; mapa.quantos];
+        for (indice, &balde) in mapa.balde.iter().enumerate() {
+            let balde = balde as usize;
+            if balde >= mapa.quantos {
+                continue;
+            }
+            let inicio = balde * dimensao;
+            let proje = produto(
+                &mapa.centroide[inicio..inicio + dimensao],
+                &self.vetores[indice * dimensao..indice * dimensao + dimensao],
+            );
+            let tamanho = mapa.norma[balde];
+            let residual = (1.0 - 2.0 * tamanho * proje + tamanho * tamanho).max(0.0).sqrt();
+            if residual + CLUSTER_FOLGA > raio[balde] {
+                raio[balde] = residual + CLUSTER_FOLGA;
+            }
+        }
+        mapa.raio = raio;
+        self.meta.clusteres = Some(mapa);
+    }
+
     /// Os `k` melhores acima do `piso`, na ordem que o `modo` manda, e só do que
     /// ainda pode ser lembrado: os arquivos das pastas concedidas em `raizes`, as
     /// conversas que `ignorar` não corta e as notas que ainda estão em
@@ -1055,7 +1685,30 @@ impl Indice {
     /// O cosseno é sempre medido, mesmo em modo léxico: ele é o número do
     /// cartão, e um achado que chegou pela palavra continua tendo o vetor dele no
     /// índice. O que muda com o modo é a *ordem*, não a medida.
+    ///
+    /// Com um mapa de baldes gravado ([`Clusteres`]), a busca deixa de medir o índice
+    /// inteiro: sonda os baldes do teto mais promissor para o menor e para quando o
+    /// teto cai abaixo do que ainda pode entrar na lista. A lista sai igual à da
+    /// varredura completa — é o que a desigualdade de [`Clusteres`] garante, e o que
+    /// `o_particionamento_devolve_a_mesma_lista` cobra. O único número que o corte
+    /// muda é `alcancados`, que passa a contar o que a sondagem alcançou: ver
+    /// [`Indice::buscar_contando`].
     pub fn buscar(&self, busca: &Busca, raizes: &[PathBuf]) -> Result<Resposta> {
+        self.buscar_contando(busca, raizes).map(|(resposta, _)| resposta)
+    }
+
+    /// A mesma busca com a conta dos produtos escalares que ela fez. Existe porque
+    /// `Resposta` não tem onde pôr o número: os dois consumidores do contrato
+    /// (`commands.rs` e a ferramenta `buscar_memoria`) desmontam a struct campo por
+    /// campo, e um campo novo ali seria a API pública mudando por causa de uma
+    /// medição da casa. É por esta porta que se pode dizer quantos vetores uma
+    /// pergunta atravessa, e não por uma estimativa de comentário.
+    pub fn buscar_contando(
+        &self,
+        busca: &Busca,
+        raizes: &[PathBuf],
+    ) -> Result<(Resposta, Contagem)> {
+        let mut conta = Contagem::default();
         if busca.vetor.len() != self.meta.dimensao {
             // Só acontece com índice de outro codificador em memória, o que o
             // `Custodio` já recusa ao carregar. Preferimos o erro ao vizinho
@@ -1069,39 +1722,54 @@ impl Indice {
             ));
         }
         let lexico = matches!(busca.modo, Modo::Hibrido | Modo::Lexico);
-        // Quem responde se um trecho pode ser devolvido é a fonte dele: o arquivo
-        // obedece às pastas concedidas, a conversa obedece à lista de conversas e
-        // ao `ignorar` do turno, e a nota obedece à lista de notas da pasta
-        // `base/`. Nenhuma das três empresta política para as outras duas.
-        let pode = |indice: usize| -> bool {
-            let trecho = &self.meta.trechos[indice];
-            match trecho.fonte {
-                Fonte::Arquivo => concedida(&trecho.arquivo, raizes),
-                Fonte::Conversa => {
-                    !busca.ignorar.iter().any(|id| *id == trecho.arquivo)
-                }
-                // A nota ainda existe? O `ignorar` do turno não passa por aqui:
-                // ele corta o que a conversa já tem no buffer, e uma nota curada
-                // não está em buffer nenhum.
-                Fonte::Documento => busca
-                    .documentos
-                    .iter()
-                    .any(|id| *id == trecho.arquivo),
-            }
+        let total = self.meta.trechos.len();
+        let liberado = self.liberados(busca, raizes);
+        // Quantos candidatos a lista vetorial precisa ter para que a ordem final saia
+        // igual à da varredura inteira. No modo misto quem corta é `FUSAO_MAXIMA`,
+        // não o `k`: são as primeiras posições que `fundir` lê do vetor.
+        let necessario = match busca.modo {
+            // O léxico não ordena por vetor nenhum: o cartão mostra o cosseno de quem
+            // a palavra chamou, e medir os outros seria a casa inteira por meia dúzia
+            // de cartas.
+            Modo::Lexico => 0,
+            Modo::Vetorial => busca.k.max(1),
+            Modo::Hibrido => busca.k.max(FUSAO_MAXIMA),
         };
-        let mut proximidade = vec![0f32; self.meta.trechos.len()];
+        let mut proximidade = vec![0f32; total];
+        let mut medido = vec![false; total];
         let mut vetorial: Vec<usize> = Vec::new();
-        for indice in 0..self.meta.trechos.len() {
-            if !pode(indice) {
-                continue;
+        if necessario > 0 {
+            match self.particao(necessario) {
+                None => {
+                    for indice in 0..total {
+                        if !liberado[indice] {
+                            continue;
+                        }
+                        proximidade[indice] = self.medir(indice, busca.vetor, &mut conta);
+                        medido[indice] = true;
+                    }
+                }
+                Some(mapa) => self.sondar(
+                    mapa,
+                    busca,
+                    &liberado,
+                    necessario,
+                    &mut proximidade,
+                    &mut medido,
+                    &mut conta,
+                ),
             }
-            let inicio = indice * self.meta.dimensao;
-            let vetor = &self.vetores[inicio..inicio + self.meta.dimensao];
-            let similaridade: f32 = vetor.iter().zip(busca.vetor.iter()).map(|(a, b)| a * b).sum();
-            proximidade[indice] = similaridade;
-            if busca.modo != Modo::Lexico && similaridade >= busca.piso {
-                vetorial.push(indice);
-            }
+            // A lista nasce na ordem de `meta.trechos`, como no caminho exaustivo:
+            // quem resolve o empate de cosseno é o `sort_by` estável, jogando para o
+            // índice menor — e isso tem de valer igual dos dois lados da porta, ou a
+            // mesma pergunta daria duas respostas.
+            vetorial = (0..total)
+                .filter(|&indice| {
+                    liberado[indice]
+                        && medido[indice]
+                        && proximidade[indice] >= busca.piso
+                })
+                .collect();
         }
         // A posição na lista vetorial é o que a fusão lê, então ela é ordenada
         // em qualquer modo que use o vetor — não só no modo puramente vetorial.
@@ -1113,12 +1781,22 @@ impl Indice {
                 .lexico()
                 .pontuar(busca.texto)
                 .into_iter()
-                .filter(|(_, indice)| pode(*indice))
+                .filter(|(_, indice)| liberado[*indice])
                 .collect::<Vec<(f32, usize)>>();
             // Empate de BM25 vai para o índice menor: sem desempate fixo a mesma
             // pergunta daria listas diferentes, e nenhuma medição do cartão
             // seria comparável de uma execução para outra.
             marcados.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            // O cosseno do cartão é medido para quem ainda tem como chegar à ordem
+            // final — os que passam de `FUSAO_MAXIMA` não entram em lista que a
+            // fusão lê, e medir um vetor por palavra rara que ficou em centésimo
+            // seria a varredura inteira de volta para responder oito cartas.
+            for (_, indice) in marcados.iter().take(FUSAO_MAXIMA.max(busca.k)) {
+                if !medido[*indice] {
+                    proximidade[*indice] = self.medir(*indice, busca.vetor, &mut conta);
+                    medido[*indice] = true;
+                }
+            }
             marcados.into_iter().map(|(_, indice)| indice).collect()
         } else {
             Vec::new()
@@ -1151,7 +1829,14 @@ impl Indice {
                 Self::uniao(&vetorial, &por_palavra),
             ),
         };
-        Ok(Resposta {
+        // `alcancados` com o pré-filtro ativo é o que a sondagem alcançou, não o que
+        // a casa tem: quando ela para porque já tem o `necessario` melhor, pode
+        // existir um trecho acima do piso num balde não sondado. A pergunta que o
+        // número responde — "a lista parou porque acabou ou porque o `k` mandou?" —
+        // continua certa: ou a sondagem varreu os baldes todos até o piso (e o
+        // número é exato), ou ela parou com pelo menos `FUSAO_MAXIMA` na mão, e
+        // nesse caso havia mais do que os `k` pedidos por construção.
+        let resposta = Resposta {
             achados: ordenado
                 .into_iter()
                 .take(busca.k)
@@ -1196,7 +1881,8 @@ impl Indice {
                 .collect(),
             alcancados,
             modo: busca.modo.nome(),
-        })
+        };
+        Ok((resposta, conta))
     }
 
     /// Quantos trechos aparecem em alguma das duas listas. É o denominador do
@@ -1465,11 +2151,16 @@ fn leitura(indice: &Indice) -> Leitura {
 /// A cópia que entra no lugar de um índice gravado. O vocabulário léxico nunca
 /// é copiado de propósito: as peças novas valem do zero, e um cache que
 /// sobrevivesse a uma reescrita responderia por texto que não está mais lá.
-fn copiar(indice: &Indice) -> Indice {
-    Indice {
-        meta: indice.meta.clone(),
-        vetores: indice.vetores.clone(),
-        lexico: OnceLock::new(),
+/// `Arc::make_mut` usa esta cópia quando o snapshot anterior ainda está
+/// publicado ou segurado por outra referência; com exclusividade, o escritor
+/// muta a própria alocação.
+impl Clone for Indice {
+    fn clone(&self) -> Self {
+        Indice {
+            meta: self.meta.clone(),
+            vetores: self.vetores.clone(),
+            lexico: OnceLock::new(),
+        }
     }
 }
 
@@ -1838,6 +2529,65 @@ struct InfoMotor {
     despacho: Despacho,
 }
 
+/// O vetor de uma pergunta e tudo que decide esse vetor. Não é a pergunta sozinha:
+/// o mesmo texto embutido por outro modelo, com outro agrupamento, com outro corte
+/// de lote ou com outro prefixo de consulta é **outro vetor**, e devolver o primeiro
+/// seria a resposta procurando vizinhança num espaço que não é mais o da pergunta.
+/// Entram por isto as quatro coisas que o [`Carregado`] pode trocar por baixo de uma
+/// busca, mais o prefixo que é do modelo e não do texto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChaveConsulta {
+    modelo: String,
+    agrupamento: String,
+    dimensao: usize,
+    lote: usize,
+    prefixo: Option<&'static str>,
+    texto: String,
+}
+
+/// O LRU dos vetores de consulta. Uma lista ordenada, mais recente na frente: a
+/// casa tem no máximo [`CACHE_CONSULTAS`] vetores de fora, e procurar neles é varrer
+/// sessenta e quatro chaves — nada contra os milhões de multiplicar que uma consulta
+/// poupa. Um `HashMap` seria mais rápido e não serviria: sem ordem de uso não há LRU,
+/// e sem LRU o cache de uma conversa longa cresce até o teto de memória do processo.
+///
+/// A largura é [`CACHE_CONSULTAS`] — sessenta e quatro vetores, duzentos e
+/// cinquenta quilobytes no pior codificador daqui. É o que cabe um turno inteiro de
+/// reformulações, e é pequeno o bastante para nunca ser memória que alguém sinta.
+#[derive(Default)]
+struct CacheConsultas {
+    itens: Vec<(ChaveConsulta, Vec<f32>)>,
+}
+
+impl CacheConsultas {
+    /// Acha e, achando, põe na frente. O "põe na frente" é o LRU: uma consulta que
+    /// se repete nunca é a mais antiga da casa, e a que sai é a mais antiga.
+    fn consultar(&mut self, chave: &ChaveConsulta) -> Option<Vec<f32>> {
+        let posicao = self.itens.iter().position(|(k, _)| k == chave)?;
+        let item = self.itens.remove(posicao);
+        self.itens.insert(0, item);
+        Some(self.itens[0].1.clone())
+    }
+
+    fn inserir(&mut self, chave: ChaveConsulta, vetor: Vec<f32>) {
+        self.itens.retain(|(k, _)| k != &chave);
+        self.itens.insert(0, (chave, vetor));
+        self.itens.truncate(CACHE_CONSULTAS);
+    }
+
+    fn limpar(&mut self) {
+        self.itens.clear();
+    }
+
+    /// Derruba os vetores de um só codificador. [`Self::limpar`] serviria para o
+    /// pedido de soltar, mas a casa pode ter o modelo B carregado enquanto guarda
+    /// consultas do A que alguém usou antes: derrubar tudo jogaria fora o trabalho
+    /// de B por um pedido que fala de A.
+    fn soltar_modelo(&mut self, id: &str) {
+        self.itens.retain(|(chave, _)| chave.modelo != id);
+    }
+}
+
 /// O dono da memória. Vive atrás de um `Arc`, porque a varredura corre numa
 /// tarefa bloqueante enquanto os comandos leem estado e a conversa busca.
 pub struct Custodio {
@@ -1856,9 +2606,12 @@ pub struct Custodio {
     /// exatamente quando `carregado` tem um codificador; as duas pontas se movem
     /// juntas em `carregado()` (carga) e nos dois `= None` (descarga).
     info_motor: RwLock<Option<InfoMotor>>,
-    indice: RwLock<Option<Indice>>,
+    /// O índice publicado é um snapshot imutável. Os leitores compartilham só o
+    /// `Arc`; os escritores passam por `Arc::make_mut`, que copia o conteúdo se
+    /// a versão anterior ainda estiver publicada ou segurada por um leitor.
+    indice: RwLock<Option<Arc<Indice>>>,
     /// Trava dos escritores do índice. O `RwLock` acima só protege a publicação
-    /// final; quem mexe no índice faz ler-cópia → mudar → gravar-disco → publicar,
+    /// final; quem mexe no índice faz snapshot → mudar → gravar-disco → publicar,
     /// e sem esta trava dois escritores concorrentes (um `revogar` e a revalidação
     /// de conversas de um turno) leem a mesma cópia e o último publicar ressuscita
     /// o conteúdo que o primeiro acabou de apagar, no disco e na memória. Ordem:
@@ -1866,6 +2619,11 @@ pub struct Custodio {
     /// trava — ela já é exclusiva por `ocupado`, e pegá-la sob o `carregado` que
     /// segura o tempo todo fecharia um ciclo com quem escreve.
     escritores: Mutex<()>,
+    /// Os vetores das últimas consultas. Trava própria, e nunca segurada junto de
+    /// outra: quem entra aqui já tem o `carregado` na mão — é ele que responde pela
+    /// chave — e solta os dois antes de qualquer busca. Ordem documentada:
+    /// `carregado` antes de `consultas`.
+    consultas: Mutex<CacheConsultas>,
     ocupado: AtomicBool,
     cancelado: AtomicBool,
     progresso: RwLock<Progresso>,
@@ -1873,9 +2631,9 @@ pub struct Custodio {
     concluido_em: Mutex<Option<u64>>,
 }
 
-/// Ordem dos locks, sem exceção: `carregado` antes de `indice`. Quem inverte
-/// espera para sempre, e as duas pontas são pesadas o bastante para ninguém ver
-/// o deadlock acontecer.
+/// Ordem dos locks, sem exceção: `carregado` antes de `consultas`, e `carregado`
+/// antes de `indice`. Quem inverte espera para sempre, e as duas pontas são pesadas
+/// o bastante para ninguém ver o deadlock acontecer.
 impl Custodio {
     pub fn novo(
         dlls: &[PathBuf],
@@ -1900,6 +2658,7 @@ impl Custodio {
             info_motor: RwLock::new(None),
             indice: RwLock::new(None),
             escritores: Mutex::new(()),
+            consultas: Mutex::new(CacheConsultas::default()),
             ocupado: AtomicBool::new(false),
             cancelado: AtomicBool::new(false),
             progresso: RwLock::new(Progresso::default()),
@@ -1924,6 +2683,10 @@ impl Custodio {
             *trava_estado(&self.carregado) = None;
             *trava_escrita(&self.info_motor) = None;
             *trava_escrita(&self.indice) = None;
+            // Outro codificador, outro espaço: os vetores guardados descrevem a
+            // pergunta feita à casa antiga. A chave já os recusaria, e limpar é o
+            // que faz a memória da casa antiga sair de vez, não esperar o LRU.
+            trava_estado(&self.consultas).limpar();
         }
         Ok(novos)
     }
@@ -1963,6 +2726,10 @@ impl Custodio {
         *trava_escrita(&self.indice) = None;
         *trava_escrita(&self.progresso) = Progresso::default();
         *trava_estado(&self.concluido_em) = None;
+        // "Apagar a memória" apaga também o que a casa lembra das perguntas: os
+        // vetores guardados são texto do dono, transformado, e texto do dono não
+        // sobrevive ao pedido de apagamento.
+        trava_estado(&self.consultas).limpar();
         match std::fs::remove_file(&self.caminho_indice) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1994,6 +2761,12 @@ impl Custodio {
         if era {
             *trava_escrita(&self.indice) = None;
         }
+        // Os vetores daquele codificador saem da casa mesmo quando ele não era o
+        // carregado: a chave leva o identificador, e um texto do dono transformado
+        // não pode ficar parado esperando o descarte natural do LRU depois do
+        // pedido de soltar. Fora do `guard` de propósito — a ordem documentada é
+        // `carregado` antes de `consultas`, e aqui as duas não se sobrepoem.
+        trava_estado(&self.consultas).soltar_modelo(id);
         Ok(era)
     }
 
@@ -2061,8 +2834,8 @@ impl Custodio {
     /// O índice que está no disco, recusado quando é de outro codificador ou de
     /// outra largura: vetores de espaços diferentes não são comparáveis, e aceitar
     /// um seria calcular vizinhança sobre ruído.
-    fn do_disco(&self, spec: &ModelSpec, dimensao: Option<usize>) -> Option<Indice> {
-        let indice = Indice::carregar(&self.caminho_indice)?;
+    fn do_disco(&self, spec: &ModelSpec, dimensao: Option<usize>) -> Option<Arc<Indice>> {
+        let indice = Arc::new(Indice::carregar(&self.caminho_indice)?);
         if indice.modelo() != spec.id {
             return None;
         }
@@ -2072,50 +2845,84 @@ impl Custodio {
         Some(indice)
     }
 
-    /// Uma cópia do índice, para quem vai escrever nele. Os caminhos quentes —
-    /// busca e tela — não passam por aqui: clonar doze mil vetores de mil
-    /// dimensões custa quarenta e nove megabytes por consulta.
-    fn indice_na_memoria(&self) -> Option<Indice> {
+    /// Um snapshot do índice, sem copiar metadata nem vetores. O `Arc` é a única
+    /// cópia deste caminho: `fixados`, a busca e a tela continuam vendo exatamente
+    /// o mesmo índice, e um escritor só duplica o conteúdo se a versão anterior
+    /// ainda estiver publicada ou segurada por um leitor.
+    fn indice_na_memoria(&self) -> Option<Arc<Indice>> {
         if let Some(indice) = trava_leitura(&self.indice).as_ref() {
-            return Some(copiar(indice));
+            return Some(Arc::clone(indice));
         }
         let spec = self.spec()?;
         let indice = self.do_disco(spec, None)?;
-        let devolvido = copiar(&indice);
-        *trava_escrita(&self.indice) = Some(indice);
-        Some(devolvido)
+        Some(self.publicar_ou_manter(indice))
     }
 
-    /// Busca com o índice travado só para leitura. As pastas são lidas vivas,
-    /// no momento da busca: revogar uma pasta tira o conteúdo dela da resposta
-    /// antes de tirar do índice. As notas também: a lista é a pasta `base/` como
-    /// ela está no disco agora, e apagar um `.md` por fora o esconde da resposta
-    /// na busca seguinte sem que ninguém precise chamar comando nenhum.
-    fn procurar(&self, busca: &Busca) -> Result<Resposta> {
+    /// A única porta de publicação de um snapshot pronto. Depois daqui o índice
+    /// não é mais mutado: quem escrever de novo usa `Arc::make_mut` e preserva o
+    /// snapshot anterior enquanto ele estiver publicado ou segurado por leitor.
+    fn publicar_indice(&self, indice: Arc<Indice>) {
+        *trava_escrita(&self.indice) = Some(indice);
+    }
+
+    /// Compare-and-keep da primeira publicação: se outra escrita publicou enquanto
+    /// o disco era lido, o snapshot vivo vence. O lock cobre a checagem e a troca;
+    /// devolver o vencedor permite que a busca responda por ele, não pelo disco
+    /// velho que acabou de perder.
+    fn publicar_ou_manter(&self, candidato: Arc<Indice>) -> Arc<Indice> {
+        let mut guard = trava_escrita(&self.indice);
+        if let Some(publicado) = guard.as_ref() {
+            Arc::clone(publicado)
+        } else {
+            *guard = Some(Arc::clone(&candidato));
+            candidato
+        }
+    }
+
+    /// Busca com o índice travado só para leitura, pela lista de notas que quem
+    /// chama acabou de ler. A lista é viva — vem do disco no instante da busca, e é
+    /// por fora desta função: apagar um `.md` esconde a nota da resposta seguinte sem
+    /// que ninguém precise chamar comando nenhum, e `raizes` faz o mesmo pelas pastas.
+    fn procurar_com_notas(&self, busca: &Busca, documentos: &[String]) -> Result<Resposta> {
+        self.procurar_carregando(busca, documentos, || {
+            let spec = self
+                .spec()
+                .ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
+            self.do_disco(spec, Some(busca.vetor.len()))
+                .ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemIndice", &[])))
+        })
+    }
+
+    /// O caminho da primeira busca, com o carregamento separado para que a
+    /// publicação compare-and-keep possa ser testada numa interleavação exata:
+    /// o loader publica uma escrita concorrente e devolve o snapshot velho do
+    /// disco. Em produção, o loader é `do_disco`; a regra é a mesma.
+    fn procurar_carregando(
+        &self,
+        busca: &Busca,
+        documentos: &[String],
+        carregar: impl FnOnce() -> Result<Arc<Indice>>,
+    ) -> Result<Resposta> {
         let raizes = trava_leitura(&self.pastas).raizes.clone();
-        let documentos = crate::ai::base::ids(&self.raiz_base).unwrap_or_default();
-        let busca = &Busca { documentos: &documentos, ..*busca };
+        let busca = &Busca { documentos, ..*busca };
         {
             let guard = trava_leitura(&self.indice);
             if let Some(indice) = guard.as_ref() {
                 return indice.buscar(busca, &raizes);
             }
         }
-        let spec = self
-            .spec()
-            .ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
-        let indice = self
-            .do_disco(spec, Some(busca.vetor.len()))
-            .ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemIndice", &[])))?;
-        let resposta = indice.buscar(busca, &raizes)?;
-        *trava_escrita(&self.indice) = Some(indice);
-        Ok(resposta)
+        let candidato = carregar()?;
+        // Não sobrescrever uma escrita publicada durante a leitura do disco, e
+        // responder pelo snapshot que realmente venceu essa comparação.
+        let indice = self.publicar_ou_manter(candidato);
+        indice.buscar(busca, &raizes)
     }
 
     /// Um trecho é `Some` quando `indice` já tem alguma coisa na memória; sem
     /// escritor concorrente é o que vale. Esta função é a única porta de escrita
-    /// no índice para quem não é a varredura: pega a trava dos escritores, lê a
-    /// cópia, aplica a mudança, grava no disco e publica — tudo sob a mesma trava.
+    /// no índice para quem não é a varredura: pega a trava dos escritores, obtém
+    /// um snapshot, aplica a mudança, grava no disco e publica — tudo sob a mesma
+    /// trava.
     /// O `alterar` devolve quantas peças mudou; zero significa "nada a gravar",
     /// e o índice nem sai da função.
     fn escrever_indice(
@@ -2123,13 +2930,20 @@ impl Custodio {
         alterar: impl FnOnce(&mut Indice) -> usize,
     ) -> Result<usize> {
         let _trava = trava_estado(&self.escritores);
-        let Some(mut indice) = self.indice_na_memoria() else {
+        let Some(mut snapshot) = self.indice_na_memoria() else {
             return Ok(0);
         };
-        let feitos = alterar(&mut indice);
+        let indice = Arc::make_mut(&mut snapshot);
+        let feitos = alterar(indice);
         if feitos > 0 {
+            // Toda escrita passa por aqui, então é aqui que o mapa de baldes volta a
+            // bater com o índice. Na regra geral o custo é uma passada só — as bordas
+            // recontadas sobre o que já existe — e o k-means inteiro só roda quando o
+            // mapa deixou de cobrir a casa, que é justamente o momento em que a busca
+            // começaria a sondar baldes vazios.
+            indice.reagrupar();
             indice.salvar(&self.caminho_indice)?;
-            *trava_escrita(&self.indice) = Some(indice);
+            self.publicar_indice(snapshot);
         }
         Ok(feitos)
     }
@@ -2157,24 +2971,62 @@ impl Custodio {
             }
         }
         let Some(spec) = self.spec() else { return Leitura::default() };
-        self.do_disco(spec, None).as_ref().map(leitura).unwrap_or_default()
+        self.do_disco(spec, None).map(|indice| leitura(&indice)).unwrap_or_default()
     }
 
     /// O vetor da pergunta. A consulta passa pelo prefixo que o modelo declara
     /// — é assim que ele foi treinado — e é cortada no lote, porque a pergunta
     /// que cabe é a que vira vetor.
+    ///
+    /// É também o único lugar da casa onde um texto vira vetor dentro de um turno,
+    /// e era o lugar onde ele virava mais de uma vez: a ferramenta `buscar_memoria`
+    /// chama esta função a cada invocação, e um modelo que consulta a memória três
+    /// vezes na mesma rodada pagava três vezes pelo vetor da mesma frase. O cache
+    /// existe por causa disto. A chave é o estado do codificador inteiro, não só o
+    /// texto — ver [`ChaveConsulta`] — e quem troca ou solta o modelo limpa a casa.
     fn vetor_da_consulta(&self, texto: &str, prefixo: Option<&'static str>) -> Result<Vec<f32>> {
         let mut guard = self.carregado()?;
         let carregado = guard.as_mut().expect("carregado acabou de ser garantido");
-        let com_prefixo = match prefixo {
-            Some(prefixo) => format!("{prefixo}{texto}"),
-            None => texto.to_string(),
+        let chave = ChaveConsulta {
+            modelo: carregado.ids.clone(),
+            agrupamento: carregado.embutidor.agrupamento.to_string(),
+            dimensao: carregado.embutidor.dimensao(),
+            lote: carregado.embutidor.limite(),
+            prefixo,
+            texto: texto.to_string(),
         };
-        let limite = carregado.embutidor.limite();
-        let mut ids = codificar(&carregado.tokenizador, &com_prefixo)?;
-        ids.truncate(limite);
-        let mut vetor = carregado.embutidor.embutir(&ids)?;
-        Indice::normalizar(&mut vetor)?;
+        let tokenizador = &carregado.tokenizador;
+        let embutidor = &mut carregado.embutidor;
+        self.vetor_da_chave(chave, move || {
+            let com_prefixo = match prefixo {
+                Some(prefixo) => format!("{prefixo}{texto}"),
+                None => texto.to_string(),
+            };
+            let limite = embutidor.limite();
+            let mut ids = codificar(tokenizador, &com_prefixo)?;
+            ids.truncate(limite);
+            let mut vetor = embutidor.embutir(&ids)?;
+            Indice::normalizar(&mut vetor)?;
+            Ok(vetor)
+        })
+    }
+
+    /// O cache puro, separado do codificador para que a política de acerto e de
+    /// descarte seja testável sem modelo nenhum em disco: `produzir` é o que custa
+    /// caro, e é exatamente ele que o teste conta quantas vezes rodou.
+    fn vetor_da_chave(
+        &self,
+        chave: ChaveConsulta,
+        produzir: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        {
+            let mut cache = trava_estado(&self.consultas);
+            if let Some(vetor) = cache.consultar(&chave) {
+                return Ok(vetor);
+            }
+        }
+        let vetor = produzir()?;
+        trava_estado(&self.consultas).inserir(chave, vetor.clone());
         Ok(vetor)
     }
 
@@ -2206,7 +3058,7 @@ impl Custodio {
             return Ok(0);
         }
         // Daqui para baixo há escrita no índice: a mesma trava que separa dois
-        // `revogar`/revalidações concorrentes, segurada do ler-cópia ao publicar.
+        // `revogar`/revalidações concorrentes, segurada do snapshot ao publicar.
         // Ordem `escritores → carregado → indice`; a varredura não pega esta
         // trava, então não há como fechar um ciclo contra ela.
         let _trava = trava_estado(&self.escritores);
@@ -2230,26 +3082,32 @@ impl Custodio {
         let mut trava = self.carregado()?;
         let carregado = trava.as_mut().expect("carregado acabou de ser garantido");
         let ajustes = self.ajustes();
-        let mut indice = self.indice_na_memoria().unwrap_or_else(|| {
-            Indice::vazio(
+        let mut snapshot = self.indice_na_memoria().unwrap_or_else(|| {
+            Arc::new(Indice::vazio(
                 spec.id,
                 carregado.embutidor.dimensao(),
                 carregado.embutidor.agrupamento,
                 ajustes.peca,
                 ajustes.sobreposicao,
-            )
+            ))
         });
-        if indice.refatiar(ajustes.peca, ajustes.sobreposicao) {
-            // Escala da tela diferente da escala gravada: as peças de conversa
-            // foram cortadas na antiga também. A gravação imediata é o que faz
-            // um índice esvaziado sobreviver mesmo se o turno cair no meio.
-            indice.salvar(&self.caminho_indice)?;
-            *trava_escrita(&self.indice) = Some(copiar(&indice));
+        {
+            let indice = Arc::make_mut(&mut snapshot);
+            if indice.refatiar(ajustes.peca, ajustes.sobreposicao) {
+                // Escala da tela diferente da escala gravada: as peças de conversa
+                // foram cortadas na antiga também. A gravação imediata é o que faz
+                // um índice esvaziado sobreviver mesmo se o turno cair no meio.
+                indice.salvar(&self.caminho_indice)?;
+                self.publicar_indice(Arc::new(indice.clone()));
+            }
         }
-        let mudadas = self.escrever_conversas(&mut indice, carregado, vivas, orcamento)?;
+        let indice = Arc::make_mut(&mut snapshot);
+        let mudadas = self.escrever_conversas(indice, carregado, vivas, orcamento)?;
         if mudadas > 0 {
+            // Mesmo motivo da varredura: o custo do mapa é de escrita, nunca de turno.
+            indice.reagrupar();
             indice.salvar(&self.caminho_indice)?;
-            *trava_escrita(&self.indice) = Some(indice);
+            self.publicar_indice(snapshot);
         }
         Ok(mudadas)
     }
@@ -2320,6 +3178,19 @@ impl Custodio {
     /// A busca em si: o chão do índice, o vetor da pergunta, os `k` vizinhos e as
     /// conversas que ela não pode responder.
     pub fn buscar(&self, consulta: &str, trechos: u32, ignorar: &[String]) -> Result<Resposta> {
+        let documentos = crate::ai::base::ids(&self.raiz_base).unwrap_or_default();
+        self.buscar_com_notas(consulta, trechos, ignorar, &documentos)
+    }
+
+    /// A busca com o censo da base já lido. É por aqui que entra o turno, que lê a
+    /// pasta uma vez e responde por ela nas duas portas — as presas e a busca.
+    fn buscar_com_notas(
+        &self,
+        consulta: &str,
+        trechos: u32,
+        ignorar: &[String],
+        documentos: &[String],
+    ) -> Result<Resposta> {
         let consulta = consulta.trim();
         let ajustes = self.ajustes();
         if consulta.is_empty() {
@@ -2339,17 +3210,20 @@ impl Custodio {
             .ok_or_else(|| anyhow::anyhow!(tr("erros.memoriaSemModelo", &[])))?;
         let k = if trechos == 0 { ajustes.trechos } else { trechos.min(TRECHOS_MAX) } as usize;
         let vetor = self.vetor_da_consulta(consulta, spec.query_prefix)?;
-        self.procurar(&Busca {
-            vetor: &vetor,
-            texto: consulta,
-            k,
-            piso: ajustes.piso,
-            modo: ajustes.modo,
-            ignorar,
-            // Espaços reservados, não uma decisão: quem responde pela lista é
-            // `procurar`, que lê a pasta `base/` no instante da busca.
-            documentos: &[],
-        })
+        self.procurar_com_notas(
+            &Busca {
+                vetor: &vetor,
+                texto: consulta,
+                k,
+                piso: ajustes.piso,
+                modo: ajustes.modo,
+                ignorar,
+                // Espaços reservados, não uma decisão: a lista entra por quem chama,
+                // lida do disco no instante do turno.
+                documentos: &[],
+            },
+            documentos,
+        )
     }
 
     /// Onde a base de conhecimento mora. Um caminho só, decidido na abertura.
@@ -2375,8 +3249,14 @@ impl Custodio {
     /// codificador carregado não há sincronização nenhuma para reescrever o índice
     /// e dizer que ela saiu.
     pub fn fixados(&self) -> Vec<Achado> {
-        let Some(indice) = self.indice_na_memoria() else { return Vec::new() };
         let vivas = crate::ai::base::ids(&self.raiz_base).unwrap_or_default();
+        self.fixados_com_lista(&vivas)
+    }
+
+    /// As presas com o censo da base já lido — a mesma lista que a busca do turno
+    /// obedece, para as duas portas responderem pelo mesmo disco.
+    fn fixados_com_lista(&self, vivas: &[String]) -> Vec<Achado> {
+        let Some(indice) = self.indice_na_memoria() else { return Vec::new() };
         indice
             .pecas_fixadas()
             .into_iter()
@@ -2421,25 +3301,30 @@ impl Custodio {
         // lugares. Quem nunca teve peça nenhuma não entra: a presa é lida do
         // índice como tudo nesta memória, e um cartão escrito sobre uma nota que
         // ninguém vetorou seria a tela prometendo memória que não existe.
-        let (buscados, alcancados, modo) = match self.buscar(consulta, teto as u32, ignorar) {
-            Ok(resposta) => (resposta.achados, resposta.alcancados, resposta.modo),
-            Err(_) => (Vec::new(), 0, ajustes.modo.nome()),
-        };
+        // A lista de notas é lida uma vez, e é ela que vale nas duas portas abaixo.
+        // Ler a pasta duas vezes custava dois `readdir` num turno que já paga um
+        // vetor, e — mais importante — as duas leituras não precisam concordar.
+        let vivas = crate::ai::base::ids(&self.raiz_base).unwrap_or_default();
+        let (buscados, alcancados, modo) =
+            match self.buscar_com_notas(consulta, teto as u32, ignorar, &vivas) {
+                Ok(resposta) => (resposta.achados, resposta.alcancados, resposta.modo),
+                Err(_) => (Vec::new(), 0, ajustes.modo.nome()),
+            };
         let mut bloco: Vec<Achado> = Vec::with_capacity(teto);
-        // O repetido não entra duas vezes. A lista tem no máximo `TRECHOS_MAX`
-        // itens, então varrer é mais claro que uma chave nova sobre um tipo que
-        // não é `Hash` — e é o par, fonte + chave + linha, que diz o que é o mesmo
-        // trecho: dois arquivos diferentes podem ter a mesma linha.
-        let mut chaves: Vec<(Fonte, String, usize)> = Vec::new();
-        for achado in self.fixados().into_iter().chain(buscados) {
+        // O repetido não entra duas vezes. É o par fonte + chave + linha que diz o
+        // que é o mesmo trecho — dois arquivos diferentes podem ter a mesma linha —
+        // e ele vai num conjunto em vez de varrido na lista: `Vec::contains` sobre
+        // o bloco era o teto de trechos ao quadrado, pequeno o bastante para nunca
+        // doer e grande o bastante para crescer com a casa.
+        let mut chaves: BTreeSet<(&'static str, String, usize)> = BTreeSet::new();
+        for achado in self.fixados_com_lista(&vivas).into_iter().chain(buscados) {
             if bloco.len() >= teto {
                 break;
             }
-            let chave = (achado.fonte, achado.arquivo.clone(), achado.linha);
-            if chaves.contains(&chave) {
+            let chave = (achado.fonte.nome(), achado.arquivo.clone(), achado.linha);
+            if !chaves.insert(chave) {
                 continue;
             }
-            chaves.push(chave);
             bloco.push(achado);
         }
         Resposta { achados: bloco, alcancados, modo }
@@ -2453,9 +3338,9 @@ impl Custodio {
     /// nota, do mesmo jeito que apagar a conversa apaga a lembrança dela.
     ///
     /// A trava é a mesma da revalidação de conversas e na mesma ordem documentada
-    /// (`escritores → carregado → indice`): dois escritores concorrentes lendo a
-    /// mesma cópia publicariam, no fim, um índice em que o trabalho um do outro não
-    /// existe. E a varredura em curso tem a prioridade: ela regrava o índice no fim
+    /// (`escritores → carregado → indice`): dois escritores concorrentes usando o
+    /// mesmo snapshot publicariam, no fim, um índice em que o trabalho um do outro
+    /// não existe. E a varredura em curso tem a prioridade: ela regrava o índice no fim
     /// e escrever por cima agora seria perder o que ela está lendo.
     pub fn sincronizar_base(&self, notas: &[Nota]) -> Result<Sincronia> {
         let inicio = Instant::now();
@@ -2498,22 +3383,27 @@ impl Custodio {
             let mut trava = self.carregado()?;
             let carregado = trava.as_mut().expect("carregado acabou de ser garantido");
             let ajustes = self.ajustes();
-            let mut indice = self.indice_na_memoria().unwrap_or_else(|| {
-                Indice::vazio(
+            let mut snapshot = self.indice_na_memoria().unwrap_or_else(|| {
+                Arc::new(Indice::vazio(
                     spec.id,
                     carregado.embutidor.dimensao(),
                     carregado.embutidor.agrupamento,
                     ajustes.peca,
                     ajustes.sobreposicao,
-                )
+                ))
             });
-            if indice.refatiar(ajustes.peca, ajustes.sobreposicao) {
-                indice.salvar(&self.caminho_indice)?;
-                *trava_escrita(&self.indice) = Some(copiar(&indice));
+            {
+                let indice = Arc::make_mut(&mut snapshot);
+                if indice.refatiar(ajustes.peca, ajustes.sobreposicao) {
+                    indice.salvar(&self.caminho_indice)?;
+                    self.publicar_indice(Arc::new(indice.clone()));
+                }
             }
-            let trabalho = self.escrever_notas(&mut indice, carregado, notas)?;
+            let indice = Arc::make_mut(&mut snapshot);
+            let trabalho = self.escrever_notas(indice, carregado, notas)?;
+            indice.reagrupar();
             indice.salvar(&self.caminho_indice)?;
-            *trava_escrita(&self.indice) = Some(indice);
+            self.publicar_indice(snapshot);
             trabalho
         };
         Ok(Sincronia {
@@ -2727,47 +3617,50 @@ impl Custodio {
         let alvo = ajustes.peca as usize;
         let sobre = ajustes.sobreposicao as usize;
 
-        let mut indice = self
+        let mut snapshot = self
             .indice_na_memoria()
             .filter(|i| i.modelo() == spec.id && i.dimensao() == dimensao)
             .unwrap_or_else(|| {
-                Indice::vazio(
+                Arc::new(Indice::vazio(
                     spec.id,
                     dimensao,
                     carregado.embutidor.agrupamento,
                     alvo as u32,
                     sobre as u32,
-                )
+                ))
             });
-        if indice.refatiar(alvo as u32, sobre as u32) {
-            // A escala da tela não é a escala gravada: cada vetor do índice
-            // antigo representa outro pedaço de texto, e as assinaturas foram
-            // apagadas junto para a varredura abaixo reler tudo. Um índice que
-            // sobrevivesse a isto é exatamente o controle mentiroso que o
-            // produto proíbe.
-            indice.salvar(&self.caminho_indice)?;
-        }
-        // Uma pasta revogada no grafo tem de tirar o conteúdo dela da memória, e
-        // isto vale mesmo com a varredura cortada por um teto.
-        indice.reter_dentro(&raizes);
+        {
+            let indice = Arc::make_mut(&mut snapshot);
+            if indice.refatiar(alvo as u32, sobre as u32) {
+                // A escala da tela não é a escala gravada: cada vetor do índice
+                // antigo representa outro pedaço de texto, e as assinaturas foram
+                // apagadas junto para a varredura abaixo reler tudo. Um índice que
+                // sobrevivesse a isto é exatamente o controle mentiroso que o
+                // produto proíbe.
+                indice.salvar(&self.caminho_indice)?;
+            }
+            // Uma pasta revogada no grafo tem de tirar o conteúdo dela da memória, e
+            // isto vale mesmo com a varredura cortada por um teto.
+            indice.reter_dentro(&raizes);
 
-        let vistos: Vec<String> = candidatos
-            .iter()
-            .map(|(caminho, _)| caminho.display().to_string())
-            .collect();
-        if completa {
-            // Arquivo que saiu da lista e continua no índice foi apagado ou
-            // passou a ser ignorado. Só se tem certeza disso varrendo tudo.
-            let fora: Vec<String> = indice
-                .meta
-                .assinaturas
-                .keys()
-                .filter(|arquivo| !vistos.iter().any(|vista| vista == *arquivo))
-                .cloned()
+            let vistos: Vec<String> = candidatos
+                .iter()
+                .map(|(caminho, _)| caminho.display().to_string())
                 .collect();
-            for arquivo in fora {
-                indice.remover_arquivo(&arquivo);
-                indice.meta.assinaturas.remove(&arquivo);
+            if completa {
+                // Arquivo que saiu da lista e continua no índice foi apagado ou
+                // passou a ser ignorado. Só se tem certeza disso varrendo tudo.
+                let fora: Vec<String> = indice
+                    .meta
+                    .assinaturas
+                    .keys()
+                    .filter(|arquivo| !vistos.iter().any(|vista| vista == *arquivo))
+                    .cloned()
+                    .collect();
+                for arquivo in fora {
+                    indice.remover_arquivo(&arquivo);
+                    indice.meta.assinaturas.remove(&arquivo);
+                }
             }
         }
 
@@ -2781,6 +3674,7 @@ impl Custodio {
         }
 
         for (numero, (caminho, assinatura)) in candidatos.into_iter().enumerate() {
+            let indice = Arc::make_mut(&mut snapshot);
             if self.cancelado.load(Ordering::Relaxed) {
                 cancelado = true;
                 break;
@@ -2829,11 +3723,8 @@ impl Custodio {
                 trechos: indice.trechos(),
             });
             if numero > 0 && numero % SALVAR_A_CADA == 0 {
-                {
-                    let mut guard = trava_escrita(&self.indice);
-                    *guard = Some(copiar(&indice));
-                }
-                indice.salvar(&self.caminho_indice)?;
+                self.publicar_indice(Arc::clone(&snapshot));
+                snapshot.salvar(&self.caminho_indice)?;
             }
             if truncado {
                 break;
@@ -2843,37 +3734,46 @@ impl Custodio {
         // Uma pasta revogada no meio da varredura não pode voltar pelo arquivo
         // nem continuar em memória: a última palavra é da lista viva de
         // concessões, e ela vem depois de todo o trabalho.
-        let vivas = trava_leitura(&self.pastas).raizes.clone();
-        indice.reter_dentro(&vivas);
+        let resumo = {
+            let indice = Arc::make_mut(&mut snapshot);
+            let vivas = trava_leitura(&self.pastas).raizes.clone();
+            indice.reter_dentro(&vivas);
 
-        // O varrer é também o ponto em que o histórico inteiro entra na memória,
-        // sem o orçamento de um turno: aqui o codificador já está na mão, o
-        // trabalho corre fora da conversa e a barra de progresso existe justamente
-        // para o dono ver o índice subir.
-        self.escrever_conversas(&mut indice, carregado, conversas, usize::MAX)?;
+            // O varrer é também o ponto em que o histórico inteiro entra na memória,
+            // sem o orçamento de um turno: aqui o codificador já está na mão, o
+            // trabalho corre fora da conversa e a barra de progresso existe justamente
+            // para o dono ver o índice subir.
+            self.escrever_conversas(indice, carregado, conversas, usize::MAX)?;
 
-        // A base entra no mesmo ponto, pela mesma razão: o codificador já está na
-        // mão, o trabalho corre fora da conversa e a barra de progresso existe para
-        // o dono ver o índice subir. Ler a pasta agora, e não no começo, é o que faz
-        // uma nota escrita durante a varredura entrar nela em vez de esperar a
-        // próxima.
-        let notas = crate::ai::base::listar(&self.raiz_base).unwrap_or_default();
-        self.escrever_notas(&mut indice, carregado, &notas.itens)?;
+            // A base entra no mesmo ponto, pela mesma razão: o codificador já está na
+            // mão, o trabalho corre fora da conversa e a barra de progresso existe para
+            // o dono ver o índice subir. Ler a pasta agora, e não no começo, é o que faz
+            // uma nota escrita durante a varredura entrar nela em vez de esperar a
+            // próxima.
+            let notas = crate::ai::base::listar(&self.raiz_base).unwrap_or_default();
+            self.escrever_notas(indice, carregado, &notas.itens)?;
 
-        let resumo = Resumo {
-            arquivos: indice.arquivos(),
-            relidos,
-            trechos: indice.trechos(),
-            conversas: indice.conversas(),
-            ms: 0,
-            truncado: truncado || !completa,
-            cancelado,
+            // O mapa de baldes é recontado aqui, e não dentro de `buscar`: a varredura
+            // é o único lugar da casa em que um segundo a mais é invisível — a barra de
+            // progresso já está na tela e o codificador acabou de percorrer doze mil
+            // vetores. Um índice que chegou do disco antes disto existir ganha aqui a
+            // sua primeira partição, sem que ninguém precise reindexar nada.
+            indice.reagrupar();
+
+            Resumo {
+                arquivos: indice.arquivos(),
+                relidos,
+                trechos: indice.trechos(),
+                conversas: indice.conversas(),
+                ms: 0,
+                truncado: truncado || !completa,
+                cancelado,
+            }
         };
-        {
-            let mut guard = trava_escrita(&self.indice);
-            *guard = Some(copiar(&indice));
-        }
-        indice.salvar(&self.caminho_indice)?;
+        // Publica antes de gravar, como antes: em falha de disco o snapshot vivo
+        // ainda é o trabalho concluído. O `Arc` compartilhado não duplica vetores.
+        self.publicar_indice(Arc::clone(&snapshot));
+        snapshot.salvar(&self.caminho_indice)?;
         Ok(resumo)
     }
 }
@@ -3211,8 +4111,8 @@ mod testes {
     }
 
     /// O M5 em forma de teste: um `revogar` e a revalidação de conversas de um
-    /// turno são os dois escritores do índice fora da varredura. Cada um lê uma
-    /// cópia, muda, grava no disco e publica — e sem a trava de escritores o
+    /// turno são os dois escritores do índice fora da varredura. Cada um obtém
+    /// um snapshot, muda, grava no disco e publica — e sem a trava de escritores o
     /// último publicar escreve por cima do primeiro e ressuscita o arquivo que o
     /// outro acabou de apagar. Com a trava o par é atômico: dos dois cortes nenhum
     /// some. Aqui um writer corta `a`, o outro corta `b`, e só `c` pode sobrar.
@@ -3243,7 +4143,7 @@ mod testes {
                     &[(Peca { linha: 1, texto: nome.into(), ids: vec![] }, vec![1.0])],
                 );
             }
-            *custodio.indice.write().expect("índice envenenado") = Some(indice);
+            *custodio.indice.write().expect("índice envenenado") = Some(Arc::new(indice));
         };
 
         let perdido = AtomicUsize::new(0);
@@ -3986,7 +4886,7 @@ mod testes {
             .join(format!("{}.{}", registro.nota.id, crate::ai::base::EXTENSAO));
         let mut indice = Indice::vazio("m", 2, "último", 64, 0);
         nota_no_indice(&mut indice, &registro.nota, &["nao abrir o app"], false);
-        *trava_escrita(&custodio.indice) = Some(indice);
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
 
         let bloco = custodio.bloco_do_turno("o que vale aqui?", &[]);
         assert_eq!(bloco.achados.len(), 1, "a nota presa não depende da busca para entrar");
@@ -4008,6 +4908,377 @@ mod testes {
         assert!(custodio.bloco_do_turno("o que vale aqui?", &[]).achados.is_empty());
         assert_eq!(custodio.estado(true).trechos_notas, 1, "a peça ficou no índice");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A ficha manda na ordem e no marcador, mas a pasta manda em quais notas
+    /// ainda existem. A lista é relida em cada chamada: criar um `.md` por fora o
+    /// faz aparecer, e apagá-lo o faz desaparecer sem reescrever o índice.
+    #[test]
+    fn fixados_veem_a_lista_viva_e_guardam_a_ordem_da_ultima_escrita() {
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-fixados-vivos-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        std::fs::create_dir_all(custodio.raiz_base()).unwrap();
+        let caminho_da_nota = |id: &str| {
+            custodio
+                .raiz_base()
+                .join(format!("{id}.{}", crate::ai::base::EXTENSAO))
+        };
+        for id in ["antiga", "recente", "empate", "solto"] {
+            std::fs::write(caminho_da_nota(id), format!("# {id}\ncorpo\n")).unwrap();
+        }
+
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        for (id, titulo, atualizada, fixada) in [
+            ("antiga", "Antiga", 10, true),
+            ("recente", "Recente", 30, true),
+            ("empate", "Empate", 30, true),
+            ("ausente", "Ausente", 20, true),
+            ("solto", "Solto", 40, false),
+            ("sem-peca", "Sem peça", 50, true),
+        ] {
+            let nota = nota(id, titulo, &format!("corpo {id}"), atualizada, fixada);
+            if id == "sem-peca" {
+                nota_no_indice(&mut indice, &nota, &[], false);
+            } else {
+                nota_no_indice(
+                    &mut indice,
+                    &nota,
+                    &[&format!("primeira peça {id}"), &format!("segunda peça {id}")],
+                    false,
+                );
+            }
+        }
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
+
+        fn ids(achados: &[Achado]) -> Vec<&str> {
+            achados.iter().map(|a| a.arquivo.as_str()).collect()
+        }
+        let iniciais = custodio.fixados();
+        assert_eq!(ids(&iniciais), vec!["empate", "recente", "antiga"]);
+        assert_eq!(iniciais[1].texto, "primeira peça recente", "só a primeira peça entra");
+        assert_eq!(iniciais[1].origem, Origem::Fixada);
+        assert_eq!(iniciais[1].quando, Some(30));
+        assert!(ids(&iniciais).contains(&"antiga"));
+
+        // Uma nota que já estava na ficha, mas não tinha arquivo, passa a responder
+        // sem sincronização: a existência vem do disco no instante da chamada.
+        std::fs::write(caminho_da_nota("ausente"), "# Ausente\ncorpo\n").unwrap();
+        assert_eq!(
+            ids(&custodio.fixados()),
+            vec!["empate", "recente", "ausente", "antiga"]
+        );
+
+        std::fs::remove_file(caminho_da_nota("recente")).unwrap();
+        assert_eq!(ids(&custodio.fixados()), vec!["empate", "ausente", "antiga"]);
+        assert_eq!(
+            trava_leitura(&custodio.indice).as_ref().unwrap().documentos(),
+            6,
+            "esconder da resposta não apaga a ficha nem o texto do índice"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// O índice já publicado não substitui a leitura da base: `procurar` troca
+    /// os ids reservados do chamante pela lista viva do disco em toda busca.
+    #[test]
+    fn a_busca_le_as_notas_vivas_do_disco_com_o_indice_na_memoria() {
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-busca-viva-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        std::fs::create_dir_all(custodio.raiz_base()).unwrap();
+        let arquivo = custodio
+            .raiz_base()
+            .join(format!("viva.{}", crate::ai::base::EXTENSAO));
+        std::fs::write(&arquivo, "# Viva\ncorpo\n").unwrap();
+        let nota = nota("viva", "Viva", "corpo", 1, false);
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &nota, &["corpo"], false);
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
+
+        let buscar = || {
+            let vivas = crate::ai::base::ids(custodio.raiz_base()).unwrap_or_default();
+            custodio
+                .procurar_com_notas(
+                    &Busca {
+                        vetor: &[1.0, 0.0],
+                        texto: "corpo",
+                        k: 4,
+                        piso: 0.0,
+                        modo: Modo::Vetorial,
+                        ignorar: &[],
+                        documentos: &[],
+                    },
+                    &vivas,
+                )
+                .unwrap()
+        };
+        assert_eq!(buscar().achados.len(), 1, "a nota está no disco");
+        std::fs::remove_file(&arquivo).unwrap();
+        assert!(buscar().achados.is_empty(), "o `.md` saiu por fora");
+        assert_eq!(
+            trava_leitura(&custodio.indice).as_ref().unwrap().trechos_de(Fonte::Documento),
+            1,
+            "a busca filtra o disco; não edita o índice"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Regressão determinística da primeira busca: o loader do disco termina
+    /// depois de uma escrita concorrente publicar. O snapshot velho não pode
+    /// substituir o novo, e a resposta tem de sair do que ficou publicado.
+    #[test]
+    fn a_primeira_busca_mantem_a_escrita_publicada_durante_a_leitura() {
+        let base = std::env::temp_dir().join(format!(
+            "aether-memoria-busca-concorrente-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let raiz = base.join("concedida");
+        let pastas = Arc::new(RwLock::new(Pastas {
+            raizes: vec![raiz.clone()],
+            ..Pastas::default()
+        }));
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            pastas,
+        );
+        let arquivo = raiz.join("mesmo.rs").display().to_string();
+        let mut antigo = Indice::vazio("m", 1, "último", 64, 0);
+        antigo.adicionar(
+            &arquivo,
+            Assinatura {
+                bytes: 1,
+                modificado: 1,
+            },
+            &[(
+                Peca {
+                    linha: 1,
+                    texto: "velho".into(),
+                    ids: vec![],
+                },
+                vec![1.0],
+            )],
+        );
+        let mut novo = Indice::vazio("m", 1, "último", 64, 0);
+        novo.adicionar(
+            &arquivo,
+            Assinatura {
+                bytes: 1,
+                modificado: 2,
+            },
+            &[(
+                Peca {
+                    linha: 1,
+                    texto: "novo".into(),
+                    ids: vec![],
+                },
+                vec![1.0],
+            )],
+        );
+        let novo = Arc::new(novo);
+
+        let resposta = custodio
+            .procurar_carregando(
+                &Busca {
+                    vetor: &[1.0],
+                    texto: "",
+                    k: 4,
+                    piso: 0.0,
+                    modo: Modo::Vetorial,
+                    ignorar: &[],
+                    documentos: &[],
+                },
+                &[],
+                || {
+                    // Este é o ponto exato em que a escrita concorrente vence.
+                    custodio.publicar_indice(Arc::clone(&novo));
+                    Ok(Arc::new(antigo))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resposta.achados.len(), 1);
+        assert_eq!(
+            resposta.achados[0].texto, "novo",
+            "a busca respondeu pelo snapshot velho que perdeu a publicação"
+        );
+        let publicado = trava_leitura(&custodio.indice);
+        assert!(
+            Arc::ptr_eq(publicado.as_ref().unwrap(), &novo),
+            "a leitura do disco sobrescreveu a escrita concorrente"
+        );
+        drop(publicado);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Sem modelo e sem índice, nada é inventado nem publicado. Uma escrita
+    /// publica a nova versão no lock e no disco; `apagar` derruba as duas pontas.
+    #[test]
+    fn indice_ausente_nao_publica_e_a_escrita_e_o_apagar_publicam_o_estado_real() {
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-publicacao-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        std::fs::create_dir_all(custodio.raiz_base()).unwrap();
+        std::fs::write(
+            custodio
+                .raiz_base()
+                .join(format!("presa.{}", crate::ai::base::EXTENSAO)),
+            "# Presa\ncorpo\n",
+        )
+        .unwrap();
+
+        assert!(custodio.indice_na_memoria().is_none());
+        assert!(trava_leitura(&custodio.indice).is_none(), "ausência não vira índice vazio");
+        assert!(custodio.fixados().is_empty(), "nota viva sem índice não inventa peça");
+
+        let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+        let caminho = base.join("arquivo.rs");
+        indice.adicionar(
+            &caminho.display().to_string(),
+            Assinatura { bytes: 1, modificado: 1 },
+            &[(Peca { linha: 1, texto: "corpo".into(), ids: vec![] }, vec![1.0])],
+        );
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
+        assert_eq!(
+            custodio
+                .escrever_indice(|i| i.remover_arquivo(&caminho.display().to_string()))
+                .unwrap(),
+            1
+        );
+        assert_eq!(trava_leitura(&custodio.indice).as_ref().unwrap().trechos(), 0);
+        assert_eq!(Indice::carregar(&custodio.caminho_indice).unwrap().trechos(), 0);
+
+        let nota = nota("presa", "Presa", "corpo", 1, true);
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        nota_no_indice(&mut indice, &nota, &["corpo"], false);
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
+        assert_eq!(custodio.fixados().len(), 1);
+        custodio.apagar().unwrap();
+        assert!(trava_leitura(&custodio.indice).is_none());
+        assert!(!custodio.caminho_indice.exists());
+        assert!(custodio.fixados().is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Um leitor que já obteve o índice continua vendo o mesmo snapshot enquanto
+    /// um escritor publica outra versão. A cópia sob demanda é do escritor, nunca
+    /// uma mutação escondida no índice que o leitor está consultando.
+    #[test]
+    fn a_escrita_preserva_o_snapshot_de_um_leitor_e_publica_no_disco() {
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+        for nome in ["a", "b", "c"] {
+            indice.adicionar(
+                &format!("C:/x/{nome}.rs"),
+                Assinatura { bytes: 1, modificado: 1 },
+                &[(Peca { linha: 1, texto: nome.into(), ids: vec![] }, vec![1.0])],
+            );
+        }
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
+        let snapshot = custodio.indice_na_memoria().unwrap();
+
+        assert_eq!(custodio.escrever_indice(|i| i.remover_arquivo("C:/x/a.rs")).unwrap(), 1);
+        assert_eq!(snapshot.trechos(), 3, "o leitor não viu a escrita do outro");
+        assert_eq!(trava_leitura(&custodio.indice).as_ref().unwrap().trechos(), 2);
+        assert_eq!(Indice::carregar(&custodio.caminho_indice).unwrap().trechos(), 2);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Prova estrutural da remoção do clone quente: dois acessos ao índice já
+    /// publicado apontam para a mesma alocação. Não mede RAM nem tempo; mede a
+    /// identidade do objeto que `fixados` e a tela consultam.
+    #[test]
+    fn indice_na_memoria_reutiliza_a_alocacao_publicada() {
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-alocacao-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        let mut indice = Indice::vazio("m", 1, "último", 64, 0);
+        indice.adicionar(
+            "C:/x/a.rs",
+            Assinatura { bytes: 1, modificado: 1 },
+            &[(Peca { linha: 1, texto: "a".into(), ids: vec![] }, vec![1.0])],
+        );
+        *trava_escrita(&custodio.indice) = Some(Arc::new(indice));
+        let publicado = Arc::clone(trava_leitura(&custodio.indice).as_ref().unwrap());
+
+        let primeiro = custodio.indice_na_memoria().unwrap();
+        let segundo = custodio.indice_na_memoria().unwrap();
+        assert!(
+            Arc::ptr_eq(&publicado, &primeiro) && Arc::ptr_eq(&primeiro, &segundo),
+            "o acesso ao índice publicado clonou a estrutura completa"
+        );
+        assert_eq!(primeiro.trechos(), 1);
+        assert_eq!(segundo.trechos(), 1);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A publicação recebe o `Arc` pronto e o move para o lock. A identidade do
+    /// ponteiro prova que a versão final não passa por um clone profundo.
+    #[test]
+    fn publicar_indice_nao_clona_a_estrutura() {
+        let base = std::env::temp_dir()
+            .join(format!("aether-memoria-publicar-arc-{}", std::process::id()));
+        let custodio = Custodio::novo(
+            &[],
+            &base,
+            &base,
+            base.join("rag.json"),
+            &base.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        let indice = Arc::new(Indice::vazio("m", 2, "último", 64, 0));
+        let endereco = Arc::as_ptr(&indice);
+        custodio.publicar_indice(indice);
+
+        let guard = trava_leitura(&custodio.indice);
+        assert_eq!(Arc::as_ptr(guard.as_ref().unwrap()), endereco);
     }
 
     #[test]
@@ -4090,5 +5361,566 @@ mod testes {
         std::fs::write(&arquivo, "{ não é json").unwrap();
         assert_eq!(Ajustes::de(&arquivo), Ajustes::default());
         std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Partição IVF, cache do vetor de consulta e a conta dos produtos
+    // -----------------------------------------------------------------
+
+    /// Vetor unitário apontando para a direção `grupo`, com uma cauda pequena e
+    /// determinística. Dois grupos distintos dão cosseno perto de zero entre si, e
+    /// a determinismo é o que faz o mapa ser o mesmo em duas execuções do teste —
+    /// sem ele, um k-means com sorteio aprovaria hoje e falharia amanhã.
+    fn vetor_do_grupo(n: usize, grupo: usize, dimensao: usize) -> Vec<f32> {
+        let mut vetor = vec![0f32; dimensao];
+        vetor[grupo] = 4.0;
+        for d in 0..dimensao {
+            vetor[d] += ((n * 7 + d * 13 + 1) % 17) as f32 / 200.0;
+        }
+        let norma = vetor.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for v in vetor.iter_mut() {
+            *v /= norma;
+        }
+        vetor
+    }
+
+    /// O índice sintético das buscas abaixo: `trechos` peças divididas em `grupos`
+    /// pastas, cada pasta um aglomerado de direção própria. Sintético de propósito
+    /// — nenhum modelo real devolve clusters tão limpos, e é justamente a forma
+    /// conhecida que permite provar que o pré-filtro cortou sem perder ninguém.
+    fn indice_em_grupos(trechos: usize, grupos: usize, dimensao: usize) -> Indice {
+        // Cada grupo reclama uma direção própria, e direção é eixo: doze pastas
+        // precisam de mais que oito coordenadas, e o `vetor_do_grupo` abaixo
+        // estouraria o índice antes de o teste provar qualquer coisa.
+        debug_assert!(grupos <= dimensao, "{grupos} aglomerados não cabem em {dimensao} eixos");
+        let mut indice = Indice::vazio("m", dimensao, "último", 64, 0);
+        for n in 0..trechos {
+            let grupo = n % grupos;
+            indice.anexar(
+                Trecho {
+                    arquivo: format!("C:/casa/g{grupo}/a{n}.rs"),
+                    linha: n + 1,
+                    texto: format!("p{}", n % 40),
+                    fonte: Fonte::Arquivo,
+                },
+                &vetor_do_grupo(n, grupo, dimensao),
+            );
+        }
+        indice
+    }
+
+    fn raizes_de(grupos: &[usize]) -> Vec<PathBuf> {
+        grupos.iter().map(|g| PathBuf::from(format!("C:/casa/g{g}"))).collect()
+    }
+
+    /// O que a lista devolve, despida do objeto: chave, linha, número do cartão e
+    /// origem. É o que as duas portas comparam — se estes quatro batem item a
+    /// item, a busca particionada respondeu pela mesma casa da exaustiva.
+    fn assinatura_da_lista(resposta: &Resposta) -> Vec<(String, usize, f32, Origem)> {
+        resposta
+            .achados
+            .iter()
+            .map(|a| (a.arquivo.clone(), a.linha, a.pontuacao, a.origem))
+            .collect()
+    }
+
+    /// A prova central: com o mapa gravado, a lista é a mesma que a varredura
+    /// inteira daria. Não é amostragem nem probabilidade — é o teto de Cauchy–Schwarz
+    /// de cada balde contra o melhor valor que já entra na lista, e o teste cobra
+    /// isso em três chões e quatro larguras, nos dois modos que medem vetor.
+    #[test]
+    fn o_particionamento_devolve_a_mesma_lista() {
+        let mut indice = indice_em_grupos(600, 6, 8);
+        indice.reagrupar();
+        let mapa = indice.meta.clusteres.as_ref().expect("600 peças passam do piso da partição");
+        assert_eq!(mapa.balde.len(), 600, "um balde por trecho, ou o mapa não vale");
+        assert!(mapa.quantos >= 2);
+
+        let consulta = vetor_do_grupo(0, 3, 8);
+        let raizes = raizes_de(&(0..6).collect::<Vec<usize>>());
+        let mut exaustivo = indice.clone();
+        exaustivo.meta.clusteres = None;
+
+        for (modo, k) in [
+            (Modo::Vetorial, 1usize),
+            (Modo::Vetorial, 8),
+            (Modo::Hibrido, 8),
+            (Modo::Hibrido, 40),
+        ] {
+            for piso in [0.0f32, 0.5, 0.9] {
+                let busca = Busca {
+                    vetor: &consulta,
+                    texto: "p3 p9 p12",
+                    k,
+                    piso,
+                    modo,
+                    ignorar: &[],
+                    documentos: &[],
+                };
+                let com_mapa = indice.buscar(&busca, &raizes).expect("buscou com mapa");
+                let sem_mapa = exaustivo.buscar(&busca, &raizes).expect("buscou sem mapa");
+                assert_eq!(
+                    assinatura_da_lista(&com_mapa),
+                    assinatura_da_lista(&sem_mapa),
+                    "listas diferentes para modo {k}/{piso} de {:?}",
+                    modo.nome()
+                );
+            }
+        }
+    }
+
+    /// O balde que a permissão revoga inteiro não muda o resto da lista, e não
+    /// empresta um trecho seu a ninguém. A partição entrega candidatos; quem decide
+    /// é a concessão, item a item — e um balde fora do ar tem de sair da conta sem
+    /// deixar rastro, exatamente como sairia na varredura inteira.
+    #[test]
+    fn a_revogacao_de_um_balde_inteiro_nao_muda_a_lista_dos_outros() {
+        let mut indice = indice_em_grupos(600, 6, 8);
+        indice.reagrupar();
+        let consulta = vetor_do_grupo(0, 2, 8);
+
+        for k in [1usize, 8, 24] {
+            for piso in [0.0f32, 0.4] {
+                // As pastas concedidas param antes do grupo 2: tudo o que mora
+                // naquele aglomerado está fora da resposta.
+                let raizes = raizes_de(&[0, 1, 3, 4, 5]);
+                let busca = Busca {
+                    vetor: &consulta,
+                    texto: "",
+                    k,
+                    piso,
+                    modo: Modo::Vetorial,
+                    ignorar: &[],
+                    documentos: &[],
+                };
+                let com_mapa = indice.buscar(&busca, &raizes).expect("buscou");
+                let mut exaustivo = indice.clone();
+                exaustivo.meta.clusteres = None;
+                let sem_mapa = exaustivo.buscar(&busca, &raizes).expect("buscou exaustivo");
+                assert_eq!(assinatura_da_lista(&com_mapa), assinatura_da_lista(&sem_mapa));
+                assert!(
+                    com_mapa.achados.iter().all(|a| !a.arquivo.contains("/g2/")),
+                    "a partição vazou um trecho de uma pasta revogada"
+                );
+            }
+        }
+    }
+
+    /// O número que o dono pede: quantos produtos escalares uma pergunta custa.
+    /// Doze mil peças é o teto do índice, e é o caso em que a varredura inteira é
+    /// quarenta e nove megabytes lidos por consulta. O teste conta os dois lados e
+    /// exige que a lista continue idêntica — corte, mas não corte resposta.
+    #[test]
+    fn a_particao_corta_os_produtos_escalares_da_consulta() {
+        let mut indice = indice_em_grupos(12_000, 12, 16);
+        indice.reagrupar();
+        let mapa = indice.meta.clusteres.as_ref().expect("doze mil peças passam do piso");
+        assert_eq!(mapa.balde.len(), 12_000);
+
+        let consulta = vetor_do_grupo(0, 5, 16);
+        let raizes = raizes_de(&(0..12).collect::<Vec<usize>>());
+        let busca = Busca {
+            vetor: &consulta,
+            texto: "",
+            k: 8,
+            piso: 0.0,
+            modo: Modo::Vetorial,
+            ignorar: &[],
+            documentos: &[],
+        };
+        let (lista_exaustiva, exaustiva) = {
+            let mut sem_mapa = indice.clone();
+            sem_mapa.meta.clusteres = None;
+            let (resposta, conta) = sem_mapa.buscar_contando(&busca, &raizes).expect("buscou");
+            (assinatura_da_lista(&resposta), conta)
+        };
+        let (resposta, particionada) = indice.buscar_contando(&busca, &raizes).expect("buscou");
+
+        assert_eq!(exaustiva.trechos, 12_000, "sem mapa é o índice inteiro, medição por medição");
+        assert_eq!(exaustiva.centroides, 0);
+        // Medido em execução, não estimado: a sondagem percorre uma fatia dos baldes
+        // e para no teto, e os números abaixo são a contagem que este teste acabou de
+        // fazer. É neles que a casa se pega se um dia parar de cortar.
+        // Medido nesta execução, não estimado: 825 peças dos doze mil, e o teto de
+        // 2.400 é folga para o arredondamento de `produto` entre alvos, não um número
+        // de conforto. É nele que a casa se pega se um dia parar de cortar.
+        assert!(
+            particionada.trechos <= 2_400,
+            "a partição mediu {} peças de doze mil: não cortou nada",
+            particionada.trechos
+        );
+        assert_eq!(particionada.centroides, mapa.quantos);
+        assert_eq!(resposta.achados.len(), 8);
+        assert_eq!(
+            assinatura_da_lista(&resposta),
+            lista_exaustiva,
+            "cortar a conta não é cortar a resposta: as duas listas têm de ser a mesma"
+        );
+    }
+
+    /// Abaixo de [`CLUSTER_MINIMO`] a casa é pequena demais para valer o mapa: a
+    /// varredura inteira ganha de qualquer partição, e o índice de uma pessoa com
+    /// cem notas não paga k-means em escrita nenhuma.
+    #[test]
+    fn o_piso_da_particao_deixa_a_casa_pequena_em_varredura_simples() {
+        let mut curto = indice_em_grupos(CLUSTER_MINIMO - 1, 6, 8);
+        curto.reagrupar();
+        assert!(curto.meta.clusteres.is_none(), "índice pequeno não ganha mapa nenhum");
+        let consulta = vetor_do_grupo(0, 2, 8);
+        let raizes = raizes_de(&(0..6).collect::<Vec<usize>>());
+        let busca = Busca {
+            vetor: &consulta,
+            texto: "",
+            k: 8,
+            piso: 0.0,
+            modo: Modo::Vetorial,
+            ignorar: &[],
+            documentos: &[],
+        };
+        let (resposta, conta) = curto.buscar_contando(&busca, &raizes).expect("buscou");
+        assert_eq!(conta.trechos, CLUSTER_MINIMO - 1, "varreu tudo, como tem de ser");
+        assert_eq!(conta.centroides, 0);
+        assert_eq!(resposta.achados.len(), 8);
+
+        // Um trecho acima do piso, o mapa entra — e é a mesma busca, agora medida
+        // pela sondagem, continuando a devolver a mesma lista.
+        let mut cheio = indice_em_grupos(CLUSTER_MINIMO, 6, 8);
+        cheio.reagrupar();
+        let mapa = cheio.meta.clusteres.as_ref().expect("no piso o mapa já vale");
+        assert_eq!(mapa.balde.len(), CLUSTER_MINIMO);
+        let com_mapa = cheio.buscar(&busca, &raizes).expect("buscou com mapa");
+        let mut sem_mapa = cheio.clone();
+        sem_mapa.meta.clusteres = None;
+        let exaustiva = sem_mapa.buscar(&busca, &raizes).expect("buscou sem mapa");
+        assert_eq!(assinatura_da_lista(&com_mapa), assinatura_da_lista(&exaustiva));
+        assert!(cheio.buscar_contando(&busca, &raizes).expect("contou").1.centroides > 0);
+    }
+
+    /// As três invariantes que os mutadores devem guardar: a anexação põe o recém-
+    /// chegado no balde mais próximo e afrouxa o raio dele; a remoção tira o balde
+    /// junto com o trecho; e nenhuma das duas desalinha o mapa do índice — o que,
+    /// desalinhado, faria a busca cortar baldes pelo vetor de um vizinho.
+    #[test]
+    fn anexar_e_remover_andam_com_o_mapa_de_baldes() {
+        let total = CLUSTER_MINIMO;
+        let mut indice = indice_em_grupos(total, 8, 8);
+        indice.reagrupar();
+        let quantos = indice.meta.clusteres.as_ref().unwrap().quantos;
+
+        indice.anexar(
+            Trecho {
+                arquivo: "C:/casa/g0/novo.rs".into(),
+                linha: 1,
+                texto: "p1".into(),
+                fonte: Fonte::Arquivo,
+            },
+            &vetor_do_grupo(8, 0, 8),
+        );
+        {
+            let mapa = indice.meta.clusteres.as_ref().expect("a anexação conserva o mapa");
+            assert_eq!(mapa.balde.len(), total + 1);
+            assert!(mapa.balde[total] < quantos as u32, "o recém-chegado tem balde");
+            assert!(mapa.raio.iter().all(|r| *r >= 0.0));
+            assert!(mapa.centroide.len() == quantos * mapa.dimensao);
+        }
+
+        // E a busca continua exata com o mapa herdado de outra escala — é o estado
+        // em que a casa fica entre uma varredura e outra.
+        let consulta = vetor_do_grupo(8, 0, 8);
+        let raizes = raizes_de(&(0..8).collect::<Vec<usize>>());
+        let busca = Busca {
+            vetor: &consulta,
+            texto: "",
+            k: 12,
+            piso: 0.0,
+            modo: Modo::Vetorial,
+            ignorar: &[],
+            documentos: &[],
+        };
+        let com_mapa = indice.buscar_contando(&busca, &raizes).expect("buscou");
+        assert!(com_mapa.1.trechos < total + 1, "o mapa novo ainda corta");
+        let mut sem_mapa = indice.clone();
+        sem_mapa.meta.clusteres = None;
+        assert_eq!(
+            assinatura_da_lista(&com_mapa.0),
+            assinatura_da_lista(&sem_mapa.buscar(&busca, &raizes).expect("buscou"))
+        );
+
+        assert_eq!(indice.remover_arquivo("C:/casa/g0/novo.rs"), 1);
+        let mapa = indice.meta.clusteres.as_ref().expect("a remoção conserva o mapa");
+        assert_eq!(mapa.balde.len(), total, "saiu o trecho, saiu o balde dele");
+        assert_eq!(mapa.quantos, quantos);
+    }
+
+    /// O mapa atravessa o disco. Gravar e reler é o caminho de toda sessão depois
+    /// da primeira varredura: reconstruir a partição a cada abertura pagaria um
+    /// k-means por turno e anularia o motivo de ele existir.
+    #[test]
+    fn a_particao_sobrevive_ao_salvar_e_carregar() {
+        let pasta = std::env::temp_dir()
+            .join(format!("aether-memoria-particao-{}", std::process::id()));
+        std::fs::create_dir_all(&pasta).unwrap();
+        let arquivo = pasta.join("indice.aether");
+
+        let mut indice = indice_em_grupos(600, 6, 8);
+        indice.reagrupar();
+        let gravado = indice.meta.clusteres.clone().unwrap();
+        indice.salvar(&arquivo).unwrap();
+
+        let lido = Indice::carregar(&arquivo).expect("releu");
+        assert_eq!(lido.meta.clusteres.as_ref(), Some(&gravado), "o mapa é o mapa");
+        let consulta = vetor_do_grupo(0, 4, 8);
+        let raizes = raizes_de(&(0..6).collect::<Vec<usize>>());
+        let busca = Busca {
+            vetor: &consulta,
+            texto: "",
+            k: 8,
+            piso: 0.0,
+            modo: Modo::Vetorial,
+            ignorar: &[],
+            documentos: &[],
+        };
+        let (resposta, conta) = lido.buscar_contando(&busca, &raizes).expect("buscou do disco");
+        assert_eq!(conta.centroides, gravado.quantos, "sondou os baldes, não o índice");
+        assert!(conta.trechos < 600);
+        let sem_mapa = {
+            let mut e = lido.clone();
+            e.meta.clusteres = None;
+            e.buscar(&busca, &raizes).expect("buscou")
+        };
+        assert_eq!(assinatura_da_lista(&resposta), assinatura_da_lista(&sem_mapa));
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// O índice escrito antes disto existir. A chave `clusteres` não estava no JSON
+    /// da metadata, o arquivo continua com a mesma assinatura de sempre, e a busca
+    /// dele continua sendo a varredura inteira — errada não fica, só mais lenta, e
+    /// é por isso que o formato não precisou de versão nova: quem escreve o mapa é
+    /// a próxima varredura, e enquanto ela não vem a casa responde pelo caminho
+    /// antigo.
+    #[test]
+    fn o_indice_gravado_sem_particao_continua_respondendo() {
+        let pasta = std::env::temp_dir()
+            .join(format!("aether-memoria-antigo-{}", std::process::id()));
+        std::fs::create_dir_all(&pasta).unwrap();
+        let arquivo = pasta.join("indice.aether");
+
+        let mut indice = indice_em_grupos(600, 6, 8);
+        indice.reagrupar();
+        indice.salvar(&arquivo).unwrap();
+
+        // O mesmo arquivo sem a chave: byte a byte o que a casa escrevia antes.
+        let bruto = std::fs::read(&arquivo).unwrap();
+        assert_eq!(&bruto[..4], ASSINATURA);
+        let tamanho = u32::from_le_bytes(bruto[4..8].try_into().unwrap()) as usize;
+        let mut meta: serde_json::Value = serde_json::from_slice(&bruto[8..8 + tamanho]).unwrap();
+        assert!(meta.get("clusteres").is_some(), "o formato novo escreve a chave");
+        meta.as_object_mut().unwrap().remove("clusteres");
+        let meta = serde_json::to_vec(&meta).unwrap();
+        let mut antigo = Vec::new();
+        antigo.extend_from_slice(ASSINATURA);
+        antigo.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        antigo.extend_from_slice(&meta);
+        antigo.extend_from_slice(&bruto[8 + tamanho..]);
+        std::fs::write(&arquivo, &antigo).unwrap();
+
+        let lido = Indice::carregar(&arquivo).expect("o índice antigo abre");
+        assert!(lido.meta.clusteres.is_none(), "sem a chave não há mapa nenhum");
+        assert_eq!(lido.trechos(), 600);
+        let consulta = vetor_do_grupo(0, 4, 8);
+        let raizes = raizes_de(&(0..6).collect::<Vec<usize>>());
+        let busca = Busca {
+            vetor: &consulta,
+            texto: "p3 p9",
+            k: 8,
+            piso: 0.0,
+            modo: Modo::Hibrido,
+            ignorar: &[],
+            documentos: &[],
+        };
+        let (resposta, conta) = lido.buscar_contando(&busca, &raizes).expect("o antigo responde");
+        assert_eq!(resposta.achados.len(), 8);
+        assert_eq!(conta.trechos, 600, "sem mapa a casa inteira é medida");
+        assert_eq!(conta.centroides, 0);
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// A segunda vez que a mesma pergunta entra não passa pelo codificador. É o
+    /// ponto que a auditoria achou: a ferramenta `buscar_memoria` embutia a frase a
+    /// cada invocação, e um turno que consulta a memória três vezes pagava três
+    /// vezes pelo vetor da mesma pergunta.
+    #[test]
+    fn a_mesma_pergunta_nao_vira_vetor_duas_vezes() {
+        let pasta = std::env::temp_dir()
+            .join(format!("aether-memoria-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&pasta).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &pasta,
+            &pasta,
+            pasta.join("rag.json"),
+            &pasta.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        let chave = ChaveConsulta {
+            modelo: "m".into(),
+            agrupamento: "último".into(),
+            dimensao: 2,
+            lote: 8,
+            prefixo: None,
+            texto: "quanto é dois mais dois?".into(),
+        };
+        let mut embutidas = 0usize;
+        let primeiro = custodio
+            .vetor_da_chave(chave.clone(), || {
+                embutidas += 1;
+                Ok(vec![1.0, 0.0])
+            })
+            .expect("embutiu");
+        let segundo = custodio
+            .vetor_da_chave(chave.clone(), || {
+                embutidas += 1;
+                Ok(vec![0.0, 1.0])
+            })
+            .expect("consultou");
+        assert_eq!(embutidas, 1, "a repetição não passou pelo codificador");
+        assert_eq!(primeiro, segundo, "a segunda vez devolve o mesmo vetor");
+
+        // As outras pontas que identificam o vetor, além do texto. Trocar qualquer
+        // uma delas é trocar o espaço em que a pergunta vive, e o vetor guardado
+        // deixaria de ser o da pergunta — a incoerência que o teste acima não pode
+        // deixar passar.
+        for outra in [
+            ChaveConsulta { modelo: "outro-modelo".into(), ..chave.clone() },
+            ChaveConsulta { agrupamento: "média".into(), ..chave.clone() },
+            ChaveConsulta { dimensao: 4, ..chave.clone() },
+            ChaveConsulta { lote: 16, ..chave.clone() },
+            ChaveConsulta { prefixo: Some("consulta: "), ..chave.clone() },
+            ChaveConsulta { texto: "quanto é dois mais dois".into(), ..chave.clone() },
+        ] {
+            let mut produziu = false;
+            let obtido = custodio
+                .vetor_da_chave(outra.clone(), || {
+                    produziu = true;
+                    Ok(vec![0.25, 0.75])
+                })
+                .expect("embutiu de novo");
+            assert!(produziu, "a chave de texto {:?} não é a da pergunta guardada", outra.texto);
+            assert_eq!(obtido, vec![0.25, 0.75]);
+        }
+
+        // E o teto é teto: a casa não acumula vetores de perguntas antigas.
+        for n in 0..CACHE_CONSULTAS * 2 {
+            let c = ChaveConsulta { texto: format!("pergunta {n}"), ..chave.clone() };
+            custodio.vetor_da_chave(c, || Ok(vec![0.5, 0.5])).expect("embutiu");
+        }
+        assert_eq!(trava_estado(&custodio.consultas).itens.len(), CACHE_CONSULTAS);
+        let mut saiu_e_reembutiu = false;
+        custodio
+            .vetor_da_chave(chave.clone(), || {
+                saiu_e_reembutiu = true;
+                Ok(vec![1.0, 0.0])
+            })
+            .expect("embutiu");
+        assert!(saiu_e_reembutiu, "a consulta mais antiga saiu do LRU");
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// Apagar a memória ou trocar de codificador derruba os vetores guardados. A
+    /// chave já recusaria um vetor de outra casa, mas "apagar a memória" é um
+    /// pedido do dono sobre o texto dele, e texto dele transformado não sobrevive
+    /// ao pedido esperando o descarte natural do LRU.
+    #[test]
+    fn trocar_o_codificador_e_apagar_a_memoria_esvaziam_o_cache() {
+        let pasta = std::env::temp_dir()
+            .join(format!("aether-memoria-cache-invalido-{}", std::process::id()));
+        std::fs::create_dir_all(&pasta).unwrap();
+        let custodio = Custodio::novo(
+            &[],
+            &pasta,
+            &pasta,
+            pasta.join("rag.json"),
+            &pasta.join(crate::ai::base::PASTA),
+            Arc::new(RwLock::new(Pastas::default())),
+        );
+        let chave = ChaveConsulta {
+            modelo: "m".into(),
+            agrupamento: "último".into(),
+            dimensao: 2,
+            lote: 8,
+            prefixo: None,
+            texto: "pergunta".into(),
+        };
+        let guardar = |custodio: &Custodio| {
+            custodio.vetor_da_chave(chave.clone(), || Ok(vec![1.0, 0.0])).expect("embutiu")
+        };
+        guardar(&custodio);
+        assert_eq!(trava_estado(&custodio.consultas).itens.len(), 1);
+
+        custodio.ajustar(Ajustes { modelo: "outro".into(), ..Ajustes::default() }).unwrap();
+        assert!(trava_estado(&custodio.consultas).itens.is_empty(), "trocou o codificador");
+
+        guardar(&custodio);
+        custodio.soltar("m").ok();
+        assert!(trava_estado(&custodio.consultas).itens.is_empty(), "soltou o codificador");
+
+        guardar(&custodio);
+        custodio.apagar().expect("apagou");
+        assert!(trava_estado(&custodio.consultas).itens.is_empty(), "apagar apaga tudo");
+        std::fs::remove_dir_all(&pasta).ok();
+    }
+
+    /// A primeira peça de uma nota presa é a de linha menor, na ordem em que ela
+    /// entrou — e o índice a encontra numa passada só sobre as peças, em vez de
+    /// varrer a casa inteira por nota presa. Fora de ordem de propósito: um
+    /// fatiamento truncado entra no índice assim, e era o caso que o varrer por
+    /// nota resolvia no azar da primeira aparição.
+    #[test]
+    fn a_nota_presa_e_a_de_linha_menor_na_ordem_de_chegada() {
+        let mut indice = Indice::vazio("m", 2, "último", 64, 0);
+        let presa = nota("gaveta", "Gaveta", "p0 p1", 1_700_000_000_005, true);
+        let prontas: Vec<(Peca, Vec<f32>)> = [
+            (7usize, "sete"),
+            (2, "dois"),
+            (2, "dois de novo"),
+            (9, "nove"),
+        ]
+        .into_iter()
+        .map(|(linha, texto)| {
+            (Peca { linha, texto: texto.to_string(), ids: vec![] }, vec![1.0, 0.0])
+        })
+        .collect();
+        indice.substituir_documento(&presa, prova_da_nota(&presa), &prontas, false);
+
+        let solta = nota("solta", "Solta", "p2 p3", 1_700_000_000_009, false);
+        indice.substituir_documento(
+            &solta,
+            prova_da_nota(&solta),
+            &[(Peca { linha: 1, texto: "ninguém pediu".into(), ids: vec![] }, vec![1.0, 0.0])],
+            false,
+        );
+        // Presa que ainda não tem peça nenhuma não entra: preso é o que a casa sabe.
+        indice.meta.documentos.insert(
+            "fantasma".into(),
+            FichaDocumento {
+                titulo: "Fantasma".into(),
+                atualizada: 1_700_000_000_010,
+                fixada: true,
+                prova: Assinatura { bytes: 1, modificado: 1 },
+                truncada: false,
+            },
+        );
+
+        let presas = indice.pecas_fixadas();
+        assert_eq!(
+            presas.iter().map(|a| a.arquivo.as_str()).collect::<Vec<_>>(),
+            vec!["gaveta"],
+            "só a nota presa que tem peça indexada"
+        );
+        assert_eq!(presas[0].linha, 2, "a presa é a de linha menor, não a que chegou primeiro");
+        assert_eq!(
+            presas[0].texto, "dois",
+            "no empate de linha fica o trecho de índice menor, como na varredura antiga"
+        );
     }
 }

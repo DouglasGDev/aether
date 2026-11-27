@@ -5,8 +5,10 @@
 //! que o gate negou volta ao modelo como erro, nunca como sucesso inventado.
 
 use super::chat::{
-    CALL_OPEN, ChatMessage, ChatTemplate, ToolCall, ToolSpec, afirma_que_fez, chamada_pendente,
-    corpo_de_codigo, inicio_de_chamada, parse_tool_calls, promete_e_pede_licenca, strip_tool_calls,
+    CALL_OPEN, ChatMessage, ChatTemplate, ToolCall, ToolSpec, afirma_que_fez,
+    chamada_pendente as chamada_pendente_bruta, corpo_de_codigo, inicio_de_chamada,
+    parse_tool_calls as parse_tool_calls_bruto, promete_e_pede_licenca,
+    strip_tool_calls as strip_tool_calls_bruto,
 };
 use super::compactacao::{self, Resumo};
 use super::derrame;
@@ -16,6 +18,7 @@ use super::router::Choice;
 use crate::idiomas::{self, tr};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,10 +75,28 @@ fn retomada_cabe(
         && janela.saturating_sub(prompt + gerados + teto) >= RESERVA_MINIMA
 }
 
-/// O que a sessão entrega a quem escuta. Todo evento é fato ocorrido.
+/// O que a sessão entrega a quem escuta. Todo evento é fato ocorrido e carrega
+/// a identidade do turno e da conversa que o produziu.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEvent {
+    pub turn_id: u64,
+    pub conversation_id: String,
+    #[serde(flatten)]
+    pub kind: SessionEventKind,
+}
+
+impl SessionEvent {
+    pub fn new(turn_id: u64, conversation_id: &str, kind: SessionEventKind) -> Self {
+        Self { turn_id, conversation_id: conversation_id.to_string(), kind }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum SessionEvent {
+pub enum SessionEventKind {
+    /// Primeiro evento do turno, emitido antes de qualquer saída do modelo.
+    Started,
     /// Transparência obrigatória: modelo escolhido e motivo auditável.
     Choice { choice: Choice },
     Loading { model: String },
@@ -192,6 +213,7 @@ pub struct ToolOutcome {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnOutcome {
+    pub turn_id: u64,
     pub text: String,
     pub thinking: String,
     pub rounds: usize,
@@ -275,6 +297,82 @@ fn visible_end(raw: &str, from: usize) -> usize {
 /// tomado só pelo tempo de um push, nunca segurado enquanto o modelo gera.
 fn push(history: &Mutex<Vec<ChatMessage>>, message: ChatMessage) {
     trava_historico(history).push(message);
+}
+
+fn chamadas_unicas(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut unicas = Vec::with_capacity(calls.len());
+    for call in calls {
+        if !unicas.contains(&call) {
+            unicas.push(call);
+        }
+    }
+    unicas
+}
+
+/// Alguns modelos abrem o marcador XML e já respondem com um JSON completo.
+/// Nessa forma híbrida, a leitura XML reivindica o bloco e impede o JSON de ser
+/// lido. Só a abertura redundante é removida, e apenas quando o JSON contém uma
+/// chamada conectada: bloco incompleto continua sem execução e sem aparecer cru.
+fn normalizar_abertura_json<'a>(texto: &'a str, nomes: &[&str]) -> Cow<'a, str> {
+    let mut saida: Option<String> = None;
+    let mut de = 0usize;
+    let mut busca = 0usize;
+    while let Some(achado) = texto[busca..].find(CALL_OPEN) {
+        let inicio = busca + achado;
+        let depois = inicio + CALL_OPEN.len();
+        let espaco = texto[depois..].len() - texto[depois..].trim_start().len();
+        let json_inicio = depois + espaco;
+        if !matches!(texto.as_bytes().get(json_inicio), Some(b'{' | b'[')) {
+            busca = depois;
+            continue;
+        }
+        let mut leitor =
+            serde_json::Deserializer::from_str(&texto[json_inicio..]).into_iter::<serde_json::Value>();
+        let Some(Ok(_)) = leitor.next() else {
+            busca = depois;
+            continue;
+        };
+        let json_fim = json_inicio + leitor.byte_offset();
+        if parse_tool_calls_bruto(&texto[json_inicio..json_fim], nomes).is_empty() {
+            busca = depois;
+            continue;
+        }
+        let out = saida.get_or_insert_with(|| String::with_capacity(texto.len()));
+        out.push_str(&texto[de..inicio]);
+        out.push_str(&texto[depois..json_inicio]);
+        out.push_str(&texto[json_inicio..json_fim]);
+        de = json_fim;
+        busca = json_fim;
+    }
+    match saida {
+        Some(mut normalizado) => {
+            normalizado.push_str(&texto[de..]);
+            Cow::Owned(normalizado)
+        }
+        None => Cow::Borrowed(texto),
+    }
+}
+
+/// Extração e remoção usam a mesma normalização para não divergirem sobre o
+/// que é chamada e o que é prosa.
+fn parse_tool_calls(texto: &str, nomes: &[&str]) -> Vec<ToolCall> {
+    parse_tool_calls_bruto(&normalizar_abertura_json(texto, nomes), nomes)
+}
+
+fn strip_tool_calls(texto: &str, nomes: &[&str]) -> String {
+    strip_tool_calls_bruto(&normalizar_abertura_json(texto, nomes), nomes)
+}
+
+fn chamada_pendente(texto: &str, nomes: &[&str]) -> Option<String> {
+    let normalizado = normalizar_abertura_json(texto, nomes);
+    // A continuação precisa do texto original exato, não da forma normalizada.
+    chamada_pendente_bruta(&normalizado, nomes).map(|_| texto.to_string())
+}
+
+fn assistente_da_chamada(answer: &str, calls: &[ToolCall], nomes: &[&str]) -> ChatMessage {
+    let mut assistente = ChatMessage::new("assistant", strip_tool_calls(answer, nomes).trim());
+    assistente.tool_calls = Some(calls.to_vec());
+    assistente
 }
 
 /// Trava do histórico com a política de envenenamento do projeto (A8): devolve a
@@ -375,6 +473,35 @@ fn cabeca_que_cabe(
     Ok(Some(cabecas[baixo]))
 }
 
+/// A última fronteira cujo pedido de resumo ainda cabe. O pedido cresce com o
+/// prefixo, então a busca é binária como a do recorte; `None` significa que nem
+/// a primeira unidade completa pode ser lida pelo resumo.
+fn ultima_fronteira_cabe(
+    cabecas: &[usize],
+    cabe: &dyn Fn(usize) -> Result<bool>,
+) -> Result<Option<usize>> {
+    let Some(&ultimo) = cabecas.last() else {
+        return Ok(None);
+    };
+    if !cabe(ultimo)? {
+        if !cabe(cabecas[0])? {
+            return Ok(None);
+        }
+        let mut baixo = 0usize;
+        let mut alto = cabecas.len() - 1;
+        while baixo + 1 < alto {
+            let meio = (baixo + alto) / 2;
+            if cabe(cabecas[meio])? {
+                baixo = meio;
+            } else {
+                alto = meio;
+            }
+        }
+        return Ok(Some(cabecas[baixo]));
+    }
+    Ok(Some(ultimo))
+}
+
 /// Onde a conversa pode ser dobrada sem mentir para o modelo: o começo de um
 /// pedido da pessoa ou o começo de uma rodada de ferramenta. Um resultado de
 /// ferramenta nunca é fronteira — deixá-lo sozinho, sem a chamada que o produziu,
@@ -429,6 +556,7 @@ pub(crate) fn encaixe(
 ) -> Result<Encaixe> {
     let janela = engine.context();
     let limite = compactacao::limite(janela, config.params.max_tokens);
+    let macio = compactacao::limite_macio(janela, config.params.max_tokens);
     let base = usize::from(history.first().map(|m| m.role == "system").unwrap_or(false));
     // Índice da primeira mensagem que ainda não está no resumo.
     let desde = resumo.map(|r| r.ate.max(base)).unwrap_or(base);
@@ -459,22 +587,79 @@ pub(crate) fn encaixe(
     // Cortar em `desde` é não cortar nada agora: o que está de pé, com o resumo
     // que já existe.
     let ids = medir(desde, true)?;
-    if ids.len() <= limite {
+    if ids.len() <= macio {
         return Ok(Encaixe::Cabe { ids, dobradas: desde - base });
     }
 
     let dobras = fronteiras(history, desde);
-    let teto_dobrado = limite.saturating_sub(compactacao::RESERVA).max(1);
-    let Some(ate) = cabeca_que_cabe(&dobras, teto_dobrado, &|i| Ok(medir(i, false)?.len()))?
+    let resumiveis = match ultima_fronteira_cabe(&dobras, &|ate| {
+        compactacao::resumo_cabe(
+            engine,
+            template,
+            resumo.map(|r| r.texto.as_str()),
+            &history[desde..ate],
+        )
+    })? {
+        Some(ate) => {
+            let posicao = dobras
+                .iter()
+                .position(|&i| i == ate)
+                .expect("a fronteira devolvida pertence à lista");
+            &dobras[..=posicao]
+        }
+        None => &[],
+    };
+    let teto_dobrado = limite.saturating_sub(compactacao::RESERVA);
+    let Some(ate) = cabeca_que_cabe(resumiveis, teto_dobrado, &|i| Ok(medir(i, false)?.len()))?
     else {
         // Nada a dobrar, ou o que sobra ainda não cabe — com a janela do modelo
         // inteiro dentro, o que não couber é maior que a conversa.
+        if ids.len() <= limite {
+            return Ok(Encaixe::Cabe { ids, dobradas: desde - base });
+        }
         let minima = dobras.last().copied().unwrap_or(desde);
         let pedido = medir(minima, true)?.len();
         let fixo = medir(history.len(), false)?.len();
         return Ok(Encaixe::SemLugar { janela, fixo, pedido });
     };
     Ok(Encaixe::Dobre { desde, ate })
+}
+
+/// O corte de uma dobra que a pessoa pediu, e não a janela. As réguas são as
+/// mesmas do turno — fronteira de rodada, resumo cabendo no teto dele — porque
+/// uma segunda maneira de dobrar é uma segunda maneira de errar. A diferença é o
+/// quanto se dobra: o turno corta o mínimo para caber, o pedido comprime até a
+/// última fronteira que o resumo ainda consegue carregar, que é o que "libera a
+/// janela" quer dizer.
+///
+/// `None` é a verdade dita, não um zero inventado: ainda não há um turno inteiro
+/// atrás do resumo atual para comprimir.
+pub fn dobras_pedidas(
+    engine: &Engine,
+    template: &ChatTemplate,
+    history: &[ChatMessage],
+    resumo: Option<&Resumo>,
+) -> Result<Option<(usize, usize)>> {
+    corte_pedido(history, resumo, &|trecho| {
+        compactacao::resumo_cabe(engine, template, resumo.map(|r| r.texto.as_str()), trecho)
+    })
+}
+
+/// A mesma conta com a régua nas mãos de quem chama. Separada porque é ela que se
+/// confere sem placa: onde a dobra começa, o que é fronteira e o que acontece
+/// quando nenhum resumo cabe.
+fn corte_pedido(
+    history: &[ChatMessage],
+    resumo: Option<&Resumo>,
+    cabe: &dyn Fn(&[ChatMessage]) -> Result<bool>,
+) -> Result<Option<(usize, usize)>> {
+    let base = usize::from(history.first().map(|m| m.role == "system").unwrap_or(false));
+    let desde = resumo.map(|r| r.ate.max(base)).unwrap_or(base);
+    let dobras = fronteiras(history, desde);
+    let Some(ate) = ultima_fronteira_cabe(&dobras, &|ate| cabe(&history[desde..ate]))? else {
+        return Ok(None);
+    };
+    Ok(Some((desde, ate)))
 }
 
 /// A cabeceira que fecha a prosa, quando a resposta é um arquivo cercado com
@@ -527,6 +712,18 @@ fn corte_em_pensamento_aberto(raw: &str, thinking_ligado: bool, stop: StopReason
         && !raw.contains(THINK_CLOSE)
 }
 
+/// O que uma dobra de fato fez, dito pela rodada que a escreveu — não reconstruído
+/// depois. `lidas` é o número da tela e do registro na `.aether`; `descartadas` é
+/// a parte do trecho que não coube na régua do resumo e por isso não foi lida por
+/// ninguém: esconder essa conta é a mesma falta de dizer que dobrou o que não
+/// dobrou.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeitoDeDobra {
+    pub lidas: usize,
+    pub descartadas: usize,
+    pub tokens: usize,
+}
+
 /// Um turno completo: gera, executa as ferramentas que o modelo pediu e volta a
 /// gerar com os resultados, até responder em prosa ou atingir o teto de rodadas.
 pub fn run_turn(
@@ -534,9 +731,11 @@ pub fn run_turn(
     template: &ChatTemplate,
     history: &Mutex<Vec<ChatMessage>>,
     config: &TurnConfig<'_>,
+    turn_id: u64,
     cancel: &AtomicBool,
-    mut emit: impl FnMut(SessionEvent),
+    mut emit: impl FnMut(SessionEventKind),
     mut run_tool: impl FnMut(&ToolCall) -> Result<ToolOutcome>,
+    mut persistir_resumo: impl FnMut(&Resumo, &FeitoDeDobra) -> Result<()>,
 ) -> Result<TurnOutcome> {
     // O que fecha um turno é o vocabulário do modelo que está em memória, e não
     // um marcador suposto: um arquivo cujo EOS é outro token pararia sempre no
@@ -607,17 +806,26 @@ pub fn run_turn(
                     generated_tokens += gasto.generated_tokens;
                     prompt_ms += gasto.prompt_ms;
                     decode_ms += gasto.decode_ms;
-                    emit(SessionEvent::Resumo {
+                    let feito = FeitoDeDobra {
+                        lidas,
+                        descartadas: (ate - desde).saturating_sub(lidas),
+                        tokens: gasto.generated_tokens,
+                    };
+                    emit(SessionEventKind::Resumo {
                         texto: texto.clone(),
-                        mensagens: lidas,
+                        mensagens: feito.lidas,
                         // O trecho saiu do prompt inteiro; o que não coube na
                         // régua do resumo não foi lido nem condensado. Esconder
                         // essa conta é a mesma falta de dizer que dobrou o que
                         // não dobrou — com um número a menos na tela.
-                        descartadas: (ate - desde).saturating_sub(lidas),
-                        tokens: gasto.generated_tokens,
+                        descartadas: feito.descartadas,
+                        tokens: feito.tokens,
                     });
-                    resumo = Some(Resumo { texto, ate });
+                    resumo = Some(Resumo { texto, ate: desde + lidas });
+                    persistir_resumo(
+                        resumo.as_ref().expect("resumo recém-escrito"),
+                        &feito,
+                    )?;
                 }
                 Encaixe::SemLugar { janela, fixo, pedido } => {
                     // A última saída, e só depois de dobrar o que dava para
@@ -641,6 +849,9 @@ pub fn run_turn(
         // prosa para mostrar, são o caminho e o corpo do arquivo.
         let em_chamada = cabecilha.is_some();
         let generation = engine.generate(&ids, config.params, &stop, cancel, |emission| {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let replaced = match emission {
                 Emission::Delta(piece) => {
                     raw.push_str(&piece);
@@ -659,15 +870,15 @@ pub fn run_turn(
                 let close = raw.find(THINK_CLOSE).unwrap_or(raw.len());
                 let open = raw.find(THINK_OPEN).map(|i| i + THINK_OPEN.len()).unwrap_or(0);
                 if close > open && close > thought {
-                    emit(SessionEvent::Thinking { text: raw[open..close].to_string() });
+                    emit(SessionEventKind::Thinking { text: raw[open..close].to_string() });
                     thought = close;
                 }
             }
             let end = visible_end(&raw, start);
             if replaced {
-                emit(SessionEvent::Replace { text: raw[start..end].to_string() });
+                emit(SessionEventKind::Replace { text: raw[start..end].to_string() });
             } else if end > shown {
-                emit(SessionEvent::Delta { text: raw[shown..end].to_string() });
+                emit(SessionEventKind::Delta { text: raw[shown..end].to_string() });
             }
             shown = end;
         })?;
@@ -715,7 +926,7 @@ pub fn run_turn(
         {
             if let Some(aberta) = chamada_pendente(&raw, &nomes) {
                 continuacoes += 1;
-                emit(SessionEvent::Replace { text: String::new() });
+                emit(SessionEventKind::Replace { text: String::new() });
                 cabecilha = Some(aberta);
                 continue;
             }
@@ -742,7 +953,7 @@ pub fn run_turn(
             bail!(tr("erros.pensamentoTruncado", &[]));
         }
 
-        let calls = parse_tool_calls(&answer, &nomes);
+        let calls = chamadas_unicas(parse_tool_calls(&answer, &nomes));
         if calls.is_empty() {
             // O modelo pôs o arquivo na tela e disse que criou. Enquanto a
             // resposta for prosa, nada aconteceu: quem lê vê "criei" e o disco
@@ -752,7 +963,7 @@ pub fn run_turn(
             if !cabeceira_usada && rounds == 0 {
                 if let Some(cabeca) = cabeca_de_chamada(&answer, config.tools) {
                     cabeceira_usada = true;
-                    emit(SessionEvent::Replace { text: String::new() });
+                    emit(SessionEventKind::Replace { text: String::new() });
                     cabecilha = Some(cabeca);
                     continue;
                 }
@@ -768,8 +979,8 @@ pub fn run_turn(
                 generation.stop,
                 dobradas,
             );
-            emit(SessionEvent::Done { text: text.clone(), rounds, medicao });
-            return Ok(TurnOutcome { text, thinking, rounds, medicao, resumo });
+            emit(SessionEventKind::Done { text: text.clone(), rounds, medicao });
+            return Ok(TurnOutcome { turn_id, text, thinking, rounds, medicao, resumo });
         }
 
         if rounds >= config.max_rounds {
@@ -780,15 +991,13 @@ pub fn run_turn(
         }
         rounds += 1;
 
-        let mut assistant = ChatMessage::new("assistant", raw.clone());
-        assistant.tool_calls = Some(calls.clone());
-        push(history, assistant);
+        push(history, assistente_da_chamada(&answer, &calls, &nomes));
 
         for call in &calls {
             if cancel.load(Ordering::Relaxed) {
                 bail!(tr("erros.pedidoCancelado", &[]));
             }
-            emit(SessionEvent::ToolCall {
+            emit(SessionEventKind::ToolCall {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
@@ -799,7 +1008,10 @@ pub fn run_turn(
                 // não rodou para não afirmar que rodou.
                 Err(error) => (false, format!("{error:#}"), None),
             };
-            emit(SessionEvent::ToolResult {
+            if cancel.load(Ordering::Relaxed) {
+                bail!(tr("erros.pedidoCancelado", &[]));
+            }
+            emit(SessionEventKind::ToolResult {
                 name: call.name.clone(),
                 ok,
                 text: text.clone(),
@@ -817,6 +1029,22 @@ pub fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn started_serializa_como_evento_sem_campos_extras() {
+        assert_eq!(
+            serde_json::to_value(SessionEventKind::Started).unwrap(),
+            serde_json::json!({ "type": "started" })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionEvent::new(7, "conversa", SessionEventKind::Started)).unwrap(),
+            serde_json::json!({
+                "turnId": 7,
+                "conversationId": "conversa",
+                "type": "started"
+            })
+        );
+    }
 
     /// Vermelho-primeiro (A8): `push` fazia `expect("histórico envenenado")` e
     /// derrubava a thread. O histórico é `Vec<ChatMessage>` e toda mutação feita
@@ -1068,6 +1296,22 @@ mod tests {
     #[test]
     fn sem_turno_anterior_nao_ha_o_cortar() {
         assert_eq!(cabeca_que_cabe(&[], 500, &|_| Ok(100)).unwrap(), None);
+        assert_eq!(ultima_fronteira_cabe(&[], &|_| Ok(true)).unwrap(), None);
+    }
+
+    #[test]
+    fn o_resumo_usa_a_maior_fronteira_que_cabe_inteira() {
+        let cabecas = [2usize, 4, 6, 8];
+        let achada = ultima_fronteira_cabe(&cabecas, &|i| Ok(i <= 6)).unwrap();
+        assert_eq!(achada, Some(6));
+        assert_eq!(
+            ultima_fronteira_cabe(&cabecas, &|_| Ok(true)).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            ultima_fronteira_cabe(&cabecas, &|_| Ok(false)).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1105,6 +1349,59 @@ mod tests {
         // Uma resposta em prosa não é fronteira: ela é o fim de um turno, e
         // cortá-la do pedido que a provocou deixaria o texto falando sozinho.
         assert!(!fronteiras(&history, 1).contains(&4));
+    }
+
+    fn turnos(qtd: usize) -> Vec<ChatMessage> {
+        let mut history = vec![ChatMessage::new("system", "prompt")];
+        for _ in 0..qtd {
+            history.push(ChatMessage::new("user", "pergunta"));
+            history.push(ChatMessage::new("assistant", "resposta"));
+        }
+        history
+    }
+
+    /// O `/compactar` não pede "cabe": pede "comprime". Por isso ele vai até a
+    /// última fronteira que o resumo aguenta, e não até a primeira.
+    #[test]
+    fn a_dobra_pedida_vai_ate_a_ultima_frenteira_que_o_resumo_carrega() {
+        let history = turnos(3);
+        let corte = corte_pedido(&history, None, &|_| Ok(true)).unwrap();
+        assert_eq!(corte, Some((1, 5)));
+    }
+
+    /// O que não cabe no teto do resumo fica na conversa inteira: dobrar um trecho
+    /// que o modelo não consegue ler seria apagar sem guardar nada no lugar.
+    #[test]
+    fn a_dobra_pedida_para_na_ultima_frenteira_que_cabe() {
+        let history = turnos(3);
+        let ate_a_primeira = corte_pedido(&history, None, &|t| Ok(t.len() <= 2)).unwrap();
+        assert_eq!(ate_a_primeira, Some((1, 3)));
+        let nenhuma = corte_pedido(&history, None, &|_| Ok(false)).unwrap();
+        assert_eq!(nenhuma, None);
+    }
+
+    /// Um turno só não tem o que comprimir: não existe rodada inteira atrás de
+    /// outro turno. `None` aqui é a resposta honesta, não um zero.
+    #[test]
+    fn a_dobra_pedida_recusa_o_que_ainda_nao_e_conversa() {
+        let um_turno = corte_pedido(&turnos(1), None, &|_| Ok(true)).unwrap();
+        assert_eq!(um_turno, None);
+        let so_pedido = corte_pedido(&[ChatMessage::new("user", "oi")], None, &|_| Ok(true)).unwrap();
+        assert_eq!(so_pedido, None);
+    }
+
+    /// O resumo que já existe manda onde a dobra começa: o que ele já cobre não
+    /// entra de novo no trecho, e a placa não resume duas vezes o mesmo texto.
+    #[test]
+    fn a_dobra_pedida_comeca_depois_do_resumo_que_ja_esta_de_pe() {
+        let history = turnos(4);
+        let anterior = Resumo { texto: "resumo antigo".to_string(), ate: 4 };
+        let (desde, ate) =
+            corte_pedido(&history, Some(&anterior), &|_| Ok(true)).unwrap().expect("há o que dobrar");
+        assert_eq!((desde, ate), (4, 7));
+        // O trecho começa onde o resumo antigo parou e termina antes do último
+        // pedido, que continua de pé ao pé da letra.
+        assert_eq!(history[desde..ate].len(), 3);
     }
 
     fn escrita(nome: &str) -> ToolSpec {
@@ -1195,6 +1492,57 @@ mod tests {
             "Confirme se esse é exatamente o que você quer (sim/não)."
         );
         assert!(cabeca_de_chamada(resposta, &ferramentas).is_some());
+    }
+
+    #[test]
+    fn chamadas_identicas_nao_sao_executadas_duas_vezes() {
+        let chamada = ToolCall { name: "local__ler".into(), arguments: serde_json::json!({"caminho": "x"}) };
+        let outra = ToolCall { name: "local__ler".into(), arguments: serde_json::json!({"caminho": "y"}) };
+        let unicas = chamadas_unicas(vec![chamada.clone(), chamada.clone(), outra.clone()]);
+        assert_eq!(unicas, vec![chamada, outra]);
+    }
+
+    #[test]
+    fn a_chamada_estruturada_nao_fica_duplicada_no_texto_do_assistente() {
+        let nomes = ["local__ler"];
+        let resposta = format!(
+            "Vou ler.{CALL_OPEN}{{\"name\":\"local__ler\",\"arguments\":{{}}}}"
+        );
+        let chamadas = parse_tool_calls(&resposta, &nomes);
+        assert_eq!(chamadas.len(), 1);
+        let mensagem = assistente_da_chamada(&resposta, &chamadas, &nomes);
+        assert_eq!(mensagem.content, "Vou ler.");
+        assert_eq!(mensagem.tool_calls, Some(chamadas));
+    }
+
+    #[test]
+    fn a_chamada_estruturada_preserva_a_prosa_antes_e_depois() {
+        let nomes = ["local__ler"];
+        let respostas = [
+            format!(
+                "Vou ler.{CALL_OPEN}{{\"name\":\"local__ler\",\"arguments\":{{}}}} Depois."
+            ),
+            format!("Vou ler.{} Depois.", call_block("local__ler")),
+        ];
+        for resposta in respostas {
+            let chamadas = parse_tool_calls(&resposta, &nomes);
+            assert_eq!(chamadas.len(), 1);
+            let mensagem = assistente_da_chamada(&resposta, &chamadas, &nomes);
+            assert_eq!(mensagem.content, "Vou ler. Depois.");
+            assert_eq!(mensagem.tool_calls, Some(chamadas));
+        }
+    }
+
+    #[test]
+    fn chamada_pendente_xml_continua_do_texto_original_mesmo_com_hibrida_antes() {
+        let nomes = ["local__ler"];
+        let resposta = format!(
+            "Vou ler.{CALL_OPEN}{{\"name\":\"local__ler\",\"arguments\":{{}}}}{}relatorio",
+            inicio_de_chamada("local__ler")
+        );
+        assert_eq!(parse_tool_calls(&resposta, &nomes).len(), 1);
+        assert_eq!(chamada_pendente(&resposta, &nomes).as_deref(), Some(resposta.as_str()));
+        assert_eq!(strip_tool_calls(&resposta, &nomes), "Vou ler.");
     }
 
     /// Os pares abaixo foram lidos do turno real no aplicativo nativo, com

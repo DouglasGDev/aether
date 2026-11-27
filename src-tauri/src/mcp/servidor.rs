@@ -37,9 +37,7 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -162,7 +160,11 @@ impl Publicador {
         configuracao.legacy_session_mode = false;
         configuracao.cancellation_token = cancelamento.clone();
         let servico = StreamableHttpService::new(
-            move || Ok(Manipulador { execucao: Arc::clone(&execucao) }),
+            move || {
+                Ok(Manipulador {
+                    execucao: Arc::clone(&execucao),
+                })
+            },
             Arc::new(LocalSessionManager::default()),
             configuracao,
         );
@@ -280,9 +282,8 @@ impl ServerHandler for Manipulador {
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = std::result::Result<ListToolsResult, ErrorData>>
-    + Send
-    + '_ {
+    ) -> impl std::future::Future<Output = std::result::Result<ListToolsResult, ErrorData>> + Send + '_
+    {
         async move {
             Ok(ListToolsResult::with_all_items(ferramentas_anunciadas(
                 &self.execucao,
@@ -293,12 +294,14 @@ impl ServerHandler for Manipulador {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = std::result::Result<CallToolResponse, ErrorData>>
-    + Send
-    + '_ {
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = std::result::Result<CallToolResponse, ErrorData>> + Send + '_
+    {
         async move {
             let nome = request.name.to_string();
+            // Tudo que entra por esta porta é externo/manual, mesmo autenticado.
+            // `_meta` é escrito pelo cliente e não prova identidade de turno; o
+            // laço interno não passa por aqui e conserva esse vínculo no gerente.
             let argumentos = match request.arguments {
                 Some(mapa) => Value::Object(mapa),
                 None => Value::Object(Map::new()),
@@ -327,7 +330,7 @@ impl ServerHandler for Manipulador {
             };
             let saida = match self
                 .execucao
-                .ferramenta(CONECTOR, &nome, efeito, argumentos)
+                .ferramenta_cancelavel(CONECTOR, &nome, efeito, argumentos, None, &context.ct)
                 .await
             {
                 Ok(saida) => saida,
@@ -397,10 +400,7 @@ fn token_novo() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
         .map_err(|e| anyhow!(tr("erros.servidorMcpToken", &[("detalhe", &e.to_string())])))?;
-    Ok(bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 type Servico = StreamableHttpService<Manipulador, LocalSessionManager>;
@@ -541,7 +541,10 @@ fn negado() -> Response<BoxBody<Bytes, Infallible>> {
 /// O cabeçalho que autentica um cliente no endpoint publicado.
 pub fn cabecalho_autenticacao(token: &str) -> Result<(HeaderName, HeaderValue)> {
     let valor = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
-        anyhow!(tr("erros.valorCabecalhoInvalido", &[("nome", "Authorization")]))
+        anyhow!(tr(
+            "erros.valorCabecalhoInvalido",
+            &[("nome", "Authorization")]
+        ))
     })?;
     Ok((AUTHORIZATION, valor))
 }
@@ -571,7 +574,19 @@ mod tests {
         modo: AgentMode,
         allowlist: Option<Vec<String>>,
     ) -> (Publicador, PathBuf) {
-        let (eventos, _) = tokio::sync::broadcast::channel(4);
+        let (publicador, raiz, _) = publicador_com_eventos(modo, allowlist);
+        (publicador, raiz)
+    }
+
+    fn publicador_com_eventos(
+        modo: AgentMode,
+        allowlist: Option<Vec<String>>,
+    ) -> (
+        Publicador,
+        PathBuf,
+        tokio::sync::broadcast::Receiver<crate::mcp::manager::McpEvent>,
+    ) {
+        let (eventos, receber) = tokio::sync::broadcast::channel(8);
         let raiz = std::env::temp_dir().join(format!("aether-servidor-{}", std::process::id()));
         std::fs::create_dir_all(&raiz).expect("pasta de teste");
         let pastas = Arc::new(RwLock::new(Pastas {
@@ -598,7 +613,7 @@ mod tests {
             Arc::new(raiz.join("bancos.json")),
             Arc::new(raiz.join("resultados")),
         );
-        (Publicador::novo(execucao), raiz)
+        (Publicador::novo(execucao), raiz, receber)
     }
 
     type Cliente = rmcp::service::RunningService<rmcp::RoleClient, ()>;
@@ -606,12 +621,10 @@ mod tests {
     /// A mão apertada do cliente que este aplicativo já usa para conectar em
     /// qualquer servidor HTTP: a prova é pelo protocolo, não por chamada interna.
     async fn conectar(url: &str, token: &str) -> Result<Cliente> {
-        let config =
-            StreamableHttpClientTransportConfig::with_uri(url.to_string()).custom_headers(
-                HashMap::from([cabecalho_autenticacao(token).expect("cabeçalho")]),
-            );
-        ()
-            .serve(StreamableHttpClientTransport::from_config(config))
+        let config = StreamableHttpClientTransportConfig::with_uri(url.to_string()).custom_headers(
+            HashMap::from([cabecalho_autenticacao(token).expect("cabeçalho")]),
+        );
+        ().serve(StreamableHttpClientTransport::from_config(config))
             .await
             .map_err(|e| anyhow!("a mão apertada falhou: {e:?}"))
     }
@@ -642,7 +655,11 @@ mod tests {
             AgentMode::FullAccess,
             Some(vec!["ler_arquivo".into(), "info_sistema".into()]),
         );
-        assert_eq!(publicador.estado().ferramentas, 2, "inativo também conta o recorte");
+        assert_eq!(
+            publicador.estado().ferramentas,
+            2,
+            "inativo também conta o recorte"
+        );
     }
 
     #[test]
@@ -656,7 +673,10 @@ mod tests {
         let cadastrado = conector(&estado);
         let json = serde_json::to_string(&cadastrado).expect("conector serializa");
         assert!(json.contains("${AETHER_MCP_TOKEN}"), "{json}");
-        assert!(json.contains("4599/mcp"), "o endereço vai no cadastro: {json}");
+        assert!(
+            json.contains("4599/mcp"),
+            "o endereço vai no cadastro: {json}"
+        );
         assert!(!json.contains("Bearer segredo"), "{json}");
         assert_eq!(cadastrado.auth, McpAuth::Token);
         assert_eq!(cadastrado.kind, ConnectorKind::Mcp);
@@ -742,8 +762,7 @@ mod tests {
         // como queda.
         let mut caiu = false;
         loop {
-            match tokio::time::timeout(Duration::from_millis(100), soquete.read(&mut corpo)).await
-            {
+            match tokio::time::timeout(Duration::from_millis(100), soquete.read(&mut corpo)).await {
                 Err(_) => break,
                 Ok(Ok(0)) => {
                     caiu = true;
@@ -756,7 +775,10 @@ mod tests {
                 }
             }
         }
-        assert!(!caiu, "a conexão caiu antes de fechar: não havia o que drenar");
+        assert!(
+            !caiu,
+            "a conexão caiu antes de fechar: não havia o que drenar"
+        );
 
         publicador.fechar().await.expect("fecha");
 
@@ -914,6 +936,84 @@ mod tests {
             "o modo do cliente não reabre uma ferramenta fechada no grafo"
         );
         assert!(!alvo.exists(), "desligada é não escrita");
+        cliente.cancel().await.ok();
+        publicador.fechar().await.expect("fecha");
+    }
+
+    /// Um cliente externo autenticado pode escrever qualquer `_meta`, inclusive
+    /// uma identidade de turno. Ela não pode emprestar o card de um turno interno.
+    /// Ainda assim, dropar a futura rmcp envia `notifications/cancelled` e o
+    /// `RequestContext.ct` corta a aprovação sem derrubar a conexão seguinte.
+    #[tokio::test]
+    async fn metadado_forjado_nao_empresta_turno_e_cancelamento_preserva_a_conexao() {
+        use crate::mcp::manager::McpEvent;
+        use rmcp::model::{RequestMetaObject, RequestParamsMeta};
+
+        let (publicador, raiz, mut eventos) = publicador_com_eventos(AgentMode::Default, None);
+        let (estado, token) = publicador.abrir().await.expect("abre");
+        let cliente = conectar(&estado.url, &token).await.expect("conecta");
+        let alvo = raiz.join("publicada-cancelada.txt");
+        let mut params = CallToolRequestParams::new("escrever_arquivo").with_arguments(
+            serde_json::json!({
+                "caminho": alvo.to_string_lossy(),
+                "conteudo": "não pode escrever",
+            })
+            .as_object()
+            .cloned()
+            .expect("objeto"),
+        );
+        let meta = serde_json::from_value::<RequestMetaObject>(serde_json::json!({
+            "aether/turnId": 77,
+        }))
+        .expect("metadado MCP");
+        params.set_meta(meta);
+        let mut chamada = Box::pin(cliente.call_tool(params));
+        let pedido = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut chamada => panic!("a escrita completou sem aprovação"),
+                evento = eventos.recv() => match evento.expect("canal aberto") {
+                    McpEvent::ApprovalRequested { request } => request,
+                    outra => panic!("esperava aprovação, veio {outra:?}"),
+                },
+            }
+        })
+        .await
+        .expect("card chega pela conexão publicada");
+        assert_eq!(
+            pedido.turn_id, None,
+            "metadado de cliente autenticado não comprova um turno interno"
+        );
+        assert_eq!(
+            publicador.execucao.aprovacoes().cancel_turn(77),
+            0,
+            "o turno forjado nem sequer entra no índice de cancelamento"
+        );
+
+        drop(chamada);
+        let assentado = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match eventos.recv().await.expect("canal aberto") {
+                    McpEvent::ApprovalSettled { id, approved } if id == pedido.id => {
+                        assert!(!approved, "cancelamento nega a aprovação");
+                        break;
+                    }
+                    McpEvent::ApprovalSettled { .. } => {}
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assentado.expect("context.ct corta a espera da aprovação");
+        assert!(!alvo.exists(), "cancelada não escreve");
+        assert!(publicador.execucao.aprovacoes().pending_ids().is_empty());
+        assert!(trava_estado(&publicador.execucao.gate()).pending().count() == 0);
+
+        // A mesma sessão HTTP continua viva: cancelar uma chamada não é
+        // desconectar o servidor nem envenenar as chamadas de outros turnos.
+        cliente
+            .list_all_tools()
+            .await
+            .expect("conexão segue responsiva depois do cancelamento");
         cliente.cancel().await.ok();
         publicador.fechar().await.expect("fecha");
     }

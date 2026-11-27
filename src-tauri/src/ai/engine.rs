@@ -77,6 +77,19 @@ pub struct Generation {
 }
 
 impl Generation {
+    pub fn cancelada(prompt_tokens: usize) -> Self {
+        Self {
+            text: String::new(),
+            prompt_tokens,
+            reused_tokens: 0,
+            recorte_recusado: false,
+            generated_tokens: 0,
+            prompt_ms: 0,
+            decode_ms: 0,
+            stop: StopReason::Cancelled,
+        }
+    }
+
     pub fn decode_tokens_per_second(&self) -> f64 {
         if self.decode_ms == 0 {
             return 0.0;
@@ -196,18 +209,32 @@ impl Motor {
     /// Logits da última posição de `tokens`, 1-D. Prefill e passo de decode
     /// entram pelo mesmo método porque o que muda entre eles é só o tamanho do
     /// lote.
-    fn passo(&mut self, tokens: &[u32]) -> Result<Tensor> {
+    fn passo(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<Tensor> {
         match self {
             Motor::Ggml { motor } => {
-                let logits = motor.passo(tokens)?;
+                let logits = motor.passo_cancelavel(tokens, cancel)?;
                 let n = logits.len();
                 Ok(Tensor::from_vec(logits, (n,), &Device::Cpu)?)
             }
             Motor::Candle { model, pos, .. } => {
-                let input = Tensor::new(tokens, &Device::Cpu)?.reshape((1, tokens.len()))?;
-                let logits = model.forward(&input, *pos)?.squeeze(0)?;
-                *pos += tokens.len();
-                Ok(logits)
+                let mut ultimo = None;
+                for lote in tokens.chunks(ggml::LOTE_CANCELAVEL) {
+                    if cancel.load(Ordering::Relaxed) {
+                        model.clear_kv_cache();
+                        *pos = 0;
+                        bail!(tr("erros.pedidoCancelado", &[]));
+                    }
+                    let input = Tensor::new(lote, &Device::Cpu)?.reshape((1, lote.len()))?;
+                    let logits = model.forward(&input, *pos)?.squeeze(0)?;
+                    *pos += lote.len();
+                    ultimo = Some(logits);
+                    if cancel.load(Ordering::Relaxed) {
+                        model.clear_kv_cache();
+                        *pos = 0;
+                        bail!(tr("erros.pedidoCancelado", &[]));
+                    }
+                }
+                Ok(ultimo.expect("passo recebeu tokens"))
             }
         }
     }
@@ -216,16 +243,21 @@ impl Motor {
     /// Na placa o começo que o cache já tem é reaproveitado; no candle não há
     /// recorte parcial de cache, então o turno prefila inteiro — e o zero é a
     /// medida honesta disso, não um reaproveitamento que não aconteceu.
-    fn passo_prompt(&mut self, tokens: &[u32]) -> Result<(Tensor, usize, bool)> {
+    fn passo_prompt(
+        &mut self,
+        tokens: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<(Tensor, usize, bool)> {
         match self {
             Motor::Ggml { motor } => {
-                let (logits, reaproveitados, recusado) = motor.passo_com_prefixo(tokens)?;
+                let (logits, reaproveitados, recusado) =
+                    motor.passo_com_prefixo_cancelavel(tokens, cancel)?;
                 let n = logits.len();
                 Ok((Tensor::from_vec(logits, (n,), &Device::Cpu)?, reaproveitados, recusado))
             }
             Motor::Candle { .. } => {
                 self.limpar();
-                Ok((self.passo(tokens)?, 0, false))
+                Ok((self.passo(tokens, cancel)?, 0, false))
             }
         }
     }
@@ -271,30 +303,41 @@ pub struct Acelerador {
     /// placa só quando nada falhou: offload não-medido nunca se apresenta como
     /// normal.
     pub motivo: Option<String>,
-    /// Onde os bytes ficaram, na placa que serviu. `None` só na CPU, onde não há
-    /// placa para alojar nada.
+    /// Onde os bytes ficaram, na memória que a carga de fato usou. No degrau sem
+    /// placa o veredito é o `SoSistema` — os pesos todos na RAM, com a janela que
+    /// foi carregada — e o `cedido` vem `None`, porque nenhum byte de VRAM mudou
+    /// de dono: o que não existiu não se mede, e um zero seria a tela afirmando
+    /// uma leitura de placa que a máquina não fez.
     pub alojado: Option<Alojado>,
-    /// A maior janela de potência de dois em que este modelo ainda iria inteiro
-    /// para a placa — a mesma conta de `alojado`, varrida do teto que o arquivo
-    /// declara para baixo. É um número medido agora, com a VRAM livre desta
-    /// máquina, não uma ficha do folheto: por isso `None` na CPU e `None` para o
-    /// modelo que não cabe inteiro em janela nenhuma. A escala de geração oferece
-    /// este valor como o teto cômodo, e o que a pessoa pedir acima dele roda
-    /// dividido, mais devagar.
+    /// A maior janela de potência de dois em que a carga inteira — pesos, KV e
+    /// estado — cabe na memória onde ela de fato pousa: a VRAM livre medida, quando
+    /// a placa serviu, e a RAM livre medida quando foi o degrau sem placa. É um
+    /// número lido agora nesta máquina, não uma ficha do folheto, e a escala de
+    /// geração o oferece como teto cômodo.
+    ///
+    /// Na placa, pedir acima dele roda dividido: continua respondendo, só custa
+    /// mais lento, e a escolha é da pessoa. Sem placa não há para onde dividir, e é
+    /// por isso que aqui a carga *obedece* o próprio teto — uma janela maior do que
+    /// a RAM livre não é um lugar lento, é troca com disco a cada token ou recusa do
+    /// contexto, e a redução vem escrita no `motivo`. `None` é a memória que não
+    /// segura nem os pesos, ou a sonda que não respondeu — nunca um zero.
     pub janela_inteira: Option<usize>,
 }
 
-/// A previsão feita com a VRAM livre de antes da carga, e o que a carga de fato
-/// tirou da placa. Os dois lados juntos são a única forma de a tela dizer "está
-/// inteiro na placa" sem estar pedindo confiança.
+/// A previsão feita antes da carga, e o que ela tirou da placa. Os dois lados
+/// juntos são a única forma de a tela dizer "está inteiro na placa" sem estar
+/// pedindo confiança.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Alojado {
     /// Veredito calculado a partir do cabeçalho do GGUF e da VRAM livre medida
-    /// antes de `llama_load_model_from_file`.
+    /// antes de `llama_load_model_from_file`. No degrau sem placa ele é o
+    /// `SoSistema` da mesma conta, com a janela que de fato foi carregada.
     pub previsto: crate::ai::alojamento::Alojamento,
-    /// Bytes de VRAM que sumiram do livre entre antes e depois da carga.
-    pub cedido: u64,
+    /// Bytes de VRAM que sumiram do livre entre antes e depois da carga. `None`
+    /// é a carga que não pousou em placa nenhuma: um zero ali diria "a carga não
+    /// levou VRAM" para uma máquina cuja VRAM nunca foi lida.
+    pub cedido: Option<u64>,
 }
 
 /// O motivo que acompanha a carga: cada sonda que falhou deixa o motivo real
@@ -419,21 +462,34 @@ impl Engine {
             Ok(motor) => {
                 // O cedido só existe quando a placa respondeu depois da carga:
                 // zero sem medição seria dizer "nada foi levado" sem ter lido.
-                // Sonda que falha aqui também deixa o motivo, e o `alojado`
-                // não publicado é a resposta honesta de que não há medida.
+                // O veredito, ao contrário, é conta feita com a leitura de antes,
+                // e continua indo à tela quando a de depois falha — o que não há
+                // é o delta, e o motivo abaixo diz exatamente isso.
                 let (alojado, erro_pos) = match previsto {
                     Some(previsto) => match super::alojamento::capacidade(dlls) {
                         Ok(Some(depois)) => (
                             Some(Alojado {
                                 previsto,
-                                cedido: livre_antes.saturating_sub(depois.livre),
+                                cedido: Some(livre_antes.saturating_sub(depois.livre)),
                             }),
                             None,
                         ),
                         // A placa que carregou não respondeu à medição de depois:
                         // o motivo é o que o motor já sabe dizer, sem chave nova.
-                        Ok(None) => (None, Some(tr("erros.motorSemPlaca", &[]))),
-                        Err(e) => (None, Some(format!("{e:#}"))),
+                        Ok(None) => (
+                            Some(Alojado {
+                                previsto,
+                                cedido: None,
+                            }),
+                            Some(tr("erros.motorSemPlaca", &[])),
+                        ),
+                        Err(e) => (
+                            Some(Alojado {
+                                previsto,
+                                cedido: None,
+                            }),
+                            Some(format!("{e:#}")),
+                        ),
                     },
                     None => (None, None),
                 };
@@ -462,10 +518,57 @@ impl Engine {
                 // cache, que é o que o candle não faz: cair direto nele trocaria
                 // "sem placa" por "só Granite".
                 let escala = ggml::Escala::da_maquina();
+                // Sem placa, a RAM do sistema é onde os pesos pousam e é ela que a
+                // janela estica. Aqui não há para onde dividir: uma janela que passa
+                // da memória livre não fica só mais lenta — troca com disco a cada
+                // token, que é o consumo de RAM variável que a pessoa vê, ou a
+                // biblioteca recusa o contexto inteiro. O teto, então, é lido antes
+                // de ele ser pedido, com a mesma régua que o roteador usa para
+                // colocar candidatos: cabeçalho GGUF contra RAM medida agora.
+                let sistema = super::alojamento::memoria_do_sistema();
+                let cabendo = ficha
+                    .as_ref()
+                    .zip(sistema)
+                    .map(|(ficha, s)| super::alojamento::caber_no_sistema(ficha, s.livre, context));
+                let inteira = ficha
+                    .as_ref()
+                    .zip(sistema)
+                    .and_then(|(ficha, s)| {
+                        super::alojamento::maior_janela_no_sistema(
+                            ficha,
+                            s.livre,
+                            super::geracao::CONTEXTO_MAX as usize,
+                        )
+                    });
+                // A janela só desce quando a pedida não cabe e existe um teto que
+                // caiba — e nunca sobe: `min` é o que garante que esta conta reduz a
+                // escolha da pessoa em vez de trocá-la por uma maior.
+                let janela_carga = match (&cabendo, inteira) {
+                    (Some(cabendo), Some(teto)) if !cabendo.cabe => teto.min(context),
+                    _ => context,
+                };
+                let aviso = (janela_carga < context).then(|| {
+                    let cabendo = cabendo.expect("só desce com medida");
+                    tr("erros.janelaCurtaSistema", &[
+                        ("pedida", &context.to_string()),
+                        ("janela", &janela_carga.to_string()),
+                        ("custo", &super::alojamento::gibs(cabendo.total)),
+                        ("livre", &super::alojamento::gibs(cabendo.livre)),
+                    ])
+                });
+                // O veredito do degrau sem placa é a mesma conta de sempre com a
+                // capacidade ausente — que é a verdade desta máquina — e com a
+                // janela que vai ser carregada, não a que foi pedida. Ele conta
+                // quantos bytes de RAM a carga ocupa, e é por isso que vai à tela:
+                // o que não existe aqui é a VRAM cedida, não o alojamento.
+                let alojado = ficha.as_ref().map(|ficha| Alojado {
+                    previsto: super::alojamento::alojar(ficha, None, janela_carga),
+                    cedido: None,
+                });
                 match ggml::Motor::novo(
                     dlls,
                     &weights,
-                    context,
+                    janela_carga,
                     ggml::Destino::Sistema(escala),
                 ) {
                     Ok(motor) => {
@@ -475,6 +578,13 @@ impl Engine {
                         let motivo = match motivo_de_carga([erro_ficha, erro_sonda, None]) {
                             Some(avisos) => format!("{falha_gpu}\n{avisos}"),
                             None => falha_gpu.to_string(),
+                        };
+                        // A janela que a RAM mandou é a última linha porque é
+                        // consequência das de cima: a placa recusou, os bytes pousaram
+                        // na RAM, e este é o teto que a RAM respondeu.
+                        let motivo = match aviso {
+                            Some(aviso) => format!("{motivo}\n{aviso}"),
+                            None => motivo,
                         };
                         Ok(Self {
                             model_id: model_id.to_string(),
@@ -487,8 +597,8 @@ impl Engine {
                                 tipo: "cpu",
                                 dispositivo,
                                 motivo: Some(motivo),
-                                alojado: None,
-                                janela_inteira: None,
+                                alojado,
+                                janela_inteira: inteira,
                             },
                         })
                     }
@@ -496,7 +606,7 @@ impl Engine {
                     // erro dele vai junto com o da placa — os dois são o que a
                     // máquina respondeu, e esconder um deixaria a tela sem causa.
                     Err(falha_cpu_ggml) => {
-                        let (model, config) = carregar_na_cpu(&weights, context).map_err(
+                        let (model, config) = carregar_na_cpu(&weights, janela_carga).map_err(
                             |falha_candle| {
                                 anyhow::anyhow!("{falha_gpu}\n{falha_cpu_ggml}\n{falha_candle}")
                             },
@@ -504,6 +614,10 @@ impl Engine {
                         let motivo = match motivo_de_carga([erro_ficha, erro_sonda, None]) {
                             Some(avisos) => format!("{falha_gpu}\n{falha_cpu_ggml}\n{avisos}"),
                             None => format!("{falha_gpu}\n{falha_cpu_ggml}"),
+                        };
+                        let motivo = match aviso {
+                            Some(aviso) => format!("{motivo}\n{aviso}"),
+                            None => motivo,
                         };
                         Ok(Self {
                             model_id: model_id.to_string(),
@@ -516,8 +630,8 @@ impl Engine {
                                 tipo: "cpu",
                                 dispositivo: String::new(),
                                 motivo: Some(motivo),
-                                alojado: None,
-                                janela_inteira: None,
+                                alojado,
+                                janela_inteira: inteira,
                             },
                         })
                     }
@@ -656,6 +770,13 @@ impl Engine {
         let sampling = if params.temperature < 1e-7 { Sampling::ArgMax } else { sampling };
         let mut logits_processor = LogitsProcessor::from_sampling(params.seed, sampling);
 
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(Generation::cancelada(prompt_tokens.len()));
+        }
+        if let Motor::Ggml { motor } = &self.motor {
+            motor.definir_aborte(Some(cancel));
+        }
+        let resultado = (|| -> Result<Generation> {
         let mut all_tokens = prompt_tokens.to_vec();
         let mut stream = TextStream::new(self.tokenizer.clone());
         // A vigia vê os tokens especiais que o stream da pessoa esconde: é neles
@@ -666,8 +787,12 @@ impl Engine {
         let mut text = String::new();
 
         let prefill_start = Instant::now();
-        let (logits, reused_tokens, recorte_recusado) = self.motor.passo_prompt(prompt_tokens)?;
+        let (logits, reused_tokens, recorte_recusado) =
+            self.motor.passo_prompt(prompt_tokens, cancel)?;
         let prompt_ms = prefill_start.elapsed().as_millis() as u64;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(Generation::cancelada(prompt_tokens.len()));
+        }
 
         let mut next = logits_processor.sample(&logits)?;
         let decode_start = Instant::now();
@@ -711,7 +836,10 @@ impl Engine {
                 break StopReason::StopSequence;
             }
 
-            let logits = self.motor.passo(&[next])?;
+            if cancel.load(Ordering::Relaxed) {
+                break StopReason::Cancelled;
+            }
+            let logits = self.motor.passo(&[next], cancel)?;
             let logits = if params.repeat_penalty == 1.0 {
                 logits
             } else {
@@ -721,7 +849,7 @@ impl Engine {
             next = logits_processor.sample(&logits)?;
         };
 
-        if stop != StopReason::StopSequence {
+        if stop != StopReason::StopSequence && stop != StopReason::Cancelled {
             if let Some(rest) = stream.flush()? {
                 text.push_str(&rest);
                 emit(Emission::Delta(rest));
@@ -739,6 +867,15 @@ impl Engine {
             decode_ms,
             stop,
         })
+        })();
+        if let Motor::Ggml { motor } = &self.motor {
+            motor.definir_aborte(None);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            Ok(Generation::cancelada(prompt_tokens.len()))
+        } else {
+            resultado
+        }
     }
 }
 
@@ -1128,7 +1265,7 @@ mod tests {
                     estado: 0,
                     livre: 6000,
                 },
-                cedido: 1900,
+                cedido: Some(1900),
             }),
             janela_inteira: Some(32768),
         };
@@ -1141,5 +1278,33 @@ mod tests {
         assert!(json.contains("\"emRam\":1136"), "{json}");
         // A escala lê esta chave para saber até onde o cursor pode ir inteiro.
         assert!(json.contains("\"janelaInteira\":32768"), "{json}");
+    }
+
+    #[test]
+    fn o_degrau_sem_placa_publica_o_sistema_sem_cedido_falso() {
+        // Sem placa os pesos pousam todos na RAM: o alojamento existe — é conta
+        // feita com o cabeçalho do GGUF — e o que não existe é a VRAM cedida. Um
+        // `0` ali diria "a carga não levou placa" como se fosse uma medição, e a
+        // tela tem de ler a diferença entre as duas coisas.
+        use super::super::alojamento::Alojamento;
+        let a = Acelerador {
+            tipo: "cpu",
+            dispositivo: String::new(),
+            motivo: Some("nenhuma placa serviu".to_string()),
+            alojado: Some(Alojado {
+                previsto: Alojamento::SoSistema {
+                    pesos: 2240,
+                    kv: 335,
+                    estado: 0,
+                },
+                cedido: None,
+            }),
+            janela_inteira: Some(8192),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"tipo\":\"soSistema\""), "{json}");
+        assert!(json.contains("\"pesos\":2240"), "{json}");
+        assert!(json.contains("\"cedido\":null"), "{json}");
+        assert!(!json.contains("\"cedido\":0"), "{json}");
     }
 }

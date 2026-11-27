@@ -151,7 +151,8 @@
   "compactacao": {
     "instrucao": "You compress the beginning of an assistant conversation. Reply with the summary only, in English: what the person asked, what was already done, the paths, names and values mentioned, and what is still pending. At most eight sentences, no preamble and no talk about the summary.",
     "anterior": "Summary of the messages already compressed before these: {texto}",
-    "pedido": "Summarize everything that comes before this message."
+    "pedido": "Summarize everything that comes before this message.",
+    "atalho": "Compact the conversation"
   },
   "aprovacao": {
     "titulo": "Needs your approval",
@@ -304,6 +305,8 @@
     "contexto": "Context window",
     "janelaInteira": "fits the card up to {n}",
     "janelaInteiraUsar": "set to the window that fits the card",
+    "janelaInteiraSistema": "fits the RAM up to {n}",
+    "janelaInteiraUsarSistema": "set to the window that fits the RAM",
     "janela": "Window",
     "pensamento": "Show the reasoning",
     "pensamentoCusto": "Reasoning takes tokens before the first word.",
@@ -593,11 +596,11 @@
     },
     "bancosColunas": {
       "titulo": "View table columns",
-      "descricao": "Shows the columns of an exposed table with each one's type, so filters and inserts can be built correctly."
+      "descricao": "Shows the real columns of an exposed table with each one's type, reports the connection type/dialect, and explains ordering. For an unknown source, call this tool before building filters or ordering."
     },
     "bancosConsultar": {
       "titulo": "Query table",
-      "descricao": "Reads rows from an exposed table, with chosen columns, optional filter, ordering and limit. The requested limit never exceeds the cap the owner registered."
+      "descricao": "Reads rows from an exposed table, with chosen columns, optional filter, ordering and limit. Ordering accepts one real column, with ordemDesc or the legacy ASC/DESC suffix, without raw SQL. The requested limit never exceeds the cap the owner registered."
     },
     "bancosContar": {
       "titulo": "Count rows",
@@ -676,13 +679,13 @@
     "fonte": "Table",
     "fonteDescricao": "Name of a table exposed on that connection. Call bancos_tabelas to see what is exposed.",
     "colunas": "Columns",
-    "colunasDescricao": "Columns to return, in the requested order. Omit to bring all of them.",
+    "colunasDescricao": "Real columns to return, in the requested order. Omit to bring all of them. For an unknown source, call bancos_colunas before choosing columns or building a filter or ordering.",
     "filtro": "Filter",
-    "filtroDescricao": "Conditions the rows must satisfy. Example: {\"coluna\": \"valor\"}. With a comparison: {\"coluna\": {\"op\": \"maior\", \"valor\": 10}}. Operations: igual, diferente, maior, maiorigual, menor, menorigual, contendo. An empty filter matches every row.",
+    "filtroDescricao": "Conditions the rows must satisfy. Example: {\"coluna\": \"valor\"}. With a comparison: {\"coluna\": {\"op\": \"maior\", \"valor\": 10}}. Operations: igual, diferente, maior, maiorigual, menor, menorigual, contendo. An empty filter matches every row. Use only real names discovered with bancos_colunas; values remain parameterized.",
     "ordem": "Order by",
-    "ordemDescricao": "Column to order the result by.",
+    "ordemDescricao": "Name of one real column to order by. Preferred form: ordem: \"qt_venda\" with ordemDesc: true (descending) or false (ascending). For compatibility, ordem: \"qt_venda DESC\" or \"qt_venda ASC\" is also accepted; an explicit suffix overrides ordemDesc. Do not use ORDER BY, expressions, commas, or multiple columns. Discover names with bancos_colunas.",
     "ordemDesc": "Descending order",
-    "ordemDescDescricao": "Orders from highest to lowest when true.",
+    "ordemDescDescricao": "Direction used when ordem has no suffix: true means DESC (descending) and false means ASC (ascending). An explicit ASC/DESC suffix in ordem takes precedence.",
     "limite": "Limit",
     "limiteDescricao": "How many rows to bring. The cap registered by the owner always wins.",
     "valores": "Values",
@@ -931,7 +934,10 @@
     "modeloForaDoCatalogo": "the router chose {modelo}, which isn't in the catalog",
     "pedidoCancelado": "request canceled",
     "janelaSemLugar": "the window is {janela} tokens: the tools and identity already take {fixo} and this request needs {pedido} even with the conversation summarized; disconnect a server or raise the window in the generation scales",
+    "janelaCurtaSistema": "the window asked for is {pedida} tokens and the whole load would cost {custo} GiB against {livre} GiB of free RAM; it came down to {janela} tokens, which is where it fits without paging. A smaller quant, or fewer programs open, gives the bigger window back",
     "nadaParaResumir": "there was nothing to summarize: the section to compress is empty",
+    "nadaParaCompactar": "there is nothing to compact: the conversation has no full turn after the last summary",
+    "nenhumModeloEmMemoria": "no model is in memory; load one before compacting",
     "resumoVazio": "the model returned an empty summary; raise the window or send it again",
     "lacoDeFerramentas": "the model requested tools {n} times without finishing; I stopped to avoid a loop",
     "pensamentoTruncado": "the model stopped mid-reasoning without reaching an answer; raise the token limit or shorten the request",
@@ -1147,6 +1153,7 @@
     "runtimeHashDiverge": "{nome} is not the checked binary: expected {esperado}, measured {medido}",
     "falhaSerializar": "could not serialize {caminho}: {detalhe}",
     "conversaIdInvalido": "invalid chat id: {id}",
+    "semPastaAether": "could not find the Aether home folder: set HOME, USERPROFILE or AETHER_CASA",
     "conversaDesconhecida": "unknown chat {id}",
     "conversaTituloVazio": "the chat title is empty",
     "runtimeFalhaMover": "could not move {origem} to {destino}: {detalhe}",
@@ -1215,7 +1222,9 @@
     "bancoConexaoInexistente": "there is no connection named {nome} in the registry. Call bancos_listar to see the names.",
     "bancoOperacaoNegada": "the owner did not allow {op} on table {fonte} of connection {conexao}",
     "bancoSqlBloqueado": "connection {conexao} does not have free SQL enabled",
-    "bancoColunaInexistente": "the table has no column {coluna}",
+    "bancoOrdemInvalida": "invalid ordem: provide one real column, for example ordem: \"qt_venda\" with ordemDesc: true, or the compatible ordem: \"qt_venda DESC\"/\"qt_venda ASC\". Do not use ORDER BY, expressions, commas, or multiple columns; discover names with bancos_colunas.",
+    "bancoColunaInexistente": "the source has no column {coluna}. Valid columns: {colunas}. Use one of these names in columns, filters, and ordering. To order, prefer ordem: \"name\" with ordemDesc: true/false; compatible ordem: \"name DESC\"/\"name ASC\" accepts one column. Call bancos_colunas to check the schema.",
+    "bancoCampoInvalido": "field {coluna} is not a valid identifier in this database. Call bancos_colunas to discover the real names.",
     "bancoFonteInexistente": "table {fonte} is not exposed on this connection"
   },
   "servidorMcp": {
@@ -1235,6 +1244,9 @@
     "nenhumaConexao": "The owner has not registered any database connection yet.",
     "nenhumaFonte": "Connection {conexao} has no exposed tables.",
     "contagem": "{total} row(s) in {fonte} match the filter.",
+    "orientacaoColunas": "Type/dialect: {tipo}. Use the names and types discovered above. Before building filters or ordering for an unknown source, call bancos_colunas and confirm the real columns. In bancos_consultar, prefer ordem: \"qt_venda\" with ordemDesc: true for DESC or false for ASC. For compatibility, ordem: \"qt_venda DESC\" or \"qt_venda ASC\" also works; an explicit suffix takes precedence. Pass only one column, without ORDER BY, expressions, or a list.",
+    "colunasAmostraMongo": "In MongoDB, this list is the union of fields seen in a sample of up to 100 documents; it is not a declared schema and does not guarantee fields that appear only outside the sample.",
+    "semColunas": "none",
     "linhasInseridas": "{total} row(s) inserted into {fonte}.",
     "linhasAtualizadas": "{total} row(s) updated in {fonte}.",
     "linhasApagadas": "{total} row(s) deleted from {fonte}.",

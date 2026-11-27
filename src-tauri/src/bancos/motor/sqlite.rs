@@ -11,7 +11,10 @@ use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde_json::{Map, Value};
 use std::time::Duration;
 
-use super::{Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto, teto_de_leitura};
+use super::{
+    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto,
+    erro_coluna_invalida, ordem_de, teto_de_leitura,
+};
 use crate::bancos::config::{Conexao, Operacao};
 use crate::idiomas::tr;
 
@@ -83,7 +86,7 @@ impl Sqlite {
             .iter()
             .find(|(nome, _)| nome.eq_ignore_ascii_case(coluna))
             .map(|(nome, _)| citada(nome))
-            .ok_or_else(|| anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", coluna)])))
+            .ok_or_else(|| erro_coluna_invalida(coluna, conhecidas))
     }
 
     /// O WHERE traduzido do filtro, com as marcas `?` na ordem dos parâmetros.
@@ -205,9 +208,7 @@ impl Sqlite {
                     .iter()
                     .find(|(nome, _)| nome.eq_ignore_ascii_case(pedida))
                     .map(|(nome, _)| nome.clone())
-                    .ok_or_else(|| {
-                        anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", pedida)]))
-                    })
+                    .ok_or_else(|| erro_coluna_invalida(pedida, esquema))
             })
             .collect()
     }
@@ -260,8 +261,9 @@ impl Motor for Sqlite {
         let onde = Self::where_sql(filtro, &esquema, &mut params)?;
         let ordenar = match ordem {
             None => String::new(),
-            Some((coluna, desc)) => {
-                let coluna = Self::conferir_coluna(coluna, &esquema)?;
+            Some((texto, desc)) => {
+                let (coluna, desc) = ordem_de(texto, desc, Some(&esquema))?;
+                let coluna = Self::conferir_coluna(&coluna, &esquema)?;
                 format!(" ORDER BY {coluna} {}", if desc { "DESC" } else { "ASC" })
             }
         };
@@ -676,6 +678,43 @@ mod tests {
         assert_eq!(comandos_contados(), 1, "a leitura foi ao dado mesmo recusada");
         drop(motor);
         std::fs::remove_dir_all(&raiz).ok();
+    }
+
+    /// A string crua nunca é um identificador: o motor confere no schema e a
+    /// recusa mostra as colunas reais e a forma correta do argumento de ordem.
+    #[test]
+    fn coluna_de_ordem_invalida_lista_as_validas_e_o_exemplo() {
+        let schema = vec![
+            ("id".to_string(), "INTEGER".to_string()),
+            ("qt_venda".to_string(), "INTEGER".to_string()),
+        ];
+        assert_eq!(
+            Sqlite::conferir_coluna("QT_VENDA", &schema).unwrap(),
+            "\"qt_venda\""
+        );
+        for entrada in [
+            "qt_venda DESC",
+            "qt_venda, id",
+            "qt_venda; DROP TABLE vendas",
+        ] {
+            let erro = Sqlite::conferir_coluna(entrada, &schema)
+                .unwrap_err()
+                .to_string();
+            for trecho in [
+                entrada,
+                "id",
+                "qt_venda",
+                "ordem",
+                "ordemDesc",
+                "bancos_colunas",
+            ] {
+                assert!(erro.contains(trecho), "{entrada}: {erro}");
+            }
+        }
+        let erro = Sqlite::colunas_da_leitura(&["desconhecida".into()], &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("qt_venda") && erro.contains("id"), "{erro}");
     }
 
     /// O identificador conferido é o que o banco grafa, não o que o modelo

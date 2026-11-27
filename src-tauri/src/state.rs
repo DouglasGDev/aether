@@ -8,10 +8,11 @@ use crate::mcp::manager::McpManager;
 use crate::permissions::PermissionGate;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Trava de um dado de estado puro: um `Option`, um `Vec`, um `HashMap` ou um
 /// struct que só muda por operação inteira. Um panic segurando uma destas travas
@@ -105,6 +106,10 @@ pub struct AppState {
     /// buffer vivo (`AiRuntime::history`) é o da conversa ativa, e é ele que o
     /// turno grava aqui quando termina.
     pub conversas: Arc<crate::conversas::Conversas>,
+    /// `<casa>/.aether/compactacoes`: o registro do que foi dobrado. Mora no
+    /// estado como `rede_path` — a raiz é decidida uma vez na abertura, e um
+    /// segundo cálculo dentro do turno é como uma dobra acabaria em duas pastas.
+    pub compactacoes_path: PathBuf,
 }
 
 /// Um modelo carregado: pesos, template e a ficha do catálogo que o escolheu.
@@ -113,6 +118,33 @@ pub struct LoadedModel {
     pub template: ChatTemplate,
     pub spec: &'static ModelSpec,
 }
+
+/// Uma ficha com a assinatura do arquivo de onde ela saiu.
+///
+/// A assinatura é a mesma que o catálogo usa para os cartões da biblioteca
+/// (tamanho + última modificação + criação): é o que o `std::fs::Metadata`
+/// daqui entrega sem abrir o arquivo, e é o que faz a entrada cair sozinha
+/// quando o peso é trocado — download que termina, `.part` que vira `.gguf`,
+/// arquivo copiado por fora. O `carimbo` é a idade para a saída LRU.
+pub(crate) struct FichaGuardada {
+    assinatura: catalog::Assinatura,
+    ficha: crate::ai::alojamento::Ficha,
+    carimbo: u64,
+}
+
+/// Fichas residentes no máximo.
+///
+/// Um arquivo, uma entrada. O catálogo inteiro tem 60 modelos (58 de conversa e
+/// 2 codificadores) e duas raizes de modelos podem coexistir na máquina — a de
+/// `%LOCALAPPDATA%` e uma escolhida pelo usuário —, o que dá 120 arquivos. 128
+/// cobre as duas com folga. O custo é sabido: uma ficha guarda o vetor de bytes
+/// por camada (dezenas de `u64`) e o template lido do arquivo, poucos
+/// kilobytes, então o teto inteiro fica na casa de algumas centenas de KB.
+/// Passou disso, sai a mais antiga; o preço de errar é reler um cabeçalho na
+/// próxima decisão do roteador, não faltar RAM para o KV da conversa.
+const TETO_DE_FICHAS: usize = 128;
+
+static FICHA_CARIMBO: AtomicU64 = AtomicU64::new(0);
 
 /// Estado da IA local. A geração é bloqueante e pesada, então o motor fica atrás
 /// de um Mutex: um turno por vez, e quem chama roda em spawn_blocking.
@@ -134,13 +166,15 @@ pub struct AiRuntime {
     /// sobre os pesos agora, e o motivo dito por ele quando algum não está. É a
     /// única fonte de "aplicado" da tela — a escolha gravada não é prova de nada.
     aplicados: Mutex<Vec<crate::ai::ggml::Aplicado>>,
-    /// Cabeçalhos de GGUF já lidos, por caminho e tamanho. A ficha é o que o
-    /// roteador usa para decidir onde o modelo fica, e ela não muda enquanto o
-    /// arquivo é o mesmo — por isso o tamanho entra na chave. Um re-download com
-    /// outro tamanho é outra chave e é relido; um arquivo trocado pelo mesmo
-    /// tamanho é o único caso em que a cache envelhece, e ele não acontece no
-    /// fluxo de download, que escreve `.part` e move no fim.
-    fichas: Mutex<HashMap<(PathBuf, u64), crate::ai::alojamento::Ficha>>,
+    /// Cabeçalhos de GGUF já lidos, por arquivo e assinados pelo disco. A ficha é
+    /// o que o roteador usa para decidir onde o modelo fica, e ela não muda
+    /// enquanto o arquivo é o mesmo — por isso a chave é o caminho e a assinatura
+    /// (tamanho + datas) vai dentro, conferida a cada uso: um arquivo trocado
+    /// cai sozinho, sem depender de alguém lembrar de invalidar.
+    /// Guardar por `(caminho, tamanho)`, como era antes, vazava: um download em
+    /// curso muda de tamanho a cada bloco e deixava uma entrada por tamanho
+    /// novo, e a troca pelo mesmo tamanho continuava envelhecida.
+    fichas: Mutex<HashMap<PathBuf, FichaGuardada>>,
     /// Onde o modelo carregado está rodando. Separado do motor pelo mesmo
     /// motivo do `loaded_id`: o turno segura o motor a geração inteira, e a
     /// UI precisa ler a placa nesse meio tempo sem esperar o turno acabar.
@@ -162,23 +196,79 @@ pub struct AiRuntime {
     /// dela: recompôr o resumo a cada turno seria cobrar da placa um texto que
     /// ela já escreveu.
     pub resumo: Mutex<Option<crate::ai::compactacao::Resumo>>,
-    pub cancel: Arc<AtomicBool>,
+    turno: Mutex<Option<Turno>>,
+    proximo_turno: AtomicU64,
     busy: AtomicBool,
+    parado: tokio::sync::Notify,
     /// Um cancelador por download em curso. A UI precisa poder interromper sem
     /// esperar o turno de conversa, então isto não passa pelo Mutex do motor.
     downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
-/// O lugar do turno reservado. O `Drop` devolve o flag: sem isso, um panic no
-/// corpo da troca — ou uma recusa no meio dela — deixaria `busy` preso e
-/// travaria todos os turnos seguintes até reiniciar o aplicativo. É um flag
-/// atômico, não um lock: não cria aresta de ordenação com o motor, e é por isso
-/// que ele segura o turno sem esperar o motor.
-pub struct Reserva<'a>(&'a AiRuntime);
+#[derive(Debug, Clone)]
+pub struct Turno {
+    pub id: u64,
+    pub cancel: Arc<AtomicBool>,
+    pub token: CancellationToken,
+}
+
+/// O lugar do turno reservado por um caminho síncrono. O empréstimo não atravessa
+/// um closure `'static` de `spawn_blocking`; para esse caminho use
+/// [`AiRuntime::reservar_dono`]. O `Drop` devolve o flag só para a identidade
+/// que reservou: um término atrasado não libera o turno que veio depois.
+#[must_use = "mantenha a reserva viva até o corpo síncrono terminar"]
+pub struct Reserva<'a> {
+    ai: &'a AiRuntime,
+    turno: Turno,
+}
+
+impl Reserva<'_> {
+    pub fn id(&self) -> u64 {
+        self.turno.id
+    }
+
+    pub fn cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.turno.cancel)
+    }
+
+    pub fn token(&self) -> CancellationToken {
+        self.turno.token.clone()
+    }
+}
 
 impl Drop for Reserva<'_> {
     fn drop(&mut self) {
-        self.0.end();
+        self.ai.end(self.turno.id);
+    }
+}
+
+/// A reserva de um turno da qual um closure `'static` é dono. O `Arc` é movido
+/// para dentro de `spawn_blocking` junto com a identidade; o `Drop` só acontece
+/// quando esse closure termina, inclusive por panic. Não há uma reserva borrowed
+/// intermediária: soltá-la no retorno liberaria `busy` antes de o trabalho começar.
+#[must_use = "mova a reserva para o closure e mantenha-a viva até o fim"]
+pub struct ReservaDona {
+    ai: Arc<AiRuntime>,
+    turno: Turno,
+}
+
+impl ReservaDona {
+    pub fn id(&self) -> u64 {
+        self.turno.id
+    }
+
+    pub fn cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.turno.cancel)
+    }
+
+    pub fn token(&self) -> CancellationToken {
+        self.turno.token.clone()
+    }
+}
+
+impl Drop for ReservaDona {
+    fn drop(&mut self) {
+        self.ai.end(self.turno.id);
     }
 }
 
@@ -206,8 +296,10 @@ impl AiRuntime {
             loaded_id: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             resumo: Mutex::new(None),
-            cancel: Arc::new(AtomicBool::new(false)),
+            turno: Mutex::new(None),
+            proximo_turno: AtomicU64::new(1),
             busy: AtomicBool::new(false),
+            parado: tokio::sync::Notify::new(),
             downloads: Mutex::new(HashMap::new()),
         }
     }
@@ -397,29 +489,95 @@ impl AiRuntime {
         self.busy.load(Ordering::Relaxed)
     }
 
-    /// Marca o turno como ocupado. Devolve false se já havia um turno rodando:
-    /// dois turnos simultâneos disputariam o mesmo KV cache.
-    pub fn begin(&self) -> bool {
-        self.cancel.store(false, Ordering::Relaxed);
-        self.busy
+    pub fn active_turn(&self) -> Option<Turno> {
+        trava_estado(&self.turno).clone()
+    }
+
+    /// Instala o turno ativo antes de devolver qualquer reserva. É um só caminho
+    /// para as duas variantes: a dona nunca passa por uma reserva borrowed que
+    /// seria solta no retorno e liberaria o turno antes de `spawn_blocking`.
+    fn reservar_turno(&self) -> Option<Turno> {
+        let mut ativo = trava_estado(&self.turno);
+        if self
+            .busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+            .is_err()
+        {
+            return None;
+        }
+        let turno = Turno {
+            id: self.proximo_turno.fetch_add(1, Ordering::Relaxed),
+            cancel: Arc::new(AtomicBool::new(false)),
+            token: CancellationToken::new(),
+        };
+        *ativo = Some(turno.clone());
+        Some(turno)
     }
 
-    pub fn end(&self) {
-        self.busy.store(false, Ordering::SeqCst);
-    }
-
-    pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-
-    /// Reserva atômica do lugar do turno com o mesmo CAS que `chat_send` usa
-    /// para começar. `None` quando já há turno em curso — ou outra troca
-    /// reservada. É um flag, não um lock: não cria aresta de ordenação com o
-    /// motor, e é isso que permite segurar o turno sem esperar o motor.
+    /// Reserva para um caminho síncrono, cujo corpo termina antes do empréstimo.
+    /// Devolve `None` se já havia um turno rodando: dois turnos simultâneos
+    /// disputariam o mesmo KV cache. Uma recusa não toca no turno ativo.
     pub fn reservar(&self) -> Option<Reserva<'_>> {
-        self.begin().then(|| Reserva(self))
+        self.reservar_turno()
+            .map(|turno| Reserva { ai: self, turno })
+    }
+
+    /// Reserva dona de `Arc`, movível para dentro de `spawn_blocking`. O closure
+    /// deve recebê-la e mantê-la viva até terminar; só então o `Drop` libera o
+    /// turno e `busy`. Extrair apenas `id`/`cancel`/`token` de uma reserva borrowed
+    /// não serve para esse caminho: soltá-la no retorno libera a reserva cedo.
+    pub fn reservar_dono(self: &Arc<Self>) -> Option<ReservaDona> {
+        self.reservar_turno().map(|turno| ReservaDona {
+            ai: Arc::clone(self),
+            turno,
+        })
+    }
+
+    pub fn end(&self, id: u64) {
+        let mut ativo = trava_estado(&self.turno);
+        if ativo.as_ref().map(|t| t.id) != Some(id) {
+            return;
+        }
+        *ativo = None;
+        drop(ativo);
+        self.busy.store(false, Ordering::SeqCst);
+        self.parado.notify_waiters();
+    }
+
+    /// Cancela só a identidade pedida. `false` significa que ela já não está
+    /// ativa; um pedido atrasado não cancela o turno que veio depois.
+    pub fn request_cancel(&self, turn_id: u64) -> bool {
+        let turno = trava_estado(&self.turno)
+            .as_ref()
+            .filter(|turno| turno.id == turn_id)
+            .cloned();
+        let Some(turno) = turno else {
+            return false;
+        };
+        turno.cancel.store(true, Ordering::SeqCst);
+        turno.token.cancel();
+        true
+    }
+
+    fn turno_esta_ativo(&self, turn_id: u64) -> bool {
+        trava_estado(&self.turno)
+            .as_ref()
+            .is_some_and(|turno| turno.id == turn_id)
+    }
+
+    /// Espera somente a identidade pedida. Se ela já terminou, devolve na hora,
+    /// mesmo que outro turno esteja ocupado. Habilitar o future antes da checagem
+    /// fecha o wake perdido entre `is_busy`/identidade e o primeiro `await`.
+    pub async fn wait_stopped(&self, turn_id: u64) {
+        loop {
+            let aviso = self.parado.notified();
+            tokio::pin!(aviso);
+            aviso.as_mut().enable();
+            if !self.turno_esta_ativo(turn_id) {
+                return;
+            }
+            aviso.await;
+        }
     }
 
     /// Executa uma troca de conversa com o lugar do turno reservado. O `begin`
@@ -522,23 +680,81 @@ impl AiRuntime {
     /// decidiria pela RAM do sistema — que é exatamente o que não decide a
     /// velocidade quando existe uma placa.
     pub fn candidatos(&self, available: &[&'static ModelSpec]) -> Vec<crate::ai::router::Candidato> {
-        let mut cache = trava_estado(&self.fichas);
         available
             .iter()
             .map(|spec| {
                 let caminho = catalog::model_dir(&self.models_root, spec).join(spec.weights_file);
-                let medida = std::fs::metadata(&caminho).ok().map(|m| m.len());
-                let ficha = medida.and_then(|tamanho| match cache.get(&(caminho.clone(), tamanho)) {
-                    Some(velha) => Some(velha.clone()),
-                    None => crate::ai::alojamento::fichar(&caminho)
-                        .ok()
-                        .inspect(|nova| {
-                            cache.insert((caminho.clone(), tamanho), nova.clone());
-                        }),
-                });
+                let ficha = self.ficha_do_caminho(&caminho);
                 crate::ai::router::Candidato { spec, ficha }
             })
             .collect()
+    }
+
+    /// A ficha de um arquivo, pelo cache assinado.
+    ///
+    /// A trava é tomada e largada — uma vez para consultar, uma para gravar — e
+    /// nunca atravessa o `fichar`: abrir um GGUF leva centenas de milissegundos,
+    /// e segurar o lock durante eles prenderia qualquer outra decisão de
+    /// alojamento em curso, que é justamente o que corre em thread de turno.
+    fn ficha_do_caminho(
+        &self,
+        caminho: &Path,
+    ) -> Option<crate::ai::alojamento::Ficha> {
+        let assinatura = catalog::Assinatura::de_arquivo(caminho);
+        if assinatura == catalog::Assinatura::Ausente {
+            return None;
+        }
+        {
+            let mut cache = trava_estado(&self.fichas);
+            if let Some(entrada) = cache.get_mut(caminho) {
+                if entrada.assinatura == assinatura {
+                    entrada.carimbo = FICHA_CARIMBO.fetch_add(1, Ordering::Relaxed);
+                    return Some(entrada.ficha.clone());
+                }
+                // Assinatura diferente é arquivo diferente: a entrada antiga não
+                // vale mais e sai agora, para o teto contar o que está em RAM.
+                cache.remove(caminho);
+            }
+        }
+        let nova = crate::ai::alojamento::fichar(caminho).ok()?;
+        {
+            let mut cache = trava_estado(&self.fichas);
+            cache.insert(
+                caminho.to_path_buf(),
+                FichaGuardada {
+                    assinatura,
+                    ficha: nova.clone(),
+                    carimbo: FICHA_CARIMBO.fetch_add(1, Ordering::Relaxed),
+                },
+            );
+            while cache.len() > TETO_DE_FICHAS {
+                let mais_velha =
+                    cache.iter().min_by_key(|(_, f)| f.carimbo).map(|(k, _)| k.clone());
+                match mais_velha {
+                    Some(chave) => {
+                        cache.remove(&chave);
+                    }
+                    None => break,
+                }
+            }
+        }
+        Some(nova)
+    }
+
+    /// Esquece a ficha de um modelo. Chamada no ponto de escrita — o download
+    /// que terminou e o peso que foi apagado — para que a decisão seguinte do
+    /// roteador não saia de um arquivo que não existe mais. A assinatura já
+    /// desfaz a entrada sozinha na leitura; isto é o cinto, e tem de aparecer no
+    /// código de quem escreve.
+    pub fn descartar_ficha(&self, spec: &ModelSpec) {
+        let caminho = catalog::model_dir(&self.models_root, spec).join(spec.weights_file);
+        trava_estado(&self.fichas).remove(&caminho);
+    }
+
+    /// Esquece todas as fichas: o caminho largo, para quando a raiz de modelos
+    /// inteira mudou.
+    pub fn descartar_fichas(&self) {
+        trava_estado(&self.fichas).clear();
     }
 
     /// Carrega o modelo pedido se ainda não é ele, e devolve o guard do turno.
@@ -573,6 +789,13 @@ impl AiRuntime {
         let mut guard = self.trava_motor()?;
         let stale = guard.as_ref().map(|m| m.spec.id != spec.id).unwrap_or(true);
         if stale {
+            // O modelo velho sai inteiro antes de os pesos novos entrarem: carregar
+            // por cima do antigo somava dois modelos e dois KV na mesma máquina.
+            *guard = None;
+            *trava_estado(&self.acelerador) = None;
+            *trava_estado(&self.janela) = None;
+            *trava_estado(&self.loaded_id) = None;
+            *trava_estado(&self.aplicados) = Vec::new();
             let dir = catalog::model_dir(&self.models_root, spec);
             let mut engine = Engine::load(
                 spec.id,
@@ -874,14 +1097,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("a troca não começou");
         assert!(
-            !ai.begin(),
+            ai.reservar().is_none(),
             "um turno começou no meio da troca de conversa: a reserva não é atômica"
         );
         pode_sair_tx.send(()).expect("canal da troca fechado");
         troca.join().expect("a thread da troca panicou").expect("a troca falhou");
         // Liberada a reserva, o turno volta a poder começar.
-        assert!(ai.begin(), "a reserva não foi liberada no fim da troca");
-        ai.end();
+        assert!(ai.reservar().is_some(), "a reserva não foi liberada no fim da troca");
     }
 
     /// Nada simulado: com um turno já em curso, a troca recusa com o motivo real
@@ -889,7 +1111,7 @@ mod tests {
     #[test]
     fn a_troca_recusa_com_o_motivo_real_quando_ha_turno() {
         let ai = runtime_de_teste("recusa");
-        assert!(ai.begin(), "o turno de teste não começou");
+        let reserva = ai.reservar().expect("o turno de teste não começou");
 
         let executou = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&executou);
@@ -908,6 +1130,148 @@ mod tests {
             motivo.contains("turno"),
             "esperava o motivo real de turno em curso, veio: {motivo}"
         );
-        ai.end();
+        drop(reserva);
     }
+
+    #[test]
+    fn uma_reserva_recusada_nao_cancela_o_turno_ativo() {
+        let ai = runtime_de_teste("cancelamento-independente");
+        let ativo = ai.reservar().expect("o turno ativo não começou");
+
+        assert!(ai.request_cancel(ativo.id()));
+        assert!(
+            ai.reservar().is_none(),
+            "uma segunda reserva furou o turno ativo"
+        );
+        assert!(
+            ai.reservar_dono().is_none(),
+            "a variante dona furou o turno ativo"
+        );
+        assert!(
+            ativo.cancel().load(Ordering::Relaxed),
+            "a reserva recusada apagou o cancelamento do turno ativo"
+        );
+        assert!(
+            ativo.token().is_cancelled(),
+            "o token do turno não foi cancelado"
+        );
+        assert!(ai.is_busy(), "a recusa liberou o turno ativo");
+    }
+
+    #[test]
+    fn cada_turno_tem_identidade_e_cancelamento_proprios() {
+        let ai = runtime_de_teste("identidade-de-turno");
+        let antigo = ai.reservar().expect("o turno antigo não começou");
+        assert!(ai.request_cancel(antigo.id()));
+        assert!(antigo.cancel().load(Ordering::Relaxed));
+
+        ai.end(antigo.id());
+        let novo = ai.reservar().expect("o turno novo não começou");
+        assert_ne!(
+            novo.id(),
+            antigo.id(),
+            "dois turnos receberam a mesma identidade"
+        );
+        assert!(
+            !ai.request_cancel(antigo.id()),
+            "um cancelamento atrasado alcançou o turno novo"
+        );
+        assert!(
+            !novo.cancel().load(Ordering::Relaxed),
+            "o cancelamento antigo vazou para o turno novo"
+        );
+        assert!(
+            !novo.token().is_cancelled(),
+            "o token antigo vazou para o novo"
+        );
+
+        ai.end(antigo.id());
+        assert!(ai.is_busy(), "o fim antigo liberou o turno novo");
+        drop(novo);
+        assert!(!ai.is_busy(), "o fim do turno novo não liberou a reserva");
+    }
+
+    #[tokio::test]
+    async fn a_reserva_dona_so_libera_quando_o_closure_termina() {
+        let ai = runtime_de_teste("reserva-dona");
+        let reserva = ai.reservar_dono().expect("o turno dono não começou");
+        let id = reserva.id();
+        let cancel = reserva.cancel();
+        let token = reserva.token();
+        let (entrou_tx, mut entrou_rx) = tokio::sync::mpsc::channel(1);
+        let (sair_tx, sair_rx) = mpsc::channel();
+
+        // O tipo só compila aqui se for Send + 'static. A reserva é movida, não
+        // extraída: busy continua preso durante todo o corpo do closure.
+        let tarefa = tokio::task::spawn_blocking(move || {
+            let _reserva = reserva;
+            entrou_tx
+                .blocking_send(id)
+                .expect("canal de entrada fechado");
+            sair_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("o teste não soltou o closure");
+        });
+
+        assert_eq!(entrou_rx.recv().await.expect("o closure não começou"), id);
+        assert!(ai.is_busy(), "a reserva dona liberou busy antes do closure");
+        assert_eq!(ai.active_turn().map(|turno| turno.id), Some(id));
+        assert!(ai.reservar().is_none(), "outro turno furou a reserva dona");
+        assert!(
+            ai.reservar_dono().is_none(),
+            "outra reserva dona furou o turno"
+        );
+        assert!(ai.request_cancel(id), "o turno dono não foi cancelado");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "o cancelador dono não mudou"
+        );
+        assert!(token.is_cancelled(), "o token dono não foi cancelado");
+
+        sair_tx.send(()).expect("canal de saída fechado");
+        tokio::time::timeout(Duration::from_secs(5), tarefa)
+            .await
+            .expect("o closure não terminou")
+            .expect("o closure panicou");
+        assert!(!ai.is_busy(), "o fim do closure não liberou busy");
+        assert!(
+            ai.active_turn().is_none(),
+            "o fim do closure não soltou o turno"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_espera_so_aguarda_a_identidade_pedida() {
+        let ai = runtime_de_teste("espera-por-turno");
+        let ativo = ai.reservar_dono().expect("o turno ativo não começou");
+        let id = ativo.id();
+        let outro_id = id + 1;
+
+        // Errar o id não pode esperar o busy alheio.
+        tokio::time::timeout(Duration::from_millis(100), ai.wait_stopped(outro_id))
+            .await
+            .expect("a espera de outro id ficou presa no turno alheio");
+        assert!(ai.is_busy(), "a espera errada liberou o turno alheio");
+
+        // O future é habilitado e fica pendente enquanto este id está ativo.
+        let mut espera = Box::pin(ai.wait_stopped(id));
+        assert!(
+            futures_util::poll!(espera.as_mut()).is_pending(),
+            "a espera do turno ativo terminou cedo"
+        );
+        drop(ativo);
+        assert!(
+            futures_util::poll!(espera.as_mut()).is_ready(),
+            "o fim do turno não acordou o future já habilitado"
+        );
+
+        // Um id encerrado também não espera o turno seguinte.
+        let novo = ai.reservar_dono().expect("o turno novo não começou");
+        assert_eq!(novo.id(), outro_id);
+        tokio::time::timeout(Duration::from_millis(100), ai.wait_stopped(id))
+            .await
+            .expect("a espera do id antigo ficou presa no turno novo");
+        assert!(ai.is_busy(), "a espera antiga liberou o turno novo");
+    }
+
 }

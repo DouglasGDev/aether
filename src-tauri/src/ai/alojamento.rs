@@ -693,17 +693,117 @@ pub fn maior_janela_inteira(
 ) -> Option<usize> {
     let cap = capacidade?;
     let teto = ficha.janela_maxima.min(teto);
+    maior_potencia(teto, &|janela| {
+        matches!(alojar(ficha, Some(cap), janela), Alojamento::Inteira { .. })
+    })
+}
+
+/// Desce das potências de dois a partir de `teto` até o predicado aceitar, e é
+/// uma função e não dois laços por um motivo: a monotonia é a mesma dos dois
+/// lados — o KV cresce com a janela — e uma segunda varredura escrita à mão é uma
+/// segunda maneira de errar o passo. A ordem escolhida (de cima para baixo, em
+/// metade) é o que faz a resposta ser o *maior* teto que cabe e não um cabe
+/// qualquer.
+fn maior_potencia(teto: usize, cabe: &dyn Fn(usize) -> bool) -> Option<usize> {
     let mut janela = teto.next_power_of_two();
     if janela > teto {
         janela /= 2;
     }
     while janela > 0 {
-        if matches!(alojar(ficha, Some(cap), janela), Alojamento::Inteira { .. }) {
+        if cabe(janela) {
             return Some(janela);
         }
         janela /= 2;
     }
     None
+}
+
+/// A RAM do sistema, medida no instante em que a conta é feita. Existe porque o
+/// degrau sem placa não tem para onde dividir: os pesos já moram na RAM e a
+/// janela estica o cache por cima deles. Passar da memória livre ali não é ficar
+/// aos poucos mais lento — é trocar com disco a cada token, ou a biblioteca
+/// recusar o contexto. É por isso que este degrau também tem de conhecer o
+/// próprio teto, e não só o da placa que ele não tem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoriaSistema {
+    pub livre: u64,
+    pub total: u64,
+}
+
+/// A única chamada que sabe a resposta nesta plataforma, com a causa da falha
+/// junto: quem publica o número na tela explica a recusa com o erro real do
+/// sistema operacional, e não com um "não medimos" genérico.
+///
+/// [`crate::ai::router::measure_hardware`] lê daqui em vez de abrir a chamada por
+/// conta própria: duas leituras do mesmo sistema operacional podem discordar, e
+/// um veredito que discorda da frase que o explica é o erro que ninguém vê.
+#[cfg(windows)]
+pub fn medir_memoria_do_sistema() -> Result<MemoriaSistema> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `status` é um MEMORYSTATUSEX válido com dwLength preenchido, e a
+    // função só escreve nele.
+    unsafe { GlobalMemoryStatusEx(&mut status) }
+        .map_err(|e| anyhow::anyhow!(tr("erros.medirRam", &[("detalhe", &e.to_string())])))?;
+    Ok(MemoriaSistema { livre: status.ullAvailPhys, total: status.ullTotalPhys })
+}
+
+#[cfg(not(windows))]
+pub fn medir_memoria_do_sistema() -> Result<MemoriaSistema> {
+    bail!("{}", tr("erros.ramNaoImplementada", &[]))
+}
+
+/// A mesma leitura como opção: a conta de caber não tem o que fazer com a causa,
+/// ela só para de afirmar quando não há medida. `None` é "não medimos", nunca
+/// zero — um zero aqui diria a uma máquina com 32 GiB livres que ela não tem
+/// onde pôr nada, e o teto dela viria `None` pela razão errada.
+pub fn memoria_do_sistema() -> Option<MemoriaSistema> {
+    medir_memoria_do_sistema().ok()
+}
+
+/// O que uma carga inteira custa na RAM do sistema para uma janela: os pesos, o
+/// cache da janela e o estado dos modelos que não têm janela.
+///
+/// Sem a folga de computação de [`folga_de_computacao`], de propósito: aqueles
+/// 518 MiB de piso e os 1.024 bytes por célula são o `sched_reserve` do grafo
+/// **Vulkan** medido em treze cargas desta placa, e o kernel de CPU não tem nada
+/// medido parecido nesta casa. Pôr o número da placa na conta da RAM seria
+/// exatamente o que este módulo recusa nos outros lugares: chamar de medida o que
+/// é transferência de outra máquina.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cabimento {
+    pub pesos: u64,
+    pub kv: u64,
+    pub estado: u64,
+    /// A soma das três acima, saturante — o número que se compara com `livre`.
+    pub total: u64,
+    /// A RAM livre que a conta usou, guardada para o motivo poder citá-la.
+    pub livre: u64,
+    pub cabe: bool,
+}
+
+pub fn caber_no_sistema(ficha: &Ficha, livre: u64, janela: usize) -> Cabimento {
+    let pesos = ficha.pesos_total;
+    let kv = ficha.kv_por_token.saturating_mul(celulas_da_janela(janela) as u64);
+    let estado = ficha.estado_recorrente;
+    let total = pesos.saturating_add(kv).saturating_add(estado);
+    Cabimento { pesos, kv, estado, total, livre, cabe: total <= livre }
+}
+
+/// A maior janela de potência de dois, até `teto`, em que pesos + KV + estado
+/// ainda cabem na RAM livre medida. É o teto cômodo do degrau sem placa e a
+/// mesma varredura do teto da placa, pela mesma razão: o KV cresce com a janela,
+/// então o primeiro que cabe descendo é o maior que cabe.
+///
+/// `None` é a RAM que não segura nem os pesos — que é o caso em que a pessoa
+/// escolheu um arquivo maior do que a máquina, e a resposta honesta é o motivo,
+/// não uma janela mínima inventada para a carga "funcionar".
+pub fn maior_janela_no_sistema(ficha: &Ficha, livre: u64, teto: usize) -> Option<usize> {
+    let teto = ficha.janela_maxima.min(teto);
+    maior_potencia(teto, &|janela| caber_no_sistema(ficha, livre, janela).cabe)
 }
 
 /// O veredito traduzido na moeda da carga: quantas camadas vão para a placa.
@@ -717,6 +817,14 @@ pub fn despacho(alojado: &Alojamento) -> i32 {
         Alojamento::Dividida { camadas, .. } => *camadas as i32,
         Alojamento::SoSistema { .. } => 0,
     }
+}
+
+/// A moeda com que este módulo fala de memória: GiB com uma casa. Uma função em
+/// vez de um `format!` espalhado porque a conta de caber, a frase do roteador e o
+/// motivo da carga têm de mostrar o mesmo número para a mesma grandeza — e um
+/// formato que diverge da conta é uma tela que desmente a própria medição.
+pub fn gibs(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// Bytes por camada, em média — o número que a tela usa para dizer de quanto em
@@ -923,6 +1031,93 @@ mod testes {
             }
             other => panic!("sem placa só existe o caso de sistema, veio {other:?}"),
         }
+    }
+
+    #[test]
+    fn na_ram_a_conta_e_pesos_mais_kv_mais_estado_sem_folga_de_placa() {
+        // A folga de computação é o `sched_reserve` do grafo Vulkan medido nesta
+        // placa. Pô-la na conta da RAM seria adivinhar um piso do kernel de CPU que
+        // ninguém mediu — e o teste é justamente a ausência dele.
+        let ficha = ficha_granite();
+        let cabendo = caber_no_sistema(&ficha, 3 * 1024 * 1024 * 1024, 4096);
+        assert_eq!(cabendo.pesos, ficha.pesos_total);
+        assert_eq!(cabendo.kv, ficha.kv_por_token * 4096);
+        assert_eq!(cabendo.estado, 0);
+        assert_eq!(cabendo.total, cabendo.pesos + cabendo.kv + cabendo.estado);
+        // 2136 + 320 = 2456 MiB contra 3072 MiB livres.
+        assert_eq!(cabendo.total, 2456 * 1024 * 1024);
+        assert!(cabendo.cabe);
+    }
+
+    #[test]
+    fn a_janela_que_passa_da_ram_livre_nao_cabe() {
+        let ficha = ficha_granite();
+        let tres_gib = 3 * 1024 * 1024 * 1024;
+        // 16384 de janela são 1280 MiB de KV sobre 2136 MiB de pesos: 3416 MiB
+        // contra 3072 livres. Não é "mais lento": é paging a cada token.
+        assert!(!caber_no_sistema(&ficha, tres_gib, 16384).cabe);
+        assert!(caber_no_sistema(&ficha, tres_gib, 8192).cabe);
+    }
+
+    #[test]
+    fn o_teto_de_ram_para_na_maior_potencia_que_cabe() {
+        // Mesma varredura do teto da placa, pela mesma monotonia: 8192 é o maior
+        // degrau que a RAM de 3 GiB segura deste 3B.
+        let ficha = ficha_granite();
+        let tres_gib = 3 * 1024 * 1024 * 1024;
+        assert_eq!(maior_janela_no_sistema(&ficha, tres_gib, 262144), Some(8192));
+        // O teto do arquivo (131072) continua mandando contra um pedido maior.
+        assert_eq!(maior_janela_no_sistema(&ficha, 16 * 1024 * 1024 * 1024, 262144), Some(131072));
+    }
+
+    #[test]
+    fn o_teto_de_ram_nunca_sobe_acima_do_que_foi_pedido() {
+        // A carga obedece este número, então ele tem de ser um teto e não uma
+        // promoção: pedir 4096 a uma máquina que levaria 8192 devolve 4096.
+        let ficha = ficha_granite();
+        assert_eq!(
+            maior_janela_no_sistema(&ficha, 3 * 1024 * 1024 * 1024, 4096),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn ram_que_nao_segura_os_pesos_nao_tem_janela_comoda() {        // 2 GiB livres contra 2136 MiB de pesos: nem com janela de um token a
+        // carga inteira pousa. `None` é a resposta dita; o zero seria a tela
+        // oferecendo uma janela que não roda.
+        let ficha = ficha_granite();
+        assert_eq!(maior_janela_no_sistema(&ficha, 2 * 1024 * 1024 * 1024, 131072), None);
+    }
+
+    #[test]
+    fn a_varredura_compartilhada_acha_o_mesmo_degrau_nos_dois_lados() {
+        // A placa de 3 GiB paga o piso do grafo (2136 + 320 + 518 + 4 = 2978 MiB em
+        // 4096, e 8192 já estoura com os 640 de KV), enquanto a RAM de 3 GiB, que
+        // não tem esse piso medido, leva 8192 (2136 + 640 = 2776). Os dois saem da
+        // mesma `maior_potencia` com réguas diferentes; se a varredura estivesse
+        // errada, os dois errariam juntos e este teste não veria.
+        let ficha = ficha_granite();
+        let tres_gib = 3 * 1024 * 1024 * 1024;
+        assert_eq!(maior_janela_inteira(&ficha, placa(3 * 1024).as_ref(), 131072), Some(4096));
+        assert_eq!(maior_janela_no_sistema(&ficha, tres_gib, 131072), Some(8192));
+    }
+
+    /// A leitura que o degrau sem placa inteira depende. Roda nesta máquina, com o
+    /// sistema operacional respondendo: `medir_memoria_do_sistema` tem de devolver
+    /// número, o livre não pode passar do total, e nenhum dos dois é zero — um zero
+    /// aqui é a conta dizer que a máquina não tem onde pôr o modelo.
+    #[cfg(windows)]
+    #[test]
+    fn a_ram_do_sistema_responde_e_o_livre_nao_passa_do_total() {
+        let memoria = medir_memoria_do_sistema().expect("a RAM tem de ser legível");
+        assert!(memoria.total > 0, "total zero é ausência, não medida: {memoria:?}");
+        assert!(memoria.livre > 0, "livre zero é ausência, não medida: {memoria:?}");
+        assert!(memoria.livre <= memoria.total, "livre acima do total: {memoria:?}");
+        eprintln!(
+            "RAM lida nesta máquina: {} GiB livres de {} GiB",
+            gibs(memoria.livre),
+            gibs(memoria.total)
+        );
     }
 
     #[test]

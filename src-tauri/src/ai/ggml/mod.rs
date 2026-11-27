@@ -24,6 +24,7 @@ use ffi::{Ggml, InfoDevice, Token};
 use std::ffi::c_int;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ffi::{TIPO_CPU, TIPO_GPU, TIPO_IGPU};
 
@@ -128,6 +129,11 @@ mod reload {
         registro(&pastas).expect("terceira abertura");
     }
 }
+
+/// O callback do llama.cpp ainda pode não interromper um grafo Vulkan já
+/// enfileirado. Por isso a geração cancelável encontra o flag entre lotes de no
+/// máximo 512 tokens, em vez de esperar o `n_batch` inteiro da biblioteca.
+pub(crate) const LOTE_CANCELAVEL: usize = 512;
 
 /// O motor: pesos, contexto e o lote de ids reaproveitado a cada passo.
 pub struct Motor {
@@ -288,6 +294,18 @@ impl Motor {
     /// mais longo que `n_batch` é fatiado; só o último bloco produz os logits
     /// que voltam, e os anteriores apenas alimentam o KV cache.
     pub fn passo(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.passo_interno(tokens, None)
+    }
+
+    pub fn passo_cancelavel(&mut self, tokens: &[u32], cancel: &AtomicBool) -> Result<Vec<f32>> {
+        self.passo_interno(tokens, Some(cancel))
+    }
+
+    fn passo_interno(
+        &mut self,
+        tokens: &[u32],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -297,18 +315,29 @@ impl Motor {
         let mut buf = std::mem::take(&mut self.buf);
         buf.clear();
         buf.extend(tokens.iter().map(|t| *t as Token));
-        let (ctx, n_vocab, n_batch) = (self.contexto, self.n_vocab, self.n_batch);
+        let (ctx, n_vocab) = (self.contexto, self.n_vocab);
+        let n_batch = self.n_batch.min(cancel.map_or(self.n_batch, |_| LOTE_CANCELAVEL)).max(1);
         let ggml = &self.ggml;
 
         let mut logits = Vec::new();
         let mut falha = None;
         for inicio in (0..buf.len()).step_by(n_batch) {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                falha = Some(tr("erros.pedidoCancelado", &[]));
+                break;
+            }
             let fim = (inicio + n_batch).min(buf.len());
             // O ponteiro é da ggml, que só lê durante a chamada, e `buf` não é
             // tocado entre um bloco e outro: o intervalo continua válido.
             let bruto = unsafe { ggml.passo(ctx, buf[inicio..fim].as_mut_ptr(), fim - inicio, n_vocab) };
             match bruto {
-                Ok(l) => logits = l,
+                Ok(l) => {
+                    logits = l;
+                    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                        falha = Some(tr("erros.pedidoCancelado", &[]));
+                        break;
+                    }
+                }
                 Err(e) => {
                     falha = Some(e);
                     break;
@@ -349,6 +378,22 @@ impl Motor {
     /// `false`, o cache é esquecido inteiro e a rodada prefila do zero. Dizer
     /// "reaproveitei 0" sem essa diferença é não saber se quem errou fomos nós.
     pub fn passo_com_prefixo(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, usize, bool)> {
+        self.passo_com_prefixo_interno(tokens, None)
+    }
+
+    pub fn passo_com_prefixo_cancelavel(
+        &mut self,
+        tokens: &[u32],
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<f32>, usize, bool)> {
+        self.passo_com_prefixo_interno(tokens, Some(cancel))
+    }
+
+    fn passo_com_prefixo_interno(
+        &mut self,
+        tokens: &[u32],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Vec<f32>, usize, bool)> {
         if tokens.is_empty() {
             return Ok((Vec::new(), 0, false));
         }
@@ -366,7 +411,10 @@ impl Motor {
                 recusado = true;
             }
         }
-        let logits = self.passo(&tokens[k..])?;
+        let logits = match cancel {
+            Some(cancel) => self.passo_cancelavel(&tokens[k..], cancel)?,
+            None => self.passo(&tokens[k..])?,
+        };
         Ok((logits, k, recusado))
     }
 
@@ -374,6 +422,10 @@ impl Motor {
     pub fn limpar(&mut self) {
         self.cached.clear();
         self.ggml.limpar_cache(self.contexto);
+    }
+
+    pub fn definir_aborte(&self, cancel: Option<&std::sync::atomic::AtomicBool>) {
+        self.ggml.definir_aborte(self.contexto, cancel);
     }
 
     /// Quantas células do cache estão ocupadas, pela conta que este código

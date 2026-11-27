@@ -21,6 +21,7 @@ use libloading::Library;
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type Token = c_int;
 pub type DeviceBruto = *mut c_void;
@@ -368,6 +369,11 @@ pub struct Ggml {
     /// (`typedef int32_t llama_pos;`), e não um detalhe de gosto: declará-los
     /// como `int64_t` faria a biblioteca ler os bits errados da pilha.
     memoria_seq_rm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int) -> bool,
+    set_abort: unsafe extern "C" fn(
+        *mut c_void,
+        Option<extern "C" fn(*mut c_void) -> bool>,
+        *mut c_void,
+    ),
     lote_de_um: unsafe extern "C" fn(*mut Token, c_int) -> Lote,
     decodificar: unsafe extern "C" fn(*mut c_void, Lote) -> c_int,
     codificar: unsafe extern "C" fn(*mut c_void, Lote) -> c_int,
@@ -404,6 +410,10 @@ fn texto(p: *const c_char) -> String {
     // A CStr é emprestada: o dono é a ggml, que mantém esses nomes vivos pelo
     // resto do processo.
     unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+extern "C" fn abortar(data: *mut c_void) -> bool {
+    !data.is_null() && unsafe { &*(data as *const AtomicBool) }.load(Ordering::Relaxed)
 }
 
 /// Abre uma DLL vendorizada com a pasta dela no começo da busca. As dependências
@@ -567,6 +577,7 @@ impl Ggml {
                 memoria: simbolo(&llama, "llama_get_memory")?,
                 memoria_limpar: simbolo(&llama, "llama_memory_clear")?,
                 memoria_seq_rm: simbolo(&llama, "llama_memory_seq_rm")?,
+                set_abort: simbolo(&llama, "llama_set_abort_callback")?,
                 lote_de_um: simbolo(&llama, "llama_batch_get_one")?,
                 decodificar: simbolo(&llama, "llama_decode")?,
                 codificar: simbolo(&llama, "llama_encode")?,
@@ -593,6 +604,14 @@ impl Ggml {
             return Ok((ggml, pasta.clone()));
         }
         Err(tr("erros.motorDllNaoEncontrada", &[("caminhos", &tentadas.join(", "))]))
+    }
+
+    pub fn definir_aborte(&self, contexto: *mut c_void, cancel: Option<&AtomicBool>) {
+        let (callback, data) = match cancel {
+            Some(flag) => (Some(abortar as extern "C" fn(*mut c_void) -> bool), flag as *const AtomicBool as *mut c_void),
+            None => (None, std::ptr::null_mut()),
+        };
+        unsafe { (self.set_abort)(contexto, callback, data) };
     }
 
     /// Todos os devices que a ggml registrou, na ordem do registro.
@@ -1001,6 +1020,16 @@ impl Ggml {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    #[test]
+    fn o_aborto_nativo_le_o_cancelador_vivo_do_turno() {
+        let cancel = AtomicBool::new(false);
+        let dados = &cancel as *const AtomicBool as *mut c_void;
+        assert!(!abortar(dados));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(abortar(dados));
+        assert!(!abortar(std::ptr::null_mut()));
+    }
 
     /// Um caminho que nenhuma DLL tem, e que o carregador do Windows recusa com
     /// o erro dele mesmo: não é um falso montado por este teste, é a resposta

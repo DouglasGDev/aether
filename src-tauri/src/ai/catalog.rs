@@ -4,7 +4,11 @@
 //! lido da árvore de arquivos do HuggingFace, não estimado.
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -690,7 +694,7 @@ pub fn support_ok(path: &Path) -> bool {
     !cabeca[..lido].starts_with(b"version https://git-lfs.github.com")
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
     pub id: String,
@@ -718,20 +722,266 @@ pub fn model_dir(root: &Path, spec: &ModelSpec) -> PathBuf {
 }
 
 /// Estado medido em disco: bytes presentes e arquivos de apoio ausentes.
+///
+/// Toda a leitura passa pelo cache assinado abaixo — ver `status_com`.
 pub fn status(root: &Path, spec: &ModelSpec) -> ModelStatus {
+    status_com(&mut Visor::novo(), root, spec)
+}
+
+// ---------------------------------------------------------------------------
+// Cache de status assinado pelo disco
+// ---------------------------------------------------------------------------
+
+/// O retrato de um arquivo em disco que a máquina sabe conferir.
+///
+/// A assinatura é o que o `std::fs::Metadata` daqui entrega sem abrir o
+/// arquivo: tamanho, última modificação e criação. Ela não identifica o
+/// conteúdo — identifica a *instância*. Basta para o caso que importa, que é o
+/// do download: o `.part` cresce (muda o tamanho a cada bloco), o peso final
+/// aparece do nada (`Ausente` → `Presente`) e o `.gguf` novo tem criação e
+/// tamanho próprios. Trocar o arquivo fora do Aether também muda a assinatura.
+///
+/// O que ela não pega é uma reescrita que preserve tamanho e caia no mesmo
+/// tique de relógio: medido nesta máquina, `std::fs::write` duas vezes no mesmo
+/// caminho com o mesmo comprimento devolve assinatura idêntica cerca de três
+/// vezes em oito, porque o NTFS lê a hora de um relógio cacheado em tique de
+/// ~16 ms. O número está no teste que o descobriu, e é ele que diz onde o cache
+/// não entra: nenhum caminho do aplicativo reescreve um peso no lugar — o
+/// download escreve `.part`, que muda de tamanho a cada bloco, e renomeia, que
+/// muda a criação —, mas `alojamento.rs` reescreve `.gguf` de teste no mesmo
+/// caminho para trocar o dtype, e ali a assinatura mentiria. Ver a razão escrita
+/// em `cabecalho::ler`.
+///
+/// Por isso `invalidar` existe e é chamada nos pontos de escrita: ela é o cinto,
+/// a assinatura é o motor, e onde não há cinto possível não se monta o motor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Assinatura {
+    /// O arquivo não está lá — e isso também é uma assinatura: é o que permite
+    /// responder "0 bytes" sem abrir nada e perceber quando ele chegar.
+    Ausente,
+    Presente {
+        bytes: u64,
+        modificado: Option<SystemTime>,
+        criado: Option<SystemTime>,
+    },
+}
+
+impl Assinatura {
+    /// Assina um arquivo pelo caminho. `Err` do `metadata` é tratado como
+    /// ausente — é o que o código fazia com `unwrap_or(0)`.
+    pub fn de_arquivo(caminho: &Path) -> Self {
+        Self::do_metadata(&std::fs::metadata(caminho))
+    }
+
+    fn do_metadata(medida: &Result<std::fs::Metadata, std::io::Error>) -> Self {
+        match medida {
+            Ok(m) if m.is_file() => Self::Presente {
+                bytes: m.len(),
+                modificado: m.modified().ok(),
+                criado: m.created().ok(),
+            },
+            _ => Self::Ausente,
+        }
+    }
+
+    /// Bytes em disco, zero quando o arquivo não existe.
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Assinatura::Ausente => 0,
+            Assinatura::Presente { bytes, .. } => *bytes,
+        }
+    }
+}
+
+/// O que uma enumeração de pasta devolve: nome → assinatura de cada arquivo.
+type Conteudo = HashMap<String, Assinatura>;
+
+/// Estado de uma pasta dentro de uma mesma passada de leitura.
+enum EstadoPasta {
+    /// Enumerada com sucesso: nenhum `stat` individual é preciso daqui.
+    Listada(Conteudo),
+    /// `read_dir` falhou. Não se guarda erro: a pasta pode estar sendo criada
+    /// agora, e fingir que ela está vazia para sempre faria a biblioteca
+    /// mentir sobre um download que acabou de terminar.
+    Indefinida,
+}
+
+/// Janela de leitura de uma passada.
+///
+/// O `read_dir` é caro por chamada e barato por entrada: no Windows a
+/// enumeração já traz nome, tamanho e datas de cada arquivo de uma vez
+/// (`WIN32_FIND_DATA`), e no Unix é um `fstatat` por entrada. Enumerar a pasta
+/// uma vez custa menos que os seis `stat` + quatro aberturas que cada spec
+/// pedia. Esta janela garante que a pasta é enumerada uma única vez por
+/// `all_status` — as 30 quants granite dividem a mesma pasta.
+///
+/// A enumeração não atravessa chamadas: data de modificação de pasta não muda
+/// quando um arquivo dentro dela cresce, então guardá-la seria guardar uma
+/// mentira sobre um download em curso.
+pub struct Visor {
+    pastas: HashMap<PathBuf, EstadoPasta>,
+    /// Veredito de arquivo de apoio já aberto nesta passada. As 30 quants do
+    /// Granite dividem o mesmo `tokenizer.json`: sem esta memória cada uma o
+    /// abria por conta, e uma passada da biblioteca fazia 176 aberturas para
+    /// conferir 16 arquivos.
+    vereditos: HashMap<PathBuf, bool>,
+}
+
+impl Visor {
+    pub fn novo() -> Self {
+        Self { pastas: HashMap::new(), vereditos: HashMap::new() }
+    }
+
+    fn conteudo(&mut self, dir: &Path) -> &EstadoPasta {
+        if !self.pastas.contains_key(dir) {
+            let estado = match std::fs::read_dir(dir) {
+                Ok(entradas) => {
+                    registrar_enumeracao(dir);
+                    let mut mapa: Conteudo = HashMap::new();
+                    for entrada in entradas.flatten() {
+                        let Some(nome) = entrada.file_name().to_str().map(str::to_string) else {
+                            continue;
+                        };
+                        // No Windows o `DirEntry::metadata` não segue link nem
+                        // junção: para um arquivo montado de outro volume ele
+                        // diria o tamanho do reparse point. Onde há link,
+                        // cai no `metadata` de caminho, que segue — é o que o
+                        // código fazia antes e é o que o usuário espera ver.
+                        let assinatura = match entrada.file_type() {
+                            Ok(t) if t.is_symlink() => {
+                                Assinatura::de_arquivo(&entrada.path())
+                            }
+                            _ => Assinatura::do_metadata(&entrada.metadata()),
+                        };
+                        mapa.insert(nome, assinatura);
+                    }
+                    EstadoPasta::Listada(mapa)
+                }
+                Err(_) => EstadoPasta::Indefinida,
+            };
+            self.pastas.insert(dir.to_path_buf(), estado);
+        }
+        self.pastas.get(dir).expect("a pasta foi registrada acima")
+    }
+
+    /// Assinatura de um arquivo de uma pasta já sob observação.
+    pub fn assinatura(&mut self, dir: &Path, nome: &str) -> Assinatura {
+        match self.conteudo(dir) {
+            EstadoPasta::Listada(mapa) => mapa.get(nome).cloned().unwrap_or(Assinatura::Ausente),
+            EstadoPasta::Indefinida => Assinatura::de_arquivo(&dir.join(nome)),
+        }
+    }
+
+    /// O veredito de um arquivo de apoio, aberto uma única vez por passada.
+    pub fn apoio_ok(&mut self, caminho: &Path) -> bool {
+        if let Some(veredito) = self.vereditos.get(caminho) {
+            return *veredito;
+        }
+        let veredito = support_com(caminho);
+        self.vereditos.insert(caminho.to_path_buf(), veredito);
+        veredito
+    }
+}
+
+/// O que se guarda de um modelo: a assinatura na qual o veredito foi medido e
+/// o veredito. Se qualquer peça da assinatura mudar, a entrada vale zero e é
+/// refeita sozinha — sem invalidante que alguém possa esquecer.
+struct Entrada {
+    pesos: Assinatura,
+    parcial: Assinatura,
+    /// Nome, assinatura e veredito de cada arquivo de apoio. O veredito do
+    /// ponteiro Git LFS só sai abrindo o arquivo; guardar a assinatura junto
+    /// é o que deixa de abrir os que não mudaram.
+    apoios: Vec<(String, Assinatura, bool)>,
+    status: ModelStatus,
+    /// Idade para a saída LRU: a máquina tem de caber na memória fixa.
+    carimbo: u64,
+}
+
+/// Entradas máximas guardadas.
+///
+/// O catálogo tem 60 modelos (58 de conversa + 2 codificadores) e cada um tem
+/// uma entrada por raiz de modelos. Duas raizes vivas — a de `%LOCALAPPDATA%`
+/// e uma pasta escolhida pelo usuário — são 120 entradas; 128 cobre as duas
+/// com folga e ainda assim é pouco: uma entrada é o `ModelStatus` (três
+/// strings curtas e um vetor de nomes) mais quatro assinaturas, algo em torno
+/// de 600 bytes, então o teto inteiro custa menos de 100 KiB. Passou disso,
+/// sai a mais antiga — o preço de errar é reenumerar uma pasta, não faltar
+/// RAM para o motor.
+const TETO_DE_ENTRADAS: usize = 128;
+
+static CACHE: OnceLock<Mutex<HashMap<(PathBuf, &'static str), Entrada>>> = OnceLock::new();
+static CARIMBO: AtomicU64 = AtomicU64::new(0);
+
+fn cache() -> &'static Mutex<HashMap<(PathBuf, &'static str), Entrada>> {
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// O `status` com janela compartilhada — é por aqui que o cache entra.
+///
+/// Acerto custa uma enumeração de pasta e zero aberturas. Falha custa a
+/// enumeração e abre apenas os arquivos de apoio cuja assinatura mudou: um
+/// download que terminou reabre o peso (na verdade não o abre — só mede) e não
+/// reabre o `tokenizer.json` de sempre.
+fn status_com(visor: &mut Visor, root: &Path, spec: &ModelSpec) -> ModelStatus {
     let dir = model_dir(root, spec);
-    let weights = dir.join(spec.weights_file);
-    let downloaded_bytes = std::fs::metadata(&weights).map(|m| m.len()).unwrap_or(0);
-    let partial_bytes = std::fs::metadata(dir.join(format!("{}.part", spec.weights_file)))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let missing_support: Vec<String> = spec
+    let parcial_nome = format!("{}.part", spec.weights_file);
+    let pesos = visor.assinatura(&dir, spec.weights_file);
+    let parcial = visor.assinatura(&dir, &parcial_nome);
+    let atuais: Vec<(&'static str, Assinatura)> = spec
         .support_files
         .iter()
-        .filter(|f| !support_ok(&dir.join(f)))
-        .map(|f| f.to_string())
+        .map(|f| (*f, visor.assinatura(&dir, f)))
         .collect();
-    ModelStatus {
+
+    let chave = (dir.clone(), spec.id);
+
+    // Uma passada pela trava resolve os dois lados. Acerto pleno — as três
+    // assinaturas conferem com as da medida guardada — devolve o veredito
+    // pronto, sem abrir arquivo nenhum: é por aqui que passam os 60 cartões da
+    // biblioteca em cada atualização da tela. Erro devolve os vereditos antigos
+    // para que só o arquivo que mudou seja reaberto.
+    let antigos: Vec<(String, Assinatura, bool)> = {
+        let mut cache = crate::state::trava_estado(cache());
+        match cache.get_mut(&chave) {
+            Some(entrada) => {
+                let bate = entrada.pesos == pesos
+                    && entrada.parcial == parcial
+                    && entrada.apoios.len() == atuais.len()
+                    && entrada
+                        .apoios
+                        .iter()
+                        .zip(atuais.iter())
+                        .all(|((nome, antiga, _), (nova, atual))| nome == nova && antiga == atual);
+                if bate {
+                    entrada.carimbo = CARIMBO.fetch_add(1, Ordering::Relaxed);
+                    return entrada.status.clone();
+                }
+                entrada.apoios.clone()
+            }
+            None => Vec::new(),
+        }
+    };
+
+    // Veredito antigo só vale com a assinatura antiga idêntica.
+    let mut apoios: Vec<(String, Assinatura, bool)> = Vec::with_capacity(atuais.len());
+    let mut missing_support: Vec<String> = Vec::new();
+    for (nome, assinatura) in &atuais {
+        let ok = match antigos
+            .iter()
+            .find(|(n, a, _)| n == nome && a == assinatura)
+        {
+            Some((_, _, veredito)) => *veredito,
+            None => visor.apoio_ok(&dir.join(nome)),
+        };
+        if !ok {
+            missing_support.push((*nome).to_string());
+        }
+        apoios.push(((*nome).to_string(), assinatura.clone(), ok));
+    }
+
+    let downloaded_bytes = pesos.bytes();
+    let medida = ModelStatus {
         id: spec.id.to_string(),
         display: spec.display.to_string(),
         series: spec.series.to_string(),
@@ -744,21 +994,151 @@ pub fn status(root: &Path, spec: &ModelSpec) -> ModelStatus {
         context_limit: spec.context_limit,
         weights_bytes: spec.weights_bytes,
         downloaded_bytes,
-        partial_bytes,
+        partial_bytes: parcial.bytes(),
         complete: downloaded_bytes == spec.weights_bytes && missing_support.is_empty(),
         missing_support,
         dir: dir.display().to_string(),
+    };
+
+    // Medida nova: substitui a entrada e carimba. A substituição é sempre
+    // feita, mesmo quando o veredito é igual ao anterior — o que importa para
+    // a próxima passada é a assinatura com que ele foi medido.
+    {
+        let mut cache = crate::state::trava_estado(cache());
+        let carimbo = CARIMBO.fetch_add(1, Ordering::Relaxed);
+        cache.insert(
+            chave,
+            Entrada { pesos, parcial, apoios, status: medida.clone(), carimbo },
+        );
+    }
+    desaloja();
+    medida
+}
+
+/// Tira as entradas mais velhas até caber no teto.
+fn desaloja() {
+    let mut cache = crate::state::trava_estado(cache());
+    while cache.len() > TETO_DE_ENTRADAS {
+        let mais_velha = cache
+            .iter()
+            .min_by_key(|(_, e)| e.carimbo)
+            .map(|(k, _)| k.clone());
+        match mais_velha {
+            Some(chave) => {
+                cache.remove(&chave);
+            }
+            None => break,
+        }
     }
 }
 
+/// Descarta a entrada de um modelo. Chamada nos pontos de escrita.
+pub fn invalidar(root: &Path, spec: &ModelSpec) {
+    let dir = model_dir(root, spec);
+    let mut cache = crate::state::trava_estado(cache());
+    cache.retain(|(c, _), _| c != &dir);
+}
+
+/// Descarta tudo que uma raiz de modelos abriga. É o que se chama depois de
+/// um download, de uma limpeza ou de qualquer troca fora do catálogo: a
+/// assinatura refaria a entrada sozinha na próxima passada, mas o pedido de
+/// escrita é o momento em que a verdade muda e o código tem de dizer isso.
+pub fn invalidar_raiz(root: &Path) {
+    let mut cache = crate::state::trava_estado(cache());
+    cache.retain(|(dir, _), _| !dir.starts_with(root));
+}
+
+/// `support_ok` com a contagem de teste: o veredito é o mesmo, o que muda é
+/// que dá para provar que o caminho cacheado não abriu arquivo nenhum.
+fn support_com(caminho: &Path) -> bool {
+    registrar_abertura(caminho);
+    support_ok(caminho)
+}
+
+/// Contadores de leitura usados pelos testes de cache.
+///
+/// São por caminho, não globais: os testes correm em threads do mesmo
+/// processo, e um contador geral daria falha fantasma quando outro teste abre
+/// um arquivo enquanto este mede o seu. Fora de teste o módulo não existe e as
+/// chamadas viram nada.
+#[cfg(test)]
+mod medidor {
+    use crate::state::trava_estado;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static ABERTURAS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    static ENUMERACOES: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+
+    fn registro(
+        p: &'static OnceLock<Mutex<HashMap<PathBuf, u64>>>,
+    ) -> &'static Mutex<HashMap<PathBuf, u64>> {
+        p.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn abrir(caminho: &Path) {
+        *trava_estado(registro(&ABERTURAS)).entry(caminho.to_path_buf()).or_insert(0) += 1;
+    }
+
+    pub fn percorrer(dir: &Path) {
+        *trava_estado(registro(&ENUMERACOES)).entry(dir.to_path_buf()).or_insert(0) += 1;
+    }
+
+    pub fn aberturas(caminho: &Path) -> u64 {
+        trava_estado(registro(&ABERTURAS)).get(caminho).copied().unwrap_or(0)
+    }
+
+    pub fn percorridas(dir: &Path) -> u64 {
+        trava_estado(registro(&ENUMERACOES)).get(dir).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn registrar_abertura(caminho: &Path) {
+    medidor::abrir(caminho);
+}
+
+#[cfg(test)]
+#[inline]
+fn registrar_enumeracao(dir: &Path) {
+    medidor::percorrer(dir);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn registrar_abertura(_caminho: &Path) {}
+
+#[cfg(not(test))]
+#[inline]
+fn registrar_enumeracao(_dir: &Path) {}
+
+#[cfg(test)]
+pub fn aberturas_de(caminho: &Path) -> u64 {
+    medidor::aberturas(caminho)
+}
+
+#[cfg(test)]
+pub fn enumeracoes_de(dir: &Path) -> u64 {
+    medidor::percorridas(dir)
+}
+
+#[cfg(test)]
+pub fn entradas_em_cache() -> usize {
+    crate::state::trava_estado(cache()).len()
+}
+
 pub fn all_status(root: &Path) -> Vec<ModelStatus> {
-    todos_de_conversa().map(|spec| status(root, spec)).collect()
+    let mut visor = Visor::novo();
+    todos_de_conversa().map(|spec| status_com(&mut visor, root, spec)).collect()
 }
 
 /// O que a tela de memória oferece: as quants do codificador, com o estado
 /// medido em disco.
 pub fn status_embeddings(root: &Path) -> Vec<ModelStatus> {
-    todos_de_embeddings().map(|spec| status(root, spec)).collect()
+    let mut visor = Visor::novo();
+    todos_de_embeddings().map(|spec| status_com(&mut visor, root, spec)).collect()
 }
 
 #[cfg(test)]
@@ -1103,5 +1483,256 @@ mod tests {
         assert_eq!(st.partial_bytes, 4096);
         assert!(!st.complete);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pasta de teste isolada por nome e por processo: a cache é do processo, e
+    /// duas telas de teste medindo o mesmo caminho pisariam uma na outra.
+    fn raiz_de_teste(nome: &str) -> PathBuf {
+        let raiz =
+            std::env::temp_dir().join(format!("aether-catalog-cache-{nome}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raiz);
+        raiz
+    }
+
+    fn modelo_completo_em(raiz: &Path, spec: &ModelSpec) -> PathBuf {
+        let sub = model_dir(raiz, spec);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(spec.weights_file), b"12345").unwrap();
+        for apoio in spec.support_files {
+            std::fs::write(sub.join(apoio), b"{\"ok\": true}").unwrap();
+        }
+        sub
+    }
+
+    /// O que a assinatura jura e o que ela não jura, medido nesta máquina.
+    ///
+    /// A parte afirmativa é a que os caches usam: tamanho diferente é arquivo
+    /// diferente, e é assim que um download terminando cai na entrada sozinho. A
+    /// parte medida é o limite: reescrita do mesmo comprimento no mesmo tique
+    /// pode continuar com a mesma assinatura, e é por isso que `cabecalho::ler`
+    /// não guarda nada — lá existe código que faz exatamente isso.
+    #[test]
+    fn a_assinatura_muda_quando_o_arquivo_muda_de_tamanho() {
+        let dir = raiz_de_teste("assinatura");
+        std::fs::create_dir_all(&dir).unwrap();
+        let caminho = dir.join("peso.gguf");
+
+        std::fs::write(&caminho, b"1234").unwrap();
+        let pequena = Assinatura::de_arquivo(&caminho);
+        assert_eq!(pequena.bytes(), 4);
+        assert_eq!(pequena, Assinatura::de_arquivo(&caminho), "o mesmo arquivo quieto tem a mesma assinatura");
+
+        std::fs::write(&caminho, b"123456789").unwrap();
+        let maior = Assinatura::de_arquivo(&caminho);
+        assert_eq!(maior.bytes(), 9);
+        assert_ne!(maior, pequena, "mudar o tamanho tem de mudar a assinatura");
+
+        let ausente = dir.join("nao-existe.gguf");
+        assert_eq!(Assinatura::de_arquivo(&ausente), Assinatura::Ausente);
+        assert_eq!(Assinatura::Ausente.bytes(), 0);
+
+        let mut identicas = 0usize;
+        for letra in 0..8u8 {
+            std::fs::write(&caminho, [b'a'; 8]).unwrap();
+            let antes = Assinatura::de_arquivo(&caminho);
+            std::fs::write(&caminho, [b'b' + letra; 8]).unwrap();
+            let depois = Assinatura::de_arquivo(&caminho);
+            if antes == depois {
+                identicas += 1;
+            }
+        }
+        eprintln!(
+            "reescritas de mesmo tamanho no mesmo tique: {identicas} de 8 ficaram com a mesma assinatura \
+             — o número que proíbe o cache em `cabecalho::ler`"
+        );
+        assert_eq!(Assinatura::de_arquivo(&dir), Assinatura::Ausente, "pasta não é arquivo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direção (a) da prova: o segundo acesso não volta ao disco. O contador é
+    /// por caminho, não global, porque os testes correm em threads do mesmo
+    /// processo.
+    #[test]
+    fn o_segundo_status_nao_reabre_o_arquivo_de_apoio() {
+        let raiz = raiz_de_teste("hit");
+        let spec = find("granite-4.2-3b-Q4_K_M").unwrap();
+        let sub = modelo_completo_em(&raiz, spec);
+        let tokenizador = sub.join("tokenizer.json");
+
+        let primeiro = status(&raiz, spec);
+        assert_eq!(aberturas_de(&tokenizador), 1, "a primeira medida abre cada apoio");
+        assert_eq!(primeiro.downloaded_bytes, 5);
+        assert!(primeiro.missing_support.is_empty());
+
+        let segundo = status(&raiz, spec);
+        assert_eq!(primeiro, segundo);
+        assert_eq!(aberturas_de(&tokenizador), 1, "a segunda medida não abriu arquivo nenhum");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// Direção (b) da prova — a que impede a tela de mentir: o apoio trocado
+    /// aparece sozinho na leitura seguinte, sem ninguém chamar invalidador. É o
+    /// caso real do ponteiro Git LFS que vira o tokenizador de verdade.
+    #[test]
+    fn um_apoio_trocado_invalida_o_status_sem_pedir_invalidacao() {
+        let raiz = raiz_de_teste("apoio-trocado");
+        let spec = find("qwen3-embedding-0.6b-q8_0").unwrap();
+        let sub = model_dir(&raiz, spec);
+        std::fs::create_dir_all(&sub).unwrap();
+        let tokenizador = sub.join("tokenizer.json");
+        std::fs::write(
+            &tokenizador,
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:deadbeef\nsize 11423705\n",
+        )
+        .unwrap();
+        std::fs::write(sub.join("tokenizer_config.json"), b"{}").unwrap();
+
+        let primeiro = status(&raiz, spec);
+        assert_eq!(primeiro.missing_support, vec!["tokenizer.json".to_string()]);
+        assert!(!primeiro.complete);
+
+        std::fs::write(
+            &tokenizador,
+            b"{\"tokenizer.ggml.model\": \"gpt2\", \"nota\": \"o arquivo de verdade chegou, com outros bytes\"}",
+        )
+        .unwrap();
+        let antes = aberturas_de(&tokenizador);
+        let segundo = status(&raiz, spec);
+        assert!(
+            segundo.missing_support.is_empty(),
+            "o tokenizador novo tem de aparecer: {:?}",
+            segundo.missing_support
+        );
+        assert!(aberturas_de(&tokenizador) > antes, "a reescrita tem de causar reabertura");
+        assert_ne!(primeiro, segundo);
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// O `.part` que vira peso é o momento em que a biblioteca mais mente se não
+    /// houver cache assinado — e o mais perigoso se houver um cache errado. Aqui
+    /// ninguém invalida nada: a assinatura do arquivo novo é outra.
+    #[test]
+    fn o_download_que_termina_vira_cartao_novo_so_zinho() {
+        let raiz = raiz_de_teste("parte-para-peso");
+        let spec = find("granite-4.2-3b-Q4_K_M").unwrap();
+        let sub = modelo_completo_em(&raiz, spec);
+        let parcial = sub.join(format!("{}.part", spec.weights_file));
+        let peso = sub.join(spec.weights_file);
+        std::fs::write(&peso, b"12345").unwrap();
+        std::fs::remove_file(&peso).unwrap();
+
+        std::fs::write(&parcial, vec![0u8; 4096]).unwrap();
+        let durante = status(&raiz, spec);
+        assert_eq!(durante.partial_bytes, 4096);
+        assert_eq!(durante.downloaded_bytes, 0);
+        assert!(!durante.complete);
+
+        std::fs::write(&peso, vec![7u8; 5]).unwrap();
+        std::fs::remove_file(&parcial).unwrap();
+        let depois = status(&raiz, spec);
+        assert_eq!(depois.downloaded_bytes, 5, "o peso que chegou aparece sem ninguém invalidar");
+        assert_eq!(depois.partial_bytes, 0);
+        assert_ne!(durante, depois);
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// A raiz de modelos pode não existir na primeira leitura de um clone
+    /// recém-instalado. Guardar "não existe" como se fosse o retrato de uma
+    /// pasta real é o que faria a biblioteca negar um modelo baixado minutos
+    /// depois — aqui a pasta nasce entre as duas leituras.
+    #[test]
+    fn a_pasta_criada_depois_de_uma_leitura_aparece_na_seguinte() {
+        let raiz = raiz_de_teste("pasta-nova");
+        let spec = find("granite-4.2-3b-Q4_K_M").unwrap();
+        let primeiro = status(&raiz, spec);
+        assert_eq!(primeiro.downloaded_bytes, 0);
+        assert_eq!(primeiro.partial_bytes, 0);
+
+        let sub = model_dir(&raiz, spec);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(spec.weights_file), b"1234").unwrap();
+        let depois = status(&raiz, spec);
+        assert_eq!(depois.downloaded_bytes, 4, "a pasta que nasceu depois não pode ficar ausente para sempre");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// A conta que o cache veio pagar: uma passada da biblioteca enumera cada
+    /// pasta uma vez e abre cada arquivo de apoio uma vez, em vez de abrir os
+    /// quatro apoios por quant.
+    #[test]
+    fn uma_passada_enumera_a_pasta_uma_vez_e_abre_cada_apoio_uma_vez() {
+        let raiz = raiz_de_teste("passada");
+        let spec = find("granite-4.2-3b-Q4_K_M").unwrap();
+        let sub = modelo_completo_em(&raiz, spec);
+        let outra = find("granite-4.2-3b-Q8_0").unwrap();
+        assert_eq!(model_dir(&raiz, outra), sub, "as duas quants dividem a pasta");
+        let tokenizador = sub.join("tokenizer.json");
+
+        let lista = all_status(&raiz);
+        assert_eq!(enumeracoes_de(&sub), 1, "uma enumeração serve às quants da pasta");
+        assert_eq!(aberturas_de(&tokenizador), 1, "o apoio compartilhado é aberto uma vez por passada");
+        assert_eq!(lista.iter().filter(|s| s.downloaded_bytes == 5).count(), 1);
+        assert_eq!(lista.iter().filter(|s| s.id == spec.id || s.id == outra.id).count(), 2);
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// O teto é a promessa de que a cache não cresce com a sessão. Inundar com
+    /// raizes novas não pode passar de `TETO_DE_ENTRADAS`, e a mais antiga tem
+    /// de sair — provado pela reabertura, não pelo tamanho da tabela.
+    #[test]
+    fn a_cache_de_status_tem_teto_e_sai_pela_mais_antiga() {
+        let raiz = raiz_de_teste("teto");
+        let spec = find("granite-4.2-3b-Q4_K_M").unwrap();
+        let sub = modelo_completo_em(&raiz, spec);
+        let tokenizador = sub.join("tokenizer.json");
+
+        status(&raiz, spec);
+        let abertas_na_primeira = aberturas_de(&tokenizador);
+        for numero in 0..(TETO_DE_ENTRADAS * 4) {
+            let outra = std::env::temp_dir().join(format!(
+                "aether-catalog-teto-{numero}-{}",
+                std::process::id()
+            ));
+            status(&outra, spec);
+        }
+        assert!(
+            entradas_em_cache() <= TETO_DE_ENTRADAS,
+            "a cache passou do teto: {} entradas",
+            entradas_em_cache()
+        );
+        status(&raiz, spec);
+        assert!(
+            aberturas_de(&tokenizador) > abertas_na_primeira,
+            "a entrada mais antiga tinha de ter saído do teto"
+        );
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// A invalidação explícita dos pontos de escrita funciona nos dois tamanhos:
+    /// um modelo e uma raiz inteira.
+    #[test]
+    fn invalidar_devolve_a_leitura_de_um_modelo_e_a_raiz_devolve_todas() {
+        let raiz = raiz_de_teste("invalidar");
+        let spec = find("granite-4.2-3b-Q4_K_M").unwrap();
+        let sub = modelo_completo_em(&raiz, spec);
+        let tokenizador = sub.join("tokenizer.json");
+
+        status(&raiz, spec);
+        status(&raiz, spec);
+        assert_eq!(aberturas_de(&tokenizador), 1);
+        invalidar(&raiz, spec);
+        status(&raiz, spec);
+        assert_eq!(aberturas_de(&tokenizador), 2, "`invalidar` manda reler o apoio");
+
+        let outra = find("granite-4.2-3b-Q8_0").unwrap();
+        std::fs::write(sub.join(outra.weights_file), b"12345").unwrap();
+        status(&raiz, spec);
+        status(&raiz, outra);
+        let antes = aberturas_de(&tokenizador);
+        invalidar_raiz(&raiz);
+        status(&raiz, spec);
+        status(&raiz, outra);
+        assert_eq!(antes + 2, aberturas_de(&tokenizador), "as duas quants da raiz caem com uma chamada");
+        let _ = std::fs::remove_dir_all(&raiz);
     }
 }

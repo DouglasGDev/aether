@@ -2,12 +2,15 @@
 //!
 //! uso: engine-probe <dir-do-modelo> <arquivo.gguf> [contexto] [max_tokens] [prompt]
 
-use aether_lib::ai::{ChatMessage, ChatTemplate, Emission, Engine, Generation, SamplingParams, ToolSpec};
+use aether_lib::ai::{
+    ChatMessage, ChatTemplate, Emission, Engine, Generation, SamplingParams, StopReason, ToolSpec,
+};
 use anyhow::Context;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// As pastas onde procurar a ggml vendorizada. O executável da sonda sai na
 /// mesma pasta do `build.rs`, então o padrão já é certo; `AETHER_DLL_DIR` existe
@@ -70,6 +73,13 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(names) = prompt.strip_prefix("deq:") {
         return dump_dequantized(&dir, &weights, names);
+    }
+    if let Some(spec) = prompt.strip_prefix("cancelar:") {
+        let Some((ms, path)) = spec.split_once('|') else {
+            anyhow::bail!("cancelar: use cancelar:<milissegundos>|<arquivo-de-prompt>");
+        };
+        let ms = ms.parse::<u64>().context("cancelar: atraso ilegível")?;
+        return cancelar_prefill(&dir, &weights, context, max_tokens, path, ms);
     }
     if let Some(path) = prompt.strip_prefix("prefill:") {
         return prefill_file(&dir, &weights, context, path, max_tokens);
@@ -776,6 +786,63 @@ fn generate_file(
         "texto limpo: {:?}",
         aether_lib::ai::chat::strip_tool_calls(&generation.text, &[])
     );
+    Ok(())
+}
+
+fn cancelar_prefill(
+    dir: &PathBuf,
+    weights: &str,
+    context: usize,
+    max_tokens: usize,
+    path: &str,
+    atraso_ms: u64,
+) -> anyhow::Result<()> {
+    let mut engine = Engine::load("ggml", dir, weights, context, &dlls())?;
+    let acelerador = engine.acelerador();
+    let text = std::fs::read_to_string(path).context("falha ao ler o prompt")?;
+    let ids: Vec<u32> = engine
+        .tokenizer()
+        .encode(text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?
+        .get_ids()
+        .to_vec();
+    let params = SamplingParams { max_tokens, temperature: 0.0, ..SamplingParams::default() };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    let vigia = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(atraso_ms));
+        flag.store(true, Ordering::Relaxed);
+    });
+    println!(
+        "cancelar: {} tokens | backend={} dispositivo={:?} | atraso={}ms",
+        ids.len(), acelerador.tipo, acelerador.dispositivo, atraso_ms
+    );
+    let inicio = Instant::now();
+    let generation = engine.generate(
+        &ids,
+        &params,
+        &[concat!("<", "|im_start|>").to_string()],
+        &cancel,
+        |_| {},
+    )?;
+    let parede_ms = inicio.elapsed().as_millis();
+    vigia.join().expect("vigia de cancelamento terminou");
+    println!(
+        "cancelar: parada={:?} | parede={}ms | prompt={}tok/{}ms | decode={}tok/{}ms | cache={:?}",
+        generation.stop,
+        parede_ms,
+        generation.prompt_tokens,
+        generation.prompt_ms,
+        generation.generated_tokens,
+        generation.decode_ms,
+        engine.cache_ocupado(),
+    );
+    if generation.stop != StopReason::Cancelled {
+        anyhow::bail!("cancelar: a geração não terminou por cancelamento");
+    }
+    if engine.cache_ocupado().is_some_and(|n| n != 0) {
+        anyhow::bail!("cancelar: o prefill parcial ficou no cache");
+    }
     Ok(())
 }
 

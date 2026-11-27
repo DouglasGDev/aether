@@ -129,7 +129,7 @@ fn novo_id() -> String {
 
 /// Um id deste módulo é hex e hífen. Isto é fronteira: o valor vem da interface,
 /// e um id com separador de pasta escreveria fora da raiz das conversas.
-fn id_valido(id: &str) -> bool {
+pub(crate) fn id_valido(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 

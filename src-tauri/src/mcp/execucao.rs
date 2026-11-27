@@ -6,7 +6,9 @@
 //! o gate decide, que a aprovação espera e que a ferramenta roda. Uma segunda
 //! regra de permissão em cada porta seria duas respostas para o mesmo ato.
 
-use super::approval::{ApprovalBroker, ApprovalOutcome, ApprovalRequest, wait_for_decision};
+use super::approval::{
+    ApprovalBroker, ApprovalOutcome, ApprovalRequest, wait_for_decision_cancelavel,
+};
 use super::manager::McpEvent;
 use crate::ai::memoria::Custodio;
 use crate::bancos;
@@ -22,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 pub struct Execucao {
     gate: Arc<Mutex<PermissionGate>>,
@@ -141,6 +144,29 @@ impl Execucao {
         efeito: ToolEffect,
         argumentos: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
+        self.aprovar_cancelavel(
+            connector_id,
+            ferramenta,
+            efeito,
+            argumentos,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn aprovar_cancelavel(
+        &self,
+        connector_id: &str,
+        ferramenta: &str,
+        efeito: ToolEffect,
+        argumentos: &serde_json::Map<String, serde_json::Value>,
+        turn_id: Option<u64>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
         let compound = argumentos_contem_composto(argumentos);
         let decision = trava_estado(&self.gate).decide(connector_id, efeito, compound);
 
@@ -155,6 +181,7 @@ impl Execucao {
                     connector_id: connector_id.to_string(),
                     tool: ferramenta.to_string(),
                     arguments: serde_json::Value::Object(argumentos.clone()),
+                    turn_id,
                 };
                 let receiver = self.approvals.register(&request);
                 trava_estado(&self.gate).insert_pending(
@@ -165,23 +192,29 @@ impl Execucao {
                         effect: efeito,
                         compound,
                         created_at: Instant::now(),
+                        turn_id,
                     },
                 );
-                let _ = self
-                    .events
-                    .send(McpEvent::ApprovalRequested {
-                        request: request.clone(),
-                    });
+                let _ = self.events.send(McpEvent::ApprovalRequested {
+                    request: request.clone(),
+                });
 
                 // A chamada fica suspensa aqui, não é executada para depois
-                // voltar atrás.
-                let outcome = wait_for_decision(receiver).await;
+                // voltar atrás. O token pode vencer mesmo uma aprovação simultânea.
+                let mut outcome = wait_for_decision_cancelavel(receiver, cancel).await;
+                if cancel.is_cancelled() {
+                    outcome = ApprovalOutcome::Cancelled;
+                    self.approvals.cancel(&request.id);
+                }
 
                 trava_estado(&self.gate).resolve_pending(&request.id);
                 let _ = self.events.send(McpEvent::ApprovalSettled {
                     id: request.id.clone(),
                     approved: outcome.is_approved(),
                 });
+                if cancel.is_cancelled() {
+                    bail!(tr("erros.pedidoCancelado", &[]));
+                }
                 match outcome {
                     ApprovalOutcome::Approved => {}
                     ApprovalOutcome::Denied => bail!(tr("erros.acaoNegada", &[])),
@@ -190,6 +223,9 @@ impl Execucao {
                     }
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
         }
         Ok(())
     }
@@ -204,21 +240,46 @@ impl Execucao {
         efeito: ToolEffect,
         argumentos: serde_json::Value,
     ) -> Result<local::Saida> {
+        self.ferramenta_cancelavel(
+            connector_id,
+            ferramenta,
+            efeito,
+            argumentos,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn ferramenta_cancelavel(
+        &self,
+        connector_id: &str,
+        ferramenta: &str,
+        efeito: ToolEffect,
+        argumentos: serde_json::Value,
+        turn_id: Option<u64>,
+        cancel: &CancellationToken,
+    ) -> Result<local::Saida> {
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
         let args = match argumentos {
             serde_json::Value::Object(map) => map,
             _ => bail!(tr("erros.argumentosInvalidos", &[])),
         };
-        self.aprovar(connector_id, ferramenta, efeito, &args)
+        self.aprovar_cancelavel(connector_id, ferramenta, efeito, &args, turn_id, cancel)
             .await?;
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
 
         if bancos::ferramentas::e_ferramenta(ferramenta) {
             let caminho = Arc::clone(&self.bancos_path);
             let nome = ferramenta.to_string();
-            return tokio::task::spawn_blocking(move || {
+            return bloqueante_cancelavel(cancel, move || {
                 bancos::ferramentas::executar(&nome, serde_json::Value::Object(args), &caminho)
             })
-            .await
-            .map_err(|e| anyhow!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])))?;
+            .await;
         }
 
         // Uma cópia das pastas, nunca o lock atravessando o await: a concessão de
@@ -227,7 +288,7 @@ impl Execucao {
         let memoria = Arc::clone(&self.memoria);
         let derrame = Arc::clone(&self.derrame);
         let nome = ferramenta.to_string();
-        tokio::task::spawn_blocking(move || {
+        bloqueante_cancelavel(cancel, move || {
             local::executar(
                 &nome,
                 serde_json::Value::Object(args),
@@ -237,7 +298,50 @@ impl Execucao {
             )
         })
         .await
-        .map_err(|e| anyhow!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])))?
+    }
+}
+
+/// `spawn_blocking` não mata `std::process::Command` quando o `JoinHandle` é
+/// dropado. O token corta a espera do turno e é conferido antes de o runner
+/// começar; trabalho já iniciado pode terminar até seu próprio timeout, mas seu
+/// resultado não tem destinatário e a sessão suprime eventos posteriores ao
+/// cancelamento.
+async fn bloqueante_cancelavel<T, F>(cancel: &CancellationToken, trabalho: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    if cancel.is_cancelled() {
+        bail!(tr("erros.pedidoCancelado", &[]));
+    }
+    let cancel_tarefa = cancel.clone();
+    let tarefa = tokio::task::spawn_blocking(move || {
+        if cancel_tarefa.is_cancelled() {
+            return Err(anyhow!(tr("erros.pedidoCancelado", &[])));
+        }
+        trabalho()
+    });
+    let resultado = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!(tr("erros.pedidoCancelado", &[])),
+        resultado = tarefa => resultado,
+    };
+    concluir_bloqueante(cancel, resultado)
+}
+
+/// O `select!` pode escolher um `JoinHandle` já pronto e o token ser cancelado
+/// logo depois. Este ponto único reconfere o token antes de deixar qualquer
+/// resultado (inclusive um erro) escapar para o turno.
+fn concluir_bloqueante<T>(
+    cancel: &CancellationToken,
+    resultado: Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
+    if cancel.is_cancelled() {
+        bail!(tr("erros.pedidoCancelado", &[]));
+    }
+    match resultado {
+        Ok(feito) => feito,
+        Err(e) => bail!(tr("erros.falhaExecutar", &[("detalhe", &e.to_string())])),
     }
 }
 
@@ -285,6 +389,7 @@ pub(crate) fn argumentos_contem_composto(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     fn mapa(valor: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         match valor {
@@ -309,7 +414,15 @@ mod tests {
         modo: crate::permissions::AgentMode,
         registry: Arc<RwLock<Registry>>,
     ) -> (Arc<Execucao>, PathBuf) {
-        let (eventos, _) = broadcast::channel(4);
+        let (execucao, raiz, _) = execucao_com_eventos(modo, registry);
+        (execucao, raiz)
+    }
+
+    fn execucao_com_eventos(
+        modo: crate::permissions::AgentMode,
+        registry: Arc<RwLock<Registry>>,
+    ) -> (Arc<Execucao>, PathBuf, broadcast::Receiver<McpEvent>) {
+        let (eventos, receber) = broadcast::channel(8);
         let raiz = std::env::temp_dir().join(format!("aether-execucao-{}", std::process::id()));
         std::fs::create_dir_all(&raiz).expect("pasta de teste");
         let pastas = Arc::new(RwLock::new(Pastas {
@@ -331,7 +444,7 @@ mod tests {
             Arc::new(raiz.join("bancos.json")),
             Arc::new(raiz.join("resultados")),
         );
-        (execucao, raiz)
+        (execucao, raiz, receber)
     }
 
     #[test]
@@ -456,5 +569,207 @@ mod tests {
             !execucao.permite_local("ler_arquivo"),
             "um cadastro sem o conector embutido não autoriza nada"
         );
+    }
+
+    #[tokio::test]
+    async fn token_ja_cancelado_nao_cria_card_nem_executa() {
+        use tokio_util::sync::CancellationToken;
+
+        let (execucao, raiz, mut eventos) =
+            execucao_com_eventos(crate::permissions::AgentMode::Default, cadastro(None));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let alvo = raiz.join("cancelado-antes.txt");
+        let erro = execucao
+            .ferramenta_cancelavel(
+                local::CONECTOR,
+                "escrever_arquivo",
+                ToolEffect::Mutating,
+                json!({ "caminho": alvo.to_string_lossy(), "conteudo": "não pode existir" }),
+                Some(7),
+                &cancel,
+            )
+            .await
+            .expect_err("token cancelado recusa a chamada");
+        assert_eq!(erro.to_string(), tr("erros.pedidoCancelado", &[]));
+        assert!(!alvo.exists(), "execução não começa com token já cancelado");
+        assert!(execucao.aprovacoes().pending_ids().is_empty());
+        assert!(trava_estado(&execucao.gate()).pending().count() == 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), eventos.recv())
+                .await
+                .is_err(),
+            "chamada já cancelada não publica aprovação"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelar_a_espera_nega_o_card_e_impede_a_escrita() {
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+
+        let (execucao, raiz, mut eventos) =
+            execucao_com_eventos(crate::permissions::AgentMode::Default, cadastro(None));
+        let cancel = CancellationToken::new();
+        let alvo = raiz.join("aprovacao-cancelada.txt");
+        let args = json!({ "caminho": alvo.to_string_lossy(), "conteudo": "tardia" });
+        let tarefa = {
+            let execucao = Arc::clone(&execucao);
+            let cancel_tarefa = cancel.clone();
+            tokio::spawn(async move {
+                execucao
+                    .ferramenta_cancelavel(
+                        local::CONECTOR,
+                        "escrever_arquivo",
+                        ToolEffect::Mutating,
+                        args,
+                        Some(9),
+                        &cancel_tarefa,
+                    )
+                    .await
+            })
+        };
+        let McpEvent::ApprovalRequested { request } =
+            timeout(Duration::from_secs(1), eventos.recv())
+                .await
+                .expect("card chega")
+                .expect("canal de eventos aberto")
+        else {
+            panic!("era um pedido de aprovação");
+        };
+        assert_eq!(request.turn_id, Some(9));
+
+        cancel.cancel();
+        let resultado = timeout(Duration::from_secs(1), tarefa)
+            .await
+            .expect("espera termina com o turno")
+            .expect("tarefa do turno conclui")
+            .expect_err("cancelamento nega a chamada");
+        assert_eq!(resultado.to_string(), tr("erros.pedidoCancelado", &[]));
+        assert!(!alvo.exists(), "cancelada não escreve");
+        assert!(execucao.aprovacoes().pending_ids().is_empty());
+        assert!(!execucao.aprovacoes().resolve(&request.id, true));
+        assert!(trava_estado(&execucao.gate()).pending().count() == 0);
+    }
+
+    #[tokio::test]
+    async fn aprovacao_seguida_de_cancelamento_nao_autoriza_execucao() {
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+
+        let (execucao, raiz, mut eventos) =
+            execucao_com_eventos(crate::permissions::AgentMode::Default, cadastro(None));
+        let cancel = CancellationToken::new();
+        let alvo = raiz.join("aprovada-e-cancelada.txt");
+        let args = json!({ "caminho": alvo.to_string_lossy(), "conteudo": "tardia" });
+        let tarefa = {
+            let execucao = Arc::clone(&execucao);
+            let cancel_tarefa = cancel.clone();
+            tokio::spawn(async move {
+                execucao
+                    .ferramenta_cancelavel(
+                        local::CONECTOR,
+                        "escrever_arquivo",
+                        ToolEffect::Mutating,
+                        args,
+                        Some(10),
+                        &cancel_tarefa,
+                    )
+                    .await
+            })
+        };
+        let McpEvent::ApprovalRequested { request } =
+            timeout(Duration::from_secs(1), eventos.recv())
+                .await
+                .expect("card chega")
+                .expect("canal de eventos aberto")
+        else {
+            panic!("era um pedido de aprovação");
+        };
+
+        // Sem yield entre os dois fatos: a aprovação acorda o waiter, mas o token
+        // já está cancelado antes de ele voltar a executar.
+        assert!(execucao.aprovacoes().resolve(&request.id, true));
+        cancel.cancel();
+        let resultado = timeout(Duration::from_secs(1), tarefa)
+            .await
+            .expect("espera termina com o turno")
+            .expect("tarefa do turno conclui")
+            .expect_err("aprovação/cancelamento nega a chamada");
+        assert_eq!(resultado.to_string(), tr("erros.pedidoCancelado", &[]));
+        assert!(!alvo.exists(), "resolver não reabre uma chamada cancelada");
+    }
+
+    #[test]
+    fn resultado_bloqueante_pronto_com_cancelamento_posterior_e_descartado() {
+        use tokio_util::sync::CancellationToken;
+
+        let cancel = CancellationToken::new();
+        // O select já escolheu o ramo do resultado; o cancelamento chegou
+        // depois. A conclusão precisa vencer esse Ok tardio.
+        cancel.cancel();
+        let resultado = Ok::<_, tokio::task::JoinError>(Ok::<_, anyhow::Error>(42));
+        let erro = concluir_bloqueante(&cancel, resultado)
+            .expect_err("resultado tardio não pode voltar ao turno");
+        assert_eq!(erro.to_string(), tr("erros.pedidoCancelado", &[]));
+    }
+
+    #[tokio::test]
+    async fn cancelamento_encerra_a_espera_do_spawn_blocking_sem_matar_o_processo() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+        use tokio::sync::mpsc as tokio_mpsc;
+        use tokio::time::timeout;
+        use tokio_util::sync::CancellationToken;
+
+        let (iniciou_tx, mut iniciou_rx) = tokio_mpsc::unbounded_channel();
+        let (soltar_tx, soltar_rx) = mpsc::channel();
+        let terminou = Arc::new(AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+        let tarefa = {
+            let cancel = cancel.clone();
+            let terminou = Arc::clone(&terminou);
+            tokio::spawn(async move {
+                bloqueante_cancelavel(&cancel, move || {
+                    iniciou_tx.send(()).expect("aviso de início");
+                    soltar_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("tarefa bloqueante é solta pelo teste");
+                    terminou.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+            })
+        };
+        timeout(Duration::from_secs(1), iniciou_rx.recv())
+            .await
+            .expect("tarefa bloqueante começou")
+            .expect("aviso de início");
+
+        cancel.cancel();
+        assert!(
+            timeout(Duration::from_millis(250), tarefa)
+                .await
+                .expect("o futuro do turno não espera o processo")
+                .expect("tarefa do turno conclui")
+                .is_err()
+        );
+        assert_eq!(
+            terminou.load(Ordering::SeqCst),
+            0,
+            "o processo ainda rodava"
+        );
+
+        // A limitação é real: dropar o JoinHandle não mata std::process::Command.
+        // O resultado tardio fica sem destinatário; a sessão do turno também já
+        // suprime resultados depois do cancelamento.
+        soltar_tx.send(()).expect("solta o trabalho tardio");
+        timeout(Duration::from_secs(1), async {
+            while terminou.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("trabalho bloqueante termina depois");
     }
 }

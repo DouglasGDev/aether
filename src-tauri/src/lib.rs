@@ -67,6 +67,13 @@ pub fn run() {
             let conversas = Arc::new(conversas::Conversas::novo(
                 app.path().app_config_dir()?.join("conversas"),
             ));
+            // O registro das compactações automáticas vai para a pasta padrão do
+            // Aether (`~/.aether/compactacoes`), e não para dentro do dado do
+            // aplicativo: é o arquivo que alguém abre de fora para conferir o que
+            // o modelo leu e dobrou. A raiz é decidida aqui, uma vez — dois
+            // cálculos fariam duas pastas.
+            let compactacoes_path =
+                ai::compactacao::casa()?.join(ai::compactacao::COMPACTACOES);
             let servidores_root = app.path().app_local_data_dir()?.join("mcp-servers");
             let ligacoes_path = app.path().app_config_dir()?.join("ligacoes.json");
             // O cadastro de conexões de banco: conexões, senhas cifradas e a
@@ -130,6 +137,7 @@ pub fn run() {
                 runtime_dir,
                 runtime_job: Mutex::new(None),
                 conversas,
+                compactacoes_path,
             });
 
             let handle = app.handle().clone();
@@ -209,6 +217,7 @@ pub fn run() {
             commands::chat_history,
             commands::chat_reset,
             commands::chat_cancel,
+            commands::chat_compactar,
             commands::chat_send,
             commands::conversas_listar,
             commands::conversa_nova,

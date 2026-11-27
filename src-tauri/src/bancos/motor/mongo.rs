@@ -1,14 +1,15 @@
 //! O motor MongoDB: coleções de documentos em vez de tabelas de linhas.
 //!
 //! O que vale como "coluna" aqui é a união das chaves de uma amostra dos
-//! documentos — coleção não tem esquema declarado, e fingir que tem mentiria. O
-//! mesmo vale para tipos: cada campo carrega o tipo que a amostra viu primeiro,
-//! e um mesmo campo pode ser número num documento e texto noutro. O nome de
-//! campo é conferido por regra própria (nunca `$`, que é operador do Mongo, não
-//! identificador) — não por SQL, porque aqui não há SQL: os filtros viram
-//! consultas BSON pela API do driver, sem interpolar texto em nenhum ponto. O
-//! agendador é do processo, como nos demais motores de rede — ver
-//! `super::agendador`.
+//! documentos — coleção não tem esquema declarado, e fingir que tem mentiria. A
+//! amostra é pista, não schema fechado: campos fora dela e caminhos aninhados
+//! podem existir. O mesmo vale para tipos: cada campo carrega o tipo que a
+//! amostra viu primeiro, e um mesmo campo pode ser número num documento e texto
+//! noutro. O nome de campo é conferido por regra própria (nunca `$`, que é
+//! operador do Mongo, não identificador) — não por SQL, porque aqui não há SQL:
+//! os filtros viram consultas BSON pela API do driver, sem interpolar texto em
+//! nenhum ponto. O agendador é do processo, como nos demais motores de rede —
+//! ver `super::agendador`.
 
 use anyhow::{Result, anyhow, bail};
 use mongodb::{
@@ -21,7 +22,7 @@ use std::time::Duration;
 
 use super::{
     Comparacao, Consulta, Cronometro, Filtro, Motor, PRAZO_DE_LEITURA, ResultadoSql,
-    aparar_no_teto, erro_de_prazo, prazo_de_espera, teto_de_leitura,
+    aparar_no_teto, erro_de_prazo, ordem_de, prazo_de_espera, teto_de_leitura,
 };
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
@@ -41,9 +42,57 @@ pub struct Mongo {
 fn conferir_campo(nome: &str) -> Result<&str> {
     let nome = nome.trim();
     if nome.is_empty() || nome.starts_with('$') {
-        bail!(tr("erros.bancoColunaInexistente", &[("coluna", nome)]));
+        bail!(tr("erros.bancoCampoInvalido", &[("coluna", nome)]));
     }
     Ok(nome)
+}
+
+/// Um caminho de campos, não uma expressão: segmentos não vazios, sem `$`
+/// inicial, espaço ou pontuação de comando. O driver recebe a chave por API;
+/// esta régua impede que texto de ordem/SQL ou um operador vire nome de campo.
+fn conferir_caminho(nome: &str) -> Result<&str> {
+    let nome = nome.trim();
+    let comando = nome.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, ';' | ',' | '(' | ')' | '\'' | '"' | '`' | '\\')
+    });
+    if nome.is_empty()
+        || comando
+        || nome.split('.').any(|parte| parte.is_empty() || parte.starts_with('$'))
+    {
+        bail!(tr("erros.bancoCampoInvalido", &[("coluna", nome)]));
+    }
+    Ok(nome)
+}
+
+/// A amostra só ajuda a preservar a caixa dos prefixos que viu. Um caminho
+/// válido fora dela não é recusado: pode existir depois dos 100 documentos.
+/// Operadores, segmentos vazios e texto de comando continuam barrados.
+fn conferir_campo_conhecido(nome: &str, conhecidas: &[(String, String)]) -> Result<String> {
+    let nome = conferir_caminho(nome)
+        .map_err(|_| super::erro_coluna_invalida(nome.trim(), conhecidas))?;
+    let mut partes: Vec<String> = nome.split('.').map(str::to_string).collect();
+    for tamanho in (1..=partes.len()).rev() {
+        let prefixo = partes[..tamanho].join(".");
+        if let Some((conhecido, _)) = conhecidas.iter().find(|(conhecido, _)| conhecido == &prefixo)
+        {
+            for (parte, real) in partes.iter_mut().zip(conhecido.split('.')) {
+                *parte = real.to_string();
+            }
+            break;
+        }
+    }
+    Ok(partes.join("."))
+}
+
+fn ordenar_bson(coluna: &str, desc: bool, conhecidas: &[(String, String)]) -> Result<DocBson> {
+    let mut ordenar = DocBson::new();
+    ordenar.insert(
+        conferir_campo_conhecido(coluna, conhecidas)?,
+        Bson::Int32(if desc { -1 } else { 1 }),
+    );
+    Ok(ordenar)
 }
 
 fn conferir_colecao<'a>(nome: &str, conhecidas: &'a [String]) -> Result<&'a str> {
@@ -145,7 +194,7 @@ fn json_para_bson(valor: &Value) -> Result<Bson> {
             let mut documento = DocBson::new();
             for (chave, valor) in objeto {
                 if chave.starts_with('$') {
-                    bail!(tr("erros.bancoColunaInexistente", &[("coluna", chave)]));
+                    bail!(tr("erros.bancoCampoInvalido", &[("coluna", chave)]));
                 }
                 documento.insert(chave.clone(), json_para_bson(valor)?);
             }
@@ -329,8 +378,9 @@ impl Mongo {
         conferir_colecao(&pedida, &nomes).map(str::to_string)
     }
 
-    /// A união das chaves de uma amostra, na ordem em que apareceram: é o
-    /// esquema que a coleção de fato tem, não o que alguém declarou.
+    /// A união das chaves de uma amostra, na ordem em que apareceram: é uma
+    /// pista do que a coleção tem, não um schema fechado nem uma garantia de
+    /// campos que só apareçam fora dos 100 documentos.
     async fn amostrar(&self, colecao: &str) -> Result<Vec<(String, String)>> {
         let cursor = self
             .cliente
@@ -390,9 +440,21 @@ impl Motor for Mongo {
         let cronometro = Cronometro::agora();
         let colecao = self.colecao_conferida(fonte)?;
         let consulta = filtro_bson(filtro)?;
+        // Sem colunas pedidas a amostra define a projeção. Com ordem, ela é
+        // apenas pista para preservar a caixa dos nomes que viu; não fecha o
+        // conjunto de campos que a coleção pode ter.
+        let amostra = if colunas_pedidas.is_empty() || ordem.is_some() {
+            Some(esperar(self.runtime, self.amostrar(&colecao))?)
+        } else {
+            None
+        };
         let pedidas: Vec<String> = if colunas_pedidas.is_empty() {
-            let amostra = esperar(self.runtime, self.amostrar(&colecao))?;
-            amostra.into_iter().map(|(nome, _)| nome).collect()
+            amostra
+                .as_ref()
+                .expect("colunas implícitas exigem a amostra")
+                .iter()
+                .map(|(nome, _)| nome.clone())
+                .collect()
         } else {
             colunas_pedidas
                 .iter()
@@ -412,10 +474,12 @@ impl Motor for Mongo {
             .find(consulta)
             .limit(teto_de_leitura(limite) as i64)
             .max_time(PRAZO_DE_LEITURA);
-        if let Some((coluna, desc)) = ordem {
-            let mut ordenar = DocBson::new();
-            ordenar.insert(conferir_campo(coluna)?, Bson::Int32(if desc { -1 } else { 1 }));
-            achado = achado.sort(ordenar);
+        if let Some((texto, desc)) = ordem {
+            let (coluna, desc) = ordem_de(texto, desc, None)?;
+            let conhecidas = amostra
+                .as_ref()
+                .expect("ordem pedida exige a amostra como pista");
+            achado = achado.sort(ordenar_bson(&coluna, desc, conhecidas)?);
         }
         if !pedidas.is_empty() {
             let mut projecao = DocBson::new();
@@ -546,6 +610,82 @@ mod tests {
     use crate::bancos::config::{conexao_de_teste, Tipo};
     use crate::bancos::motor::filtro_de;
     use serde_json::json;
+
+    /// O sort recebe do parser uma coluna e um booleano. O BSON sai com uma
+    /// única chave; a amostra preserva a caixa conhecida sem excluir campos que
+    /// só apareçam fora dela. Texto de ordem ou injeção não vira sort.
+    #[test]
+    fn o_sort_do_mongo_usa_uma_coluna_real_e_a_direcao_normalizada() {
+        let schema = vec![
+            ("_id".to_string(), "objectId".to_string()),
+            ("qt_venda".to_string(), "int".to_string()),
+        ];
+        let (coluna, desc) = super::super::ordem_de("qt_venda DESC", false, None).unwrap();
+        let sort = ordenar_bson(&coluna, desc, &schema).unwrap();
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort.get_i32("qt_venda").unwrap(), -1);
+
+        let (coluna, desc) = super::super::ordem_de("qt_venda ASC", true, None).unwrap();
+        let sort = ordenar_bson(&coluna, desc, &schema).unwrap();
+        assert_eq!(sort.get_i32("qt_venda").unwrap(), 1);
+        assert_eq!(
+            ordenar_bson("qt_venda", true, &schema)
+                .unwrap()
+                .get_i32("qt_venda")
+                .unwrap(),
+            -1
+        );
+
+        for entrada in [
+            "$where",
+            "qt_venda, id",
+            "qt_venda; DROP TABLE vendas",
+        ] {
+            let erro = ordenar_bson(entrada, false, &schema)
+                .unwrap_err()
+                .to_string();
+            for trecho in [entrada, "qt_venda", "ordem", "ordemDesc", "bancos_colunas"] {
+                assert!(erro.contains(trecho), "{entrada}: {erro}");
+            }
+        }
+    }
+
+    /// A amostra é pista: caminhos aninhados e campos que só aparecem depois do
+    /// centésimo documento passam; nomes que poderiam virar operador ou comando
+    /// continuam sendo recusados em qualquer segmento.
+    #[test]
+    fn o_sort_aceita_aninhamento_e_fora_da_amostra_sem_aceitar_operadores() {
+        let schema = vec![
+            ("_id".to_string(), "objectId".to_string()),
+            ("Perfil".to_string(), "object".to_string()),
+            ("qt_venda".to_string(), "int".to_string()),
+        ];
+        for caminho in ["Perfil.cidade", "Perfil.endereco.cidade", "criado_em"] {
+            let sort = ordenar_bson(caminho, true, &schema).unwrap();
+            assert_eq!(sort.len(), 1);
+            assert_eq!(sort.get_i32(caminho).unwrap(), -1, "{caminho}");
+        }
+        // O prefixo conhecido conserva a caixa real da coleção.
+        let sort = ordenar_bson("Perfil.endereco.cidade", false, &schema).unwrap();
+        assert_eq!(sort.get_i32("Perfil.endereco.cidade").unwrap(), 1);
+
+        for entrada in [
+            "",
+            ".Perfil",
+            "Perfil.",
+            "Perfil..cidade",
+            "$where",
+            "Perfil.$where",
+            "Perfil cidade",
+            "Perfil;DROP",
+            "Perfil,cidade",
+        ] {
+            assert!(
+                ordenar_bson(entrada, false, &schema).is_err(),
+                "{entrada} não poderia virar sort"
+            );
+        }
+    }
 
     /// O prazo espera de verdade, e cobre a leitura inteira: no Mongo o
     /// `maxTimeMS` mata a consulta no servidor, mas o cursor é despejado ida a

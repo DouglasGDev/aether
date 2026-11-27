@@ -5,6 +5,7 @@
 //! motivo exibido cita exatamente esses sinais.
 
 use super::catalog::{self, ModelSpec, Tier};
+use super::alojamento::gibs;
 use crate::idiomas::tr;
 use serde::Serialize;
 
@@ -72,28 +73,17 @@ pub fn hardware_agora(dlls: &[std::path::PathBuf]) -> anyhow::Result<Hardware> {
 }
 
 /// RAM medida no sistema operacional, não estimada. O motivo exibido ao usuário
-/// cita este número, então ele tem de vir de uma medição real.
-#[cfg(windows)]
+/// cita este número, então ele tem de vir de uma medição real — e é a *mesma*
+/// leitura que o [`super::alojamento`] usa para dizer se uma carga cabe na
+/// máquina: duas chamadas ao sistema operacional podem discordar, e uma escolha
+/// explicada por um número que a conta dela não usou é o erro que ninguém vê.
 pub fn measure_hardware() -> anyhow::Result<Hardware> {
-    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let mut status = MEMORYSTATUSEX {
-        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: `status` é um MEMORYSTATUSEX válido com dwLength preenchido, e a
-    // função só escreve nele.
-    unsafe { GlobalMemoryStatusEx(&mut status) }
-        .map_err(|e| anyhow::anyhow!(tr("erros.medirRam", &[("detalhe", &e.to_string())])))?;
+    let memoria = super::alojamento::medir_memoria_do_sistema()?;
     Ok(Hardware {
-        total_ram_bytes: status.ullTotalPhys,
-        available_ram_bytes: status.ullAvailPhys,
+        total_ram_bytes: memoria.total,
+        available_ram_bytes: memoria.livre,
         placa: None,
     })
-}
-
-#[cfg(not(windows))]
-pub fn measure_hardware() -> anyhow::Result<Hardware> {
-    anyhow::bail!("{}", tr("erros.ramNaoImplementada", &[]))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,10 +244,6 @@ fn situacao(c: &Candidato, hardware: &Hardware, pedida: usize) -> String {
             ],
         ),
     }
-}
-
-fn gibs(bytes: u64) -> String {
-    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 pub fn choose(

@@ -151,7 +151,8 @@
   "compactacao": {
     "instrucao": "Você comprime o começo de uma conversa de assistente. Responda apenas com o resumo, em português: o que a pessoa pediu, o que já foi feito, os caminhos, nomes e valores citados e o que ainda está pendente. No máximo oito frases, sem introdução e sem falar do resumo.",
     "anterior": "Resumo das mensagens já comprimidas antes destas: {texto}",
-    "pedido": "Resuma tudo o que vem antes desta mensagem."
+    "pedido": "Resuma tudo o que vem antes desta mensagem.",
+    "atalho": "Compactar a conversa"
   },
   "aprovacao": {
     "titulo": "Precisa da sua aprovação",
@@ -304,6 +305,8 @@
     "contexto": "Janela de contexto",
     "janelaInteira": "inteira na placa até {n}",
     "janelaInteiraUsar": "levar para a janela inteira na placa",
+    "janelaInteiraSistema": "inteira na RAM até {n}",
+    "janelaInteiraUsarSistema": "levar para a janela inteira na RAM",
     "janela": "Janela",
     "pensamento": "Mostrar o raciocínio",
     "pensamentoCusto": "O raciocínio ocupa tokens antes da primeira palavra.",
@@ -593,11 +596,11 @@
     },
     "bancosColunas": {
       "titulo": "Ver colunas da tabela",
-      "descricao": "Mostra as colunas de uma tabela exposta com o tipo de cada uma, para montar filtros e inserções corretos."
+      "descricao": "Mostra as colunas reais de uma tabela exposta com o tipo de cada uma, informa o tipo/dialeto da conexão e orienta a ordenação. Em fonte desconhecida, chame esta ferramenta antes de montar filtros ou ordem."
     },
     "bancosConsultar": {
       "titulo": "Consultar tabela",
-      "descricao": "Lê linhas de uma tabela exposta, com colunas escolhidas, filtro opcional, ordenação e limite. O limite pedido nunca passa do teto que o dono cadastrou."
+      "descricao": "Lê linhas de uma tabela exposta, com colunas escolhidas, filtro opcional, ordenação e limite. A ordem aceita uma única coluna real, com ordemDesc ou o sufixo legado ASC/DESC, sem SQL bruto. O limite pedido nunca passa do teto que o dono cadastrou."
     },
     "bancosContar": {
       "titulo": "Contar linhas",
@@ -676,13 +679,13 @@
     "fonte": "Tabela",
     "fonteDescricao": "Nome da tabela exposta nessa conexão. Chame bancos_tabelas para ver o que está exposto.",
     "colunas": "Colunas",
-    "colunasDescricao": "Colunas a devolver, na ordem pedida. Omita para trazer todas.",
+    "colunasDescricao": "Colunas reais a devolver, na ordem pedida. Omita para trazer todas. Para fonte desconhecida, chame bancos_colunas antes de escolher colunas, montar filtro ou definir ordem.",
     "filtro": "Filtro",
-    "filtroDescricao": "Condições que as linhas precisam cumprir. Exemplo: {\"coluna\": \"valor\"}. Com comparação: {\"coluna\": {\"op\": \"maior\", \"valor\": 10}}. Operações: igual, diferente, maior, maiorigual, menor, menorigual, contendo. Um filtro vazio casa com todas as linhas.",
+    "filtroDescricao": "Condições que as linhas precisam cumprir. Exemplo: {\"coluna\": \"valor\"}. Com comparação: {\"coluna\": {\"op\": \"maior\", \"valor\": 10}}. Operações: igual, diferente, maior, maiorigual, menor, menorigual, contendo. Um filtro vazio casa com todas as linhas. Use somente nomes reais descobertos com bancos_colunas; os valores continuam parametrizados.",
     "ordem": "Ordenar por",
-    "ordemDescricao": "Coluna para ordenar o resultado.",
+    "ordemDescricao": "Nome de uma única coluna real para ordenar. Forma preferida: ordem: \"qt_venda\" com ordemDesc: true (decrescente) ou false (crescente). Por compatibilidade, aceita-se ordem: \"qt_venda DESC\" ou \"qt_venda ASC\"; o sufixo explícito prevalece sobre ordemDesc. Não use ORDER BY, expressões, vírgulas ou múltiplas colunas. Descubra os nomes com bancos_colunas.",
     "ordemDesc": "Ordem decrescente",
-    "ordemDescDescricao": "Ordena do maior para o menor quando verdadeiro.",
+    "ordemDescDescricao": "Direção usada quando ordem não traz sufixo: true dá DESC (decrescente) e false dá ASC (crescente). Um sufixo ASC/DESC explícito em ordem prevalece.",
     "limite": "Limite",
     "limiteDescricao": "Quantas linhas trazer. O teto cadastrado pelo dono sempre vence.",
     "valores": "Valores",
@@ -931,7 +934,10 @@
     "modeloForaDoCatalogo": "o roteador escolheu {modelo}, que não está no catálogo",
     "pedidoCancelado": "pedido cancelado",
     "janelaSemLugar": "a janela é de {janela} tokens: as ferramentas e a identidade já ocupam {fixo} e este pedido precisa de {pedido} mesmo com a conversa resumida; desconecte um servidor ou aumente a janela nas Escalas",
+    "janelaCurtaSistema": "a janela pedida é de {pedida} tokens e a carga inteira custaria {custo} GiB contra {livre} GiB de RAM livre; ela desceu para {janela} tokens, que é onde cabe sem trocar com disco. Uma quant menor, ou menos programas abertos, devolve a janela maior",
     "nadaParaResumir": "não havia o que resumir: o trecho a comprimir está vazio",
+    "nadaParaCompactar": "não há o que compactar: a conversa ainda não tem um turno inteiro depois do último resumo",
+    "nenhumModeloEmMemoria": "nenhum modelo está em memória; carregue um antes de compactar",
     "resumoVazio": "o modelo devolveu um resumo vazio; aumente a janela ou envie de novo",
     "lacoDeFerramentas": "o modelo pediu ferramentas {n} vezes sem concluir; parei para não entrar em laço",
     "pensamentoTruncado": "o modelo parou no meio do raciocínio, sem chegar a uma resposta; aumente o limite de tokens ou reduza o pedido",
@@ -1147,6 +1153,7 @@
     "runtimeHashDiverge": "{nome} não é o binário conferido: esperado {esperado}, medido {medido}",
     "falhaSerializar": "não serializei {caminho}: {detalhe}",
     "conversaIdInvalido": "id de conversa inválido: {id}",
+    "semPastaAether": "não encontrei a pasta inicial do Aether: defina HOME, USERPROFILE ou AETHER_CASA",
     "conversaDesconhecida": "não conheço a conversa {id}",
     "conversaTituloVazio": "o título da conversa está vazio",
     "runtimeFalhaMover": "não movi {origem} para {destino}: {detalhe}",
@@ -1215,7 +1222,9 @@
     "bancoConexaoInexistente": "não existe a conexão {nome} no cadastro. Chame bancos_listar para ver os nomes.",
     "bancoOperacaoNegada": "o dono não autorizou {op} na tabela {fonte} da conexão {conexao}",
     "bancoSqlBloqueado": "a conexão {conexao} não tem SQL livre ligado",
-    "bancoColunaInexistente": "a tabela não tem a coluna {coluna}",
+    "bancoOrdemInvalida": "ordem inválida: informe uma única coluna real, por exemplo ordem: \"qt_venda\" com ordemDesc: true, ou a compatibilidade ordem: \"qt_venda DESC\"/\"qt_venda ASC\". Não use ORDER BY, expressões, vírgulas ou múltiplas colunas; descubra os nomes com bancos_colunas.",
+    "bancoColunaInexistente": "a fonte não tem a coluna {coluna}. Colunas válidas: {colunas}. Use um desses nomes em colunas, filtro e ordem. Para ordenar, prefira ordem: \"nome\" com ordemDesc: true/false; a compatibilidade ordem: \"nome DESC\"/\"nome ASC\" aceita uma única coluna. Chame bancos_colunas para conferir o schema.",
+    "bancoCampoInvalido": "o campo {coluna} não é um identificador válido neste banco. Chame bancos_colunas para descobrir os nomes reais.",
     "bancoFonteInexistente": "a tabela {fonte} não está exposta nesta conexão"
   },
   "servidorMcp": {
@@ -1235,6 +1244,9 @@
     "nenhumaConexao": "O dono ainda não cadastrou nenhuma conexão de banco de dados.",
     "nenhumaFonte": "A conexão {conexao} não tem nenhuma tabela exposta.",
     "contagem": "{total} linha(s) em {fonte} casam com o filtro.",
+    "orientacaoColunas": "Tipo/dialeto: {tipo}. Use os nomes e tipos descobertos acima. Antes de montar filtros ou ordem para uma fonte desconhecida, chame bancos_colunas e confirme as colunas reais. Em bancos_consultar, prefira ordem: \"qt_venda\" com ordemDesc: true para DESC ou false para ASC. Por compatibilidade, ordem: \"qt_venda DESC\" ou \"qt_venda ASC\" também funciona; o sufixo explícito prevalece. Passe apenas uma coluna, sem ORDER BY, expressões ou lista.",
+    "colunasAmostraMongo": "No MongoDB, essa lista é a união dos campos vistos numa amostra de até 100 documentos; não é um schema declarado nem garante campos que só apareçam fora da amostra.",
+    "semColunas": "nenhuma",
     "linhasInseridas": "{total} linha(s) inserida(s) em {fonte}.",
     "linhasAtualizadas": "{total} linha(s) atualizada(s) em {fonte}.",
     "linhasApagadas": "{total} linha(s) apagada(s) em {fonte}.",

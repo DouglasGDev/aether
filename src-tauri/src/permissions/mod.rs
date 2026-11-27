@@ -99,6 +99,9 @@ pub struct PendingApproval {
     pub effect: ToolEffect,
     pub compound: bool,
     pub created_at: Instant,
+    /// `None` é chamada manual/externa. O gate usa isto só para remover o pending
+    /// do turno cancelado; grants de sessão não pertencem a um turno.
+    pub turn_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -145,12 +148,7 @@ impl PermissionGate {
         grants
     }
 
-    pub fn decide(
-        &self,
-        connector_id: &str,
-        effect: ToolEffect,
-        compound: bool,
-    ) -> Decision {
+    pub fn decide(&self, connector_id: &str, effect: ToolEffect, compound: bool) -> Decision {
         evaluate(
             self.mode,
             effect,
@@ -169,6 +167,21 @@ impl PermissionGate {
 
     pub fn resolve_pending(&mut self, id: &str) -> Option<PendingApproval> {
         self.pending.remove(id)
+    }
+
+    /// Apaga somente os cards do turno. Diferente de `flush_connector`, não
+    /// revoga a confiança da sessão nem toca em chamadas manuais/outros turnos.
+    pub fn cancel_turn(&mut self, turn_id: u64) -> Vec<String> {
+        let stale: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, approval)| approval.turn_id == Some(turn_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            self.pending.remove(id);
+        }
+        stale
     }
 
     /// Um conector que para não pode deixar aprovações apontando para um
@@ -217,13 +230,44 @@ mod tests {
     use super::*;
 
     fn approval(connector_id: &str) -> PendingApproval {
+        approval_turn(connector_id, None)
+    }
+
+    fn approval_turn(connector_id: &str, turn_id: Option<u64>) -> PendingApproval {
         PendingApproval {
             connector_id: connector_id.to_string(),
             tool: "run".into(),
             effect: ToolEffect::Mutating,
             compound: false,
             created_at: Instant::now(),
+            turn_id,
         }
+    }
+
+    #[test]
+    fn cancelar_turno_remove_so_os_pendings_dele_e_preserva_o_grant() {
+        let mut gate = PermissionGate::new(AgentMode::Default);
+        gate.grant_session("browser");
+        gate.insert_pending("a".into(), approval_turn("browser", Some(7)));
+        gate.insert_pending("b".into(), approval_turn("device", Some(7)));
+        gate.insert_pending("c".into(), approval_turn("browser", Some(8)));
+        gate.insert_pending("d".into(), approval_turn("browser", None));
+
+        let mut cancelados = gate.cancel_turn(7);
+        cancelados.sort();
+        assert_eq!(cancelados, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(gate.pending().count(), 2);
+        assert!(
+            gate.cancel_turn(7).is_empty(),
+            "segundo cancelamento é vazio"
+        );
+        assert_eq!(
+            gate.decide("browser", ToolEffect::Mutating, false),
+            Decision::Allow,
+            "cancelar um turno não revoga a confiança da sessão"
+        );
+        assert!(gate.resolve_pending("c").is_some());
+        assert!(gate.resolve_pending("d").is_some());
     }
 
     #[test]
@@ -291,14 +335,20 @@ mod tests {
         }
         // O plano recusa (não executa nada que não leia); os outros quatro
         // perguntam — e perguntar é a decisão explícita que o efeito exige.
-        assert_eq!(evaluate(AgentMode::Plan, ToolEffect::Rede, false, false), Decision::Deny);
+        assert_eq!(
+            evaluate(AgentMode::Plan, ToolEffect::Rede, false, false),
+            Decision::Deny
+        );
         for mode in [
             AgentMode::Default,
             AgentMode::AutoAccept,
             AgentMode::Auto,
             AgentMode::FullAccess,
         ] {
-            assert_eq!(evaluate(mode, ToolEffect::Rede, false, false), Decision::Ask);
+            assert_eq!(
+                evaluate(mode, ToolEffect::Rede, false, false),
+                Decision::Ask
+            );
         }
     }
 
@@ -318,7 +368,10 @@ mod tests {
             );
             // A mesma confiança continua valendo para o que é daqui — sem isto o
             // teste não provaria que foi a rede que mudou a resposta.
-            assert_eq!(gate.decide("computador", ToolEffect::Mutating, false), Decision::Allow);
+            assert_eq!(
+                gate.decide("computador", ToolEffect::Mutating, false),
+                Decision::Allow
+            );
         }
     }
 

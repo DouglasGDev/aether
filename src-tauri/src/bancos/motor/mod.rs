@@ -166,6 +166,65 @@ impl Comparacao {
     }
 }
 
+/// Separa a direção legada (`"coluna DESC"` / `"coluna ASC"`) sem interpretar
+/// SQL. Quando o schema já está na mão, o nome inteiro é conferido primeiro:
+/// `status DESC` pode ser uma coluna literal, não um sufixo. Só sem essa
+/// correspondência o sufixo é separado. `ordem_desc` vale quando não há sufixo
+/// — ou quando o nome inteiro é uma coluna real.
+pub fn ordem_de(
+    texto: &str,
+    ordem_desc: bool,
+    schema: Option<&[(String, String)]>,
+) -> Result<(String, bool)> {
+    let texto = texto.trim();
+    if texto.is_empty() {
+        bail!(crate::idiomas::tr("erros.bancoOrdemInvalida", &[]));
+    }
+    if let Some(schema) = schema {
+        // Caixa exata primeiro: bancos com identificadores entre aspas podem
+        // distinguir nomes que só diferem nela. A busca insensível é o fallback
+        // que os motores SQL já usam na conferência de colunas.
+        let conhecida = schema
+            .iter()
+            .find(|(nome, _)| nome == texto)
+            .or_else(|| schema.iter().find(|(nome, _)| nome.eq_ignore_ascii_case(texto)));
+        if let Some((nome, _)) = conhecida {
+            return Ok((nome.clone(), ordem_desc));
+        }
+    }
+    if let Some((coluna, direcao)) = texto.rsplit_once(char::is_whitespace) {
+        let coluna = coluna.trim_end();
+        if !coluna.is_empty() {
+            if direcao.eq_ignore_ascii_case("DESC") {
+                return Ok((coluna.to_string(), true));
+            }
+            if direcao.eq_ignore_ascii_case("ASC") {
+                return Ok((coluna.to_string(), false));
+            }
+        }
+    }
+    Ok((texto.to_string(), ordem_desc))
+}
+
+/// A recusa de identificador carrega o schema que o motor acabou de descobrir.
+/// Assim o modelo troca um palpite por um nome real e monta a ordem no formato
+/// correto, sem transformar a mensagem em SQL livre.
+pub fn erro_coluna_invalida(coluna: &str, colunas: &[(String, String)]) -> anyhow::Error {
+    let lista = if colunas.is_empty() {
+        crate::idiomas::tr("bancos.semColunas", &[])
+    } else {
+        colunas
+            .iter()
+            .map(|(nome, _)| nome.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    anyhow!(crate::idiomas::tr(
+        "erros.bancoColunaInexistente",
+        &[("coluna", coluna), ("colunas", &lista)]
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Condicao {
     pub coluna: String,
@@ -189,7 +248,15 @@ pub fn filtro_de(json: Option<&Value>) -> Result<Filtro> {
     let mut filtro = Vec::new();
     for (coluna, condicao) in mapa {
         let (comparacao, valor) = match condicao {
-            Value::Object(objeto) if objeto.len() == 1 => {
+            Value::Object(objeto) if objeto.contains_key("op") => {
+                // O envelope tem exatamente `op`, ou `op` + `valor`. Chave
+                // sobrando não é comparação: seria o aplicativo escolher um
+                // significado para um JSON que o modelo inventou.
+                let sem_valor = objeto.len() == 1;
+                let com_valor = objeto.len() == 2 && objeto.contains_key("valor");
+                if !sem_valor && !com_valor {
+                    bail!(crate::idiomas::tr("erros.filtroInvalido", &[]));
+                }
                 let Some(Value::String(rotulo)) = objeto.get("op") else {
                     bail!(crate::idiomas::tr("erros.filtroInvalido", &[]));
                 };
@@ -199,7 +266,21 @@ pub fn filtro_de(json: Option<&Value>) -> Result<Filtro> {
                         &[("op", rotulo)]
                     ))
                 })?;
-                (comparacao, objeto.get("valor").cloned().unwrap_or(Value::Null))
+                let valor = if com_valor {
+                    objeto.get("valor").cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                (comparacao, valor)
+            }
+            // Sem `op` há duas leituras possíveis, e elas divergem por uma chave:
+            // `{"a":1}` é um subdocumento comparado por igualdade, enquanto o
+            // `{"valor":10}` sozinho é o envelope que perdeu o operador — virar
+            // igualdade contra um objeto seria responder outra pergunta.
+            Value::Object(objeto)
+                if objeto.len() == 1 && objeto.contains_key("valor") =>
+            {
+                bail!(crate::idiomas::tr("erros.filtroInvalido", &[]));
             }
             outro => (Comparacao::Igual, outro.clone()),
         };
@@ -242,6 +323,8 @@ pub trait Motor: Send {
     /// Colunas e o tipo que o banco declara, na ordem delas.
     fn colunas(&mut self, fonte: &str) -> Result<Vec<(String, String)>>;
 
+    /// `ordem` leva o texto cru e a direção separada. O motor resolve o sufixo
+    /// só depois de carregar o schema, sem outra viagem ao banco.
     fn consultar(
         &mut self,
         fonte: &str,
@@ -302,6 +385,135 @@ pub mod sqlite;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// A compatibilidade tira só a direção final: o nome continua sendo um
+    /// identificador para o motor conferir no schema, nunca uma cláusula SQL.
+    #[test]
+    fn a_ordem_legada_se_separa_em_coluna_e_direcao() {
+        for (entrada, desc, coluna, direcao) in [
+            ("qt_venda", true, "qt_venda", true),
+            ("qt_venda", false, "qt_venda", false),
+            ("qt_venda DESC", false, "qt_venda", true),
+            ("qt_venda ASC", true, "qt_venda", false),
+            (" qt_venda \t dEsC ", true, "qt_venda", true),
+            ("QT_VENDA asc", false, "QT_VENDA", false),
+        ] {
+            assert_eq!(
+                ordem_de(entrada, desc, None).unwrap(),
+                (coluna.to_string(), direcao)
+            );
+        }
+    }
+
+    /// O parser não tenta adivinhar expressões ou várias colunas: deixa o texto
+    /// intacto para a validação real do motor recusar com as colunas conhecidas.
+    #[test]
+    fn o_parser_nao_transforma_sql_em_identificador() {
+        for (entrada, coluna) in [
+            ("ORDER BY qt_venda", "ORDER BY qt_venda"),
+            ("qt_venda, id", "qt_venda, id"),
+            ("qt_venda + 1", "qt_venda + 1"),
+            ("qt_venda DESC, id ASC", "qt_venda DESC, id"),
+            ("qt_venda; DROP TABLE vendas", "qt_venda; DROP TABLE vendas"),
+            (
+                "qt_venda DESC; DROP TABLE vendas",
+                "qt_venda DESC; DROP TABLE vendas",
+            ),
+        ] {
+            assert_eq!(ordem_de(entrada, false, None).unwrap().0, coluna);
+        }
+        assert!(ordem_de("   ", false, None).is_err());
+    }
+
+    /// O schema vem antes da compatibilidade: quando as duas colunas existem,
+    /// `status DESC` é o nome literal e `ordemDesc` escolhe sua direção.
+    #[test]
+    fn a_coluna_literal_com_sufixo_so_e_desmontada_sem_schema_correspondente() {
+        let schema = vec![
+            ("status".to_string(), "text".to_string()),
+            ("status DESC".to_string(), "text".to_string()),
+        ];
+        for (entrada, desc, coluna, direcao) in [
+            ("status DESC", false, "status DESC", false),
+            ("status DESC", true, "status DESC", true),
+            ("STATUS DESC", false, "status DESC", false),
+            ("status ASC", true, "status", false),
+            ("status", true, "status", true),
+        ] {
+            assert_eq!(
+                ordem_de(entrada, desc, Some(&schema)).unwrap(),
+                (coluna.to_string(), direcao),
+                "{entrada} com ordemDesc={desc}"
+            );
+        }
+        assert_eq!(
+            ordem_de("status DESC", false, None).unwrap(),
+            ("status".to_string(), true),
+            "sem schema, a compatibilidade continua separando o sufixo"
+        );
+    }
+
+    /// O envelope documentado carrega operador e valor; objetos comuns continuam
+    /// sendo igualdade, e envelope malformado não degenera em subdocumento.
+    #[test]
+    fn o_filtro_aceita_op_e_valor_sem_afrouxar_a_validacao() {
+        let filtro = filtro_de(Some(&json!({
+            "saldo": { "op": "maior", "valor": 10 },
+            "nome": { "op": "contendo", "valor": "a" },
+            "documento": { "a": 1 },
+            "metadados": { "valor": 1, "x": 2 },
+        })))
+        .unwrap();
+        assert_eq!(filtro.len(), 4);
+        assert_eq!(filtro[0].coluna, "saldo");
+        assert_eq!(filtro[0].comparacao, Comparacao::Maior);
+        assert_eq!(filtro[0].valor, json!(10));
+        assert_eq!(filtro[1].comparacao, Comparacao::Contendo);
+        assert_eq!(filtro[1].valor, json!("a"));
+        assert_eq!(filtro[2].comparacao, Comparacao::Igual);
+        assert_eq!(filtro[2].valor, json!({ "a": 1 }));
+        assert_eq!(filtro[3].comparacao, Comparacao::Igual);
+        assert_eq!(filtro[3].valor, json!({ "valor": 1, "x": 2 }));
+
+        for invalido in [
+            json!([]),
+            json!({ "saldo": { "valor": 10 } }),
+            json!({ "saldo": { "op": 1, "valor": 10 } }),
+            json!({ "saldo": { "op": "maior", "valor": 10, "extra": 1 } }),
+            json!({ "saldo": { "op": "maior", "outro": 10 } }),
+        ] {
+            assert!(filtro_de(Some(&invalido)).is_err(), "{invalido}");
+        }
+        let erro = filtro_de(Some(&json!({ "saldo": { "op": "desconhecida", "valor": 10 } })))
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("desconhecida"), "{erro}");
+
+        // Compatibilidade anterior: operador sem valor continuava sendo nulo.
+        let antigo = filtro_de(Some(&json!({ "saldo": { "op": "igual" } }))).unwrap();
+        assert_eq!(antigo[0].comparacao, Comparacao::Igual);
+        assert_eq!(antigo[0].valor, Value::Null);
+    }
+
+    #[test]
+    fn o_erro_de_coluna_lista_o_schema_e_explica_a_ordem() {
+        let schema = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("qt_venda".to_string(), "integer".to_string()),
+        ];
+        let erro = erro_coluna_invalida("qt_venda DESC", &schema).to_string();
+        for trecho in [
+            "qt_venda DESC",
+            "id",
+            "qt_venda",
+            "ordem",
+            "ordemDesc",
+            "bancos_colunas",
+        ] {
+            assert!(erro.contains(trecho), "{erro}");
+        }
+    }
 
     /// O teto é `limite + 1` e não `limite`: a linha extra é a única prova de
     /// que a leitura parou no teto em vez de parar no fim do banco.

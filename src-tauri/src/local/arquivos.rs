@@ -4,13 +4,16 @@
 use super::pastas::Pastas;
 use super::vista::{self, Achado, Entrada, Troca, Vista};
 use super::{Saida, booleano, inteiro, obrigatorio, texto};
+use crate::ai::catalog;
 use crate::idiomas::tr;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 /// Teto do que uma leitura devolve. Acima dele o modelo precisa pedir um trecho:
@@ -301,15 +304,10 @@ pub fn buscar(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
         // que apareceu nesse meio tempo é canonicalizado pelo resolver e, se
         // aponta para fora da concessão, recusado antes de qualquer leitura.
         let Ok(arquivo) = pastas.resolver(&arquivo.to_string_lossy()) else { continue };
-        let Ok(meta) = fs::metadata(&arquivo) else { continue };
-        if meta.len() > LIMITE_LEITURA {
-            continue;
-        }
-        let Ok(conteudo) = fs::read(&arquivo) else { continue };
-        if conteudo.contains(&0) {
-            continue;
-        }
-        let Ok(texto) = String::from_utf8(conteudo) else { continue };
+        // O texto vem do cache assinado: uma busca sobre a mesma árvore com
+        // outro termo volta a varrer os mesmos arquivos, e o que custava era a
+        // leitura de cada um — não a comparação de linhas.
+        let Some(texto) = texto_para_busca(&arquivo) else { continue };
         for (indice, linha) in texto.lines().enumerate() {
             if !linha.to_lowercase().contains(&needle) {
                 continue;
@@ -348,6 +346,170 @@ pub fn buscar(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
             truncado,
         },
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Cache de texto assinado pelo disco
+// ---------------------------------------------------------------------------
+
+/// O texto de um arquivo para a busca, com a assinatura do momento em que foi
+/// lido, e o custo que ele ocupa em RAM.
+struct TextoGuardado {
+    assinatura: catalog::Assinatura,
+    /// `None` é "este arquivo não é texto": byte nulo no meio ou UTF-8
+    /// inválido. É veredito de conteúdo, não falha de leitura, e por isso vale
+    /// guardar — a próxima busca não precisa reler 200 KB para descobrir de
+    /// novo que um `.png` não é texto.
+    texto: Option<String>,
+    carimbo: u64,
+}
+
+/// Arquivos residentes na busca.
+///
+/// O teto é de bytes, não de arquivos, porque é o que a máquina cobra: uma
+/// entrada é no máximo `LIMITE_LEITURA` (256 KiB), então 8 MiB guardam de
+/// verdade entre 32 arquivos grandes e centenas dos normais — o tamanho de uma
+/// árvore de código que se revolve mais de uma vez numa conversa. Oito
+/// megabytes é menos de um por cento do que um modelo de 3B pede em RAM;
+/// passar disso é a busca começando a competir com a carga.
+/// `TETO_DE_ARQUIVOS` (512) é o segundo cinto: muitos arquivos pequenos
+/// também ocupam tabela, e a tabela tem de caber no número documentado.
+/// Sai o menos recente; o preço de errar é reler um arquivo, não mentir.
+const TETO_TOTAL_DE_BYTES: usize = 8 * 1024 * 1024;
+const TETO_DE_ARQUIVOS: usize = 512;
+
+static TEXTOS: OnceLock<Mutex<HashMap<PathBuf, TextoGuardado>>> = OnceLock::new();
+static TEXTO_CARIMBO: AtomicU64 = AtomicU64::new(0);
+
+fn textos() -> &'static Mutex<HashMap<PathBuf, TextoGuardado>> {
+    TEXTOS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// O texto de um arquivo, pelo cache assinado.
+///
+/// `None` tem o mesmo significado que tinha no laço antigo: este arquivo não
+/// entra na busca (não existe, não pode ser lido, é maior que o teto, não é
+/// texto). O que não entra no cache é a falha de leitura — no Windows um
+/// arquivo aberto por outro processo sem compartilhamento devolve erro agora e
+/// devolve conteúdo depois, e gravar "não tem texto" nesse caso faria a busca
+/// seguinte continuar cega para sempre.
+///
+/// A assinatura é a mesma do catálogo (tamanho + datas): trocado o arquivo, a
+/// entrada cai sozinha. `descartar_texto` é o cinto nos pontos de escrita.
+fn texto_para_busca(caminho: &Path) -> Option<String> {
+    let assinatura = catalog::Assinatura::de_arquivo(caminho);
+    if assinatura == catalog::Assinatura::Ausente {
+        descartar_texto(caminho);
+        return None;
+    }
+    let bytes = assinatura.bytes();
+    if bytes > LIMITE_LEITURA {
+        descartar_texto(caminho);
+        return None;
+    }
+    {
+        let mut cache = crate::state::trava_estado(textos());
+        if let Some(entrada) = cache.get_mut(caminho) {
+            if entrada.assinatura == assinatura {
+                entrada.carimbo = TEXTO_CARIMBO.fetch_add(1, Ordering::Relaxed);
+                return entrada.texto.clone();
+            }
+            cache.remove(caminho);
+        }
+    }
+    registrar_leitura(caminho);
+    let conteudo = match fs::read(caminho) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let texto = if conteudo.contains(&0) {
+        None
+    } else {
+        String::from_utf8(conteudo).ok()
+    };
+    {
+        let mut cache = crate::state::trava_estado(textos());
+        cache.insert(
+            caminho.to_path_buf(),
+            TextoGuardado { assinatura, texto: texto.clone(), carimbo: TEXTO_CARIMBO.fetch_add(1, Ordering::Relaxed) },
+        );
+        while cache.len() > TETO_DE_ARQUIVOS
+            || cache
+                .values()
+                .map(|e| e.texto.as_ref().map(|t| t.len()).unwrap_or(0))
+                .sum::<usize>()
+                > TETO_TOTAL_DE_BYTES
+        {
+            let mais_velha =
+                cache.iter().min_by_key(|(_, e)| e.carimbo).map(|(k, _)| k.clone());
+            match mais_velha {
+                Some(chave) => {
+                    cache.remove(&chave);
+                }
+                None => break,
+            }
+        }
+    }
+    texto
+}
+
+/// Esquece o texto de um arquivo. Chamada em toda escrita desta módulo: o
+/// renomear apaga a origem e publica o destino, o apagar tira o alvo e a
+/// árvore inteira dele.
+fn descartar_texto(caminho: &Path) {
+    crate::state::trava_estado(textos()).remove(caminho);
+}
+
+/// Esquece tudo que mora sob uma pasta: é o que um `mover` ou um `apagar` de
+/// árvore muda de uma vez, sem percorrer o cache arquivo por arquivo.
+fn descartar_textos_sob(pasta: &Path) {
+    let mut cache = crate::state::trava_estado(textos());
+    cache.retain(|caminho, _| !caminho.starts_with(pasta));
+}
+
+/// Contador de leituras de disco por caminho, só em teste: prova que a segunda
+/// busca não voltou ao arquivo. Global não serviria — os testes rodam em
+/// threads do mesmo processo.
+#[cfg(test)]
+mod medidor {
+    use crate::state::trava_estado;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static LEITURAS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+
+    fn registro() -> &'static Mutex<HashMap<PathBuf, u64>> {
+        LEITURAS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn marcar(caminho: &Path) {
+        *trava_estado(registro()).entry(caminho.to_path_buf()).or_insert(0) += 1;
+    }
+
+    pub fn lidas(caminho: &Path) -> u64 {
+        trava_estado(registro()).get(caminho).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn registrar_leitura(caminho: &Path) {
+    medidor::marcar(caminho);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn registrar_leitura(_caminho: &Path) {}
+
+#[cfg(test)]
+pub fn leituras_de(caminho: &Path) -> u64 {
+    medidor::lidas(caminho)
+}
+
+#[cfg(test)]
+pub fn textos_em_cache() -> usize {
+    crate::state::trava_estado(textos()).len()
 }
 
 /// Uma escrita pode cair ao lado de outra: o chat e um cliente MCP loopback
@@ -395,7 +557,13 @@ fn escrever_atomico(alvo: &Path, conteudo: &str) -> Result<()> {
             "erros.falhaEscrever",
             &[("caminho", &alvo.display().to_string()), ("detalhe", &e.to_string())]
         ))
-    })
+    })?;
+    // O rename publicou um conteúdo novo neste caminho — é aqui, e não em quem
+    // chama, que a busca tem de esquecer o texto velho. Um `editar` que troca
+    // uma palavra por outra de mesmo tamanho deixa o arquivo do mesmo tamanho, e
+    // no Windows a data pode cair no mesmo tique: a assinatura sozinha não jura.
+    descartar_texto(alvo);
+    Ok(())
 }
 
 pub fn escrever(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
@@ -543,6 +711,11 @@ pub fn mover(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
             &[("caminho", &origem.display().to_string()), ("detalhe", &e.to_string())]
         ))
     })?;
+    // O caminho de origem passou a não existir e o de destino passou a existir
+    // com o conteúdo dela: os dois lados são descartados por prefixo porque um
+    // `mover` de pasta leva a árvore inteira de arquivos.
+    descartar_textos_sob(&origem);
+    descartar_textos_sob(&destino);
     Ok(Saida::nova(
         format!("{} → {}", origem.display(), destino.display()),
         Vista::Movido {
@@ -574,6 +747,9 @@ pub fn apagar(args: &Map<String, Value>, pastas: &Pastas) -> Result<Saida> {
             &[("caminho", &alvo.display().to_string()), ("detalhe", &e.to_string())]
         ))
     })?;
+    // Apagada a árvore, o texto que ela continha tem de sair do cache junto:
+    // sem isto a busca seguinte ainda acharia linha de arquivo que não existe.
+    descartar_textos_sob(&alvo);
     Ok(Saida::nova(
         format!("{}: {}", tr("cartao.apagado", &[]), alvo.display()),
         Vista::Apagado {

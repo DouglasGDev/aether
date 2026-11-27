@@ -1,11 +1,12 @@
 use crate::ai::adaptadores;
 use crate::ai::base::{self, Nota};
 use crate::ai::catalog::{self, ModelSpec, ModelStatus};
+use crate::ai::compactacao;
 use crate::ai::download;
 use crate::ai::geracao;
 use crate::ai::memoria::{self, Custodio, Resposta};
 use crate::ai::router::{self, Choice, Request};
-use crate::ai::session::{self, SessionEvent, TurnConfig, TurnOutcome};
+use crate::ai::session::{self, SessionEventKind, TurnConfig, TurnOutcome};
 use crate::ai::{Alvo, ChatMessage, ToolCall, ToolSpec};
 use crate::connectors::Connector;
 use crate::conversas;
@@ -31,6 +32,28 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 fn report(error: anyhow::Error) -> String {
     format!("{error:#}")
+}
+
+struct RegistroTurnoMcp {
+    manager: Arc<McpManager>,
+    turn_id: u64,
+}
+
+impl RegistroTurnoMcp {
+    fn novo(
+        manager: Arc<McpManager>,
+        turn_id: u64,
+        token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        manager.register_turn(turn_id, token);
+        Self { manager, turn_id }
+    }
+}
+
+impl Drop for RegistroTurnoMcp {
+    fn drop(&mut self) {
+        self.manager.finish_turn(self.turn_id);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -654,6 +677,15 @@ pub async fn model_download(
             }
         };
         let outcome = download::fetch(spec, &root, &cancel, emit.clone()).await;
+        // O disco mudou: o cartão da biblioteca (bytes do peso e do `.part`,
+        // arquivos de apoio) e a ficha do roteador são os dois caches que medem
+        // este modelo. Cada um é assinado e cairia sozinho na próxima leitura,
+        // mas este é o ponto em que a verdade muda — e invalidação tem de estar
+        // visível onde a escrita acontece, não depender de quem lembra. O
+        // cabeçalho GGUF não tem cache próprio: ver a razão medida na doc de
+        // `cabecalho::ler`.
+        catalog::invalidar(&root, spec);
+        done.descartar_ficha(spec);
         done.end_download(&job_id);
         match outcome {
             Ok(()) => {}
@@ -694,6 +726,11 @@ pub async fn model_delete(state: State<'_, AppState>, id: String) -> Result<(), 
         // sai do disco, e o llama.cpp mapeia. Solta a memória antes de apagar.
         custodio.soltar(&id)?;
         download::remove_weights(&ai.models_root, spec)?;
+        // O peso saiu do disco e os dois caches que o medem não podem continuar
+        // dizendo que ele está lá: mesmo motivo e mesmo lugar de
+        // `model_download`.
+        catalog::invalidar(&ai.models_root, spec);
+        ai.descartar_ficha(spec);
         // O peso saiu do disco: um pino apontando para ele faria o próximo turno
         // falhar por escolha de um modelo que não existe mais.
         if ai.ajustes().modelo == spec.id {
@@ -764,21 +801,36 @@ pub fn chat_history(state: State<'_, AppState>) -> Vec<ChatMessage> {
 }
 
 #[tauri::command]
-pub fn chat_reset(state: State<'_, AppState>) -> Result<(), String> {
-    state.ai.request_cancel();
-    session::trava_historico(&state.ai.history).clear();
-    *session::trava_resumo(&state.ai.resumo) = None;
-    // O arquivo tem de dizer o mesmo que o buffer vivo: uma conversa limpa na
-    // tela e cheia no disco voltaria cheia no próximo arranque.
-    if let Some(id) = state.conversas.estado().ativa {
-        state.conversas.gravar(&id, &[], None).map_err(report)?;
+pub async fn chat_reset(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(turno) = state.ai.active_turn() {
+        state.ai.request_cancel(turno.id);
+        state.manager.cancel_turn(turno.id);
+        // O comando é async justamente para esperar sem prender a thread da janela.
+        // Só depois de o turno soltar o motor é seguro apagar o que ele ainda usava.
+        state.ai.wait_stopped(turno.id).await;
     }
-    Ok(())
+    state
+        .ai
+        .troca_exclusiva(|| {
+            state.ai.esquecer()?;
+            session::trava_historico(&state.ai.history).clear();
+            *session::trava_resumo(&state.ai.resumo) = None;
+            // O arquivo tem de dizer o mesmo que o buffer vivo: uma conversa limpa na
+            // tela e cheia no disco voltaria cheia no próximo arranque.
+            if let Some(id) = state.conversas.estado().ativa {
+                state.conversas.gravar(&id, &[], None)?;
+            }
+            Ok(())
+        })
+        .map_err(report)
 }
 
 #[tauri::command]
 pub fn chat_cancel(state: State<'_, AppState>) {
-    state.ai.request_cancel();
+    if let Some(turno) = state.ai.active_turn() {
+        state.ai.request_cancel(turno.id);
+        state.manager.cancel_turn(turno.id);
+    }
 }
 
 // ─── Conversas salvas ─────────────────────────────────────────────────────────
@@ -860,6 +912,7 @@ pub fn conversa_apagar(state: State<'_, AppState>, id: String) -> Result<convers
             state.conversas.apagar(&id)?;
             if era_ativa {
                 session::trava_historico(&state.ai.history).clear();
+                *session::trava_resumo(&state.ai.resumo) = None;
             }
             Ok(state.conversas.estado())
         })
@@ -902,39 +955,51 @@ pub async fn chat_send(
     let pastas = Arc::clone(&state.pastas);
     let conversas = Arc::clone(&state.conversas);
     let derrame = state.derrame_path.clone();
-    if !ai.begin() {
+    let compactacoes = state.compactacoes_path.clone();
+    let Some(reserva) = ai.reservar_dono() else {
         return Err(tr("erros.turnoEmAndamento", &[]));
-    }
+    };
+    let turn_id = reserva.id();
+    let cancel = reserva.cancel();
+    let token = reserva.token();
     // A conversa tem de existir antes do turno: é nela que este histórico fica,
     // e um pedido sem conversa seria um pedido perdido ao fechar a janela.
-    let id = match conversas.garantir() {
-        Ok(id) => id,
-        Err(erro) => {
-            ai.end();
-            return Err(report(erro));
-        }
-    };
-    let done = Arc::clone(&ai);
+    let id = conversas.garantir().map_err(report)?;
+    // A identidade do turno é publicada antes de qualquer trabalho. Um `started`
+    // emitido lá dentro do corpo bloqueante chega depois de a tela ter vinculado
+    // outro turno — e os deltas deste iriam para a bolha errada.
+    let _ = app.emit(
+        "chat-event",
+        &session::SessionEvent::new(turn_id, &id, SessionEventKind::Started),
+    );
     let voz = Arc::clone(&state.voz);
     let app_fala = app.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
+        let registro = RegistroTurnoMcp::novo(Arc::clone(&manager), turn_id, token.clone());
         let resultado = run_chat_turn(
-            &app, &ai, &manager, &memoria, &pastas, &conversas, &derrame, &id, &text,
+            &app, &ai, &manager, &memoria, &pastas, &conversas, &derrame, &compactacoes, &id,
+            &text, turn_id, &cancel, &token,
         );
         // Grava mesmo quando o turno falhou: o que o modelo já disse e as
         // ferramentas que já rodaram aconteceram, e a conversa é o registro
-        // disso. O lock do histórico é tomado e largado antes do das conversas.
-        let mensagens = session::trava_historico(&ai.history).clone();
-        let resumo = session::trava_resumo(&ai.resumo).clone();
-        match (resultado, conversas.gravar(&id, &mensagens, resumo.as_ref())) {
-            (Ok(desfecho), Ok(_)) => Ok(desfecho),
-            // A causa do turno vem primeiro: ela é o que a pessoa precisa ver.
-            (Err(erro), _) => Err(erro),
-            (Ok(_), Err(erro)) => Err(report(erro)),
-        }
+        // disso. Só este turno pode publicar no buffer que ele reservou.
+        let resultado = if ai.active_turn().map(|t| t.id) == Some(turn_id) {
+            let mensagens = session::trava_historico(&ai.history).clone();
+            let resumo = session::trava_resumo(&ai.resumo).clone();
+            match (resultado, conversas.gravar(&id, &mensagens, resumo.as_ref())) {
+                (Ok(desfecho), Ok(_)) => Ok(desfecho),
+                // A causa do turno vem primeiro: ela é o que a pessoa precisa ver.
+                (Err(erro), _) => Err(erro),
+                (Ok(_), Err(erro)) => Err(report(erro)),
+            }
+        } else {
+            resultado
+        };
+        drop(registro);
+        drop(reserva);
+        resultado
     })
     .await;
-    done.end();
     let resultado =
         joined.map_err(|e| tr("erros.turnoNaoTerminou", &[("detalhe", &e.to_string())]))?;
 
@@ -966,10 +1031,22 @@ fn run_chat_turn(
     // nela e a ferramenta `ler_resultado` lê dela: as duas pontas têm de ser a
     // mesma pasta, senão o id que o modelo recebe não leva a lugar nenhum.
     derrame: &std::path::Path,
+    // `<casa>/.aether/compactacoes`: onde cada dobra automática deixa o registro
+    // dela. É parâmetro e não cálculo aqui dentro porque a raiz é uma decisão da
+    // abertura, e uma dobra escrita em outro lugar seria um segundo arquivo que
+    // ninguém procura.
+    compactacoes: &std::path::Path,
     conversa: &str,
     text: &str,
+    turn_id: u64,
+    cancel: &Arc<AtomicBool>,
+    token: &tokio_util::sync::CancellationToken,
 ) -> Result<TurnOutcome, String> {
-    let emit = |event: SessionEvent| {
+    let emit = |kind: session::SessionEventKind| {
+        if cancel.load(Ordering::SeqCst) || token.is_cancelled() {
+            return;
+        }
+        let event = session::SessionEvent::new(turn_id, conversa, kind);
         let _ = app.emit("chat-event", &event);
     };
 
@@ -1036,7 +1113,7 @@ fn run_chat_turn(
         // lembrança que ele realmente não tem. A ferramenta, quando o modelo
         // chama, responde por ela também — aí a pergunta é sobre o que a janela
         // já perdeu.
-        let ignorar = [conversa.to_string()];
+        let ignorar = vec![conversa.to_string()];
         // O bloco do turno, e não a busca crua: é aqui que a nota presa entra, na
         // frente e sem precisar ser achada, dividindo com o resto o mesmo teto de
         // `trechos`. Chamar `buscar` diretamente deixaria o marcador do dono como
@@ -1047,7 +1124,7 @@ fn run_chat_turn(
         } else {
             let Resposta { achados, alcancados, modo } = resposta;
             let texto = Custodio::texto_do_bloco(&achados);
-            emit(SessionEvent::Memoria {
+            emit(SessionEventKind::Memoria {
                 ferramenta: sinapse,
                 consulta: text.to_string(),
                 modo,
@@ -1073,7 +1150,7 @@ fn run_chat_turn(
             .iter()
             .min_by_key(|m| m.weights_bytes)
             .expect("available não é vazio");
-        emit(SessionEvent::Loading { model: starter.display.to_string() });
+        emit(SessionEventKind::Loading { model: starter.display.to_string() });
         let mut guard = ai.acquire(starter).map_err(report)?;
         let prompt_tokens = guard
             .as_mut()
@@ -1094,7 +1171,7 @@ fn run_chat_turn(
         let candidatos = ai.candidatos(&available);
         let escolha = router::choose(&request, hardware, &candidatos)
             .ok_or_else(|| tr("erros.semModeloParaPedido", &[]))?;
-        emit(SessionEvent::Choice { choice: escolha.clone() });
+        emit(SessionEventKind::Choice { choice: escolha.clone() });
         let spec = catalog::find(&escolha.model_id).ok_or_else(|| {
             tr("erros.modeloForaDoCatalogo", &[("modelo", &escolha.model_id)])
         })?;
@@ -1108,7 +1185,7 @@ fn run_chat_turn(
         (spec, None)
     };
 
-    emit(SessionEvent::Loading { model: spec.display.to_string() });
+    emit(SessionEventKind::Loading { model: spec.display.to_string() });
     // O guard abaixo é segurado até o fim desta função — geração, rodadas de
     // ferramenta e a espera do gate incluídas — e é ele que serializa um turno por
     // vez sobre o KV cache do modelo em memória. Não é descuido: dois turnos no
@@ -1133,7 +1210,7 @@ fn run_chat_turn(
             janela: ajustes.contexto as usize,
         };
         let (complexidade, signals) = router::classify(&pedido);
-        emit(SessionEvent::Choice {
+        emit(SessionEventKind::Choice {
             choice: Choice {
                 model_id: spec.id.to_string(),
                 display: spec.display.to_string(),
@@ -1169,22 +1246,60 @@ fn run_chat_turn(
 
     let runtime = tokio::runtime::Handle::current();
     let run_tool = |call: &ToolCall| -> anyhow::Result<session::ToolOutcome> {
-        let result = runtime.block_on(manager.call_tool(&call.name, call.arguments.clone()))?;
+        let result = runtime.block_on(manager.call_tool_cancellable(
+            &call.name,
+            call.arguments.clone(),
+            token.clone(),
+        ))?;
         let text = result_text(&result);
         if result.is_error.unwrap_or(false) {
             anyhow::bail!("{text}");
         }
         Ok(session::ToolOutcome { text, vista: result.structured_content.clone() })
     };
+    let janela = loaded.engine.context();
+    let modelo = loaded.spec.id.to_string();
+    let mut persistir_resumo =
+        |novo: &crate::ai::compactacao::Resumo, feito: &session::FeitoDeDobra| -> anyhow::Result<()>
+            {
+                if ai.active_turn().map(|t| t.id) != Some(turn_id) {
+                    anyhow::bail!(tr("erros.pedidoCancelado", &[]));
+                }
+                *session::trava_resumo(&ai.resumo) = Some(novo.clone());
+                let mensagens = session::trava_historico(&ai.history).clone();
+                conversas.gravar(conversa, &mensagens, Some(novo))?;
+                // A cópia da conversa é o que o prompt lê; esta é o que a pessoa
+                // lê depois. Uma dobra só chega aqui depois de gravada na
+                // conversa, senão o registro contaria uma memória que o motor
+                // ainda não tem.
+                let dobra = crate::ai::compactacao::Dobra {
+                    conversa: conversa.to_string(),
+                    ordem: crate::ai::compactacao::Dobra::ordem_anterior(
+                        compactacoes, conversa,
+                    ) + 1,
+                    modelo: modelo.clone(),
+                    janela,
+                    texto: novo.texto.clone(),
+                    ate: novo.ate,
+                    lidas: feito.lidas,
+                    descartadas: feito.descartadas,
+                    tokens: feito.tokens,
+                    quando: crate::ai::compactacao::agora(),
+                };
+                dobra.gravar(compactacoes)?;
+                Ok(())
+            };
 
     let turno = session::run_turn(
         &mut loaded.engine,
         &loaded.template,
         &ai.history,
         &config,
-        &ai.cancel,
+        turn_id,
+        cancel,
         emit,
         run_tool,
+        &mut persistir_resumo,
     );
     if let Ok(desfecho) = &turno {
         // O resumo que o turno escreveu é do buffer vivo, como o histórico: sem
@@ -1204,6 +1319,148 @@ fn run_chat_turn(
         }
     }
     turno.map_err(report)
+}
+
+/// O que a dobra pedida devolve: os números que o modelo produziu, e a
+/// identidade do turno que a tela já atrelou pelo `started`. O texto volta aqui e
+/// no evento de propósito: o evento pinta a bolha em curso, e este é o que a
+/// promessa usa para assentar a mesma bolha quando o turno acaba.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Compactacao {
+    pub turn_id: u64,
+    pub conversa: String,
+    pub texto: String,
+    pub lidas: usize,
+    pub descartadas: usize,
+    pub tokens: usize,
+    pub ordem: usize,
+}
+
+/// Dobra a conversa agora, sem esperar a janela apertar. Não é um segundo
+/// mecanismo: é o mesmo `compactacao::dobrar`, o mesmo evento `resumo`, a mesma
+/// gravação na conversa e o mesmo registro em `<casa>/.aether/compactacoes` que o
+/// turno usa. O que muda é só o gatilho — e o quanto se dobra, que aqui é o
+/// máximo que o resumo consegue carregar em vez do mínimo que faz caber.
+#[tauri::command]
+pub async fn chat_compactar(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Compactacao, String> {
+    let ai = Arc::clone(&state.ai);
+    let conversas = Arc::clone(&state.conversas);
+    let compactacoes = state.compactacoes_path.clone();
+    // A dobra é um turno: ela segura o motor e escreve no histórico. Começá-la
+    // durante uma geração leria um histórico mudando sob o resumo.
+    let Some(reserva) = ai.reservar_dono() else {
+        return Err(tr("erros.turnoEmAndamento", &[]));
+    };
+    let turn_id = reserva.id();
+    let cancel = reserva.cancel();
+    let id = conversas.garantir().map_err(report)?;
+    // Pela mesma razão de `chat_send`: o `started` é o que vincula a bolha ao
+    // turno, e precisa existir antes de o corpo bloqueante começar.
+    let _ = app.emit(
+        "chat-event",
+        &session::SessionEvent::new(turn_id, &id, SessionEventKind::Started),
+    );
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let resultado =
+            run_dobra(&app, &ai, &conversas, &compactacoes, &id, turn_id, &cancel);
+        drop(reserva);
+        resultado
+    })
+    .await;
+    joined.map_err(|e| tr("erros.turnoNaoTerminou", &[("detalhe", &e.to_string())]))?
+}
+
+fn run_dobra(
+    app: &AppHandle,
+    ai: &Arc<AiRuntime>,
+    conversas: &Arc<conversas::Conversas>,
+    compactacoes: &Path,
+    conversa: &str,
+    turn_id: u64,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Compactacao, String> {
+    let emit = |kind: session::SessionEventKind| {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        let event = session::SessionEvent::new(turn_id, conversa, kind);
+        let _ = app.emit("chat-event", &event);
+    };
+    // O modelo que está em memória é o que resume. Escolher outro aqui trocaria os
+    // pesos e o KV da conversa, e a pessoa pediu que comprimisse o que ela vê, não
+    // que ligasse outra máquina.
+    let id = ai.loaded_id().ok_or_else(|| tr("erros.nenhumModeloEmMemoria", &[]))?;
+    let spec =
+        catalog::find(&id).ok_or_else(|| tr("erros.modeloNaoCatalogado", &[("id", &id)]))?;
+    let mut guard = ai.acquire(spec).map_err(report)?;
+    let loaded = guard.as_mut().expect("acquire acabou de carregar");
+    // A conversa inteira fora do lock: medir e escrever o resumo são geração, e
+    // segurar o histórico enquanto a placa trabalha prende a tela que o lê.
+    let history = session::trava_historico(&ai.history).clone();
+    let resumo = session::trava_resumo(&ai.resumo).clone();
+    let Some((desde, ate)) =
+        session::dobras_pedidas(&loaded.engine, &loaded.template, &history, resumo.as_ref())
+            .map_err(report)?
+    else {
+        return Err(tr("erros.nadaParaCompactar", &[]));
+    };
+    let params = ai.ajustes().amostragem();
+    let (texto, gasto, lidas) = compactacao::dobrar(
+        &mut loaded.engine,
+        &loaded.template,
+        &params,
+        resumo.as_ref().map(|r| r.texto.as_str()),
+        &history[desde..ate],
+        cancel,
+    )
+    .map_err(report)?;
+    let feito = session::FeitoDeDobra {
+        lidas,
+        descartadas: (ate - desde).saturating_sub(lidas),
+        tokens: gasto.generated_tokens,
+    };
+    let novo = compactacao::Resumo { texto, ate: desde + lidas };
+    emit(SessionEventKind::Resumo {
+        texto: novo.texto.clone(),
+        mensagens: feito.lidas,
+        descartadas: feito.descartadas,
+        tokens: feito.tokens,
+    });
+    // O Parar já soltou o turno e outro pode ter começado: nada de escrever o
+    // resumo de um pedido desistido no buffer vivo de quem chegou depois.
+    if ai.active_turn().map(|t| t.id) != Some(turn_id) {
+        return Err(tr("erros.pedidoCancelado", &[]));
+    }
+    *session::trava_resumo(&ai.resumo) = Some(novo.clone());
+    let mensagens = session::trava_historico(&ai.history).clone();
+    conversas.gravar(conversa, &mensagens, Some(&novo)).map_err(report)?;
+    let ordem = compactacao::Dobra::ordem_anterior(compactacoes, conversa) + 1;
+    let dobra = compactacao::Dobra {
+        conversa: conversa.to_string(),
+        ordem,
+        modelo: spec.id.to_string(),
+        janela: loaded.engine.context(),
+        texto: novo.texto.clone(),
+        ate: novo.ate,
+        lidas: feito.lidas,
+        descartadas: feito.descartadas,
+        tokens: feito.tokens,
+        quando: compactacao::agora(),
+    };
+    dobra.gravar(compactacoes).map_err(report)?;
+    Ok(Compactacao {
+        turn_id,
+        conversa: conversa.to_string(),
+        texto: novo.texto,
+        lidas: feito.lidas,
+        descartadas: feito.descartadas,
+        tokens: feito.tokens,
+        ordem,
+    })
 }
 
 // ─── Grafo de ligações ────────────────────────────────────────────────────────
@@ -1877,12 +2134,11 @@ fn bancada_spec(ai: &AiRuntime) -> Option<&'static ModelSpec> {
 #[tauri::command]
 pub async fn bancada_rodar(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let ai = Arc::clone(&state.ai);
-    if !ai.begin() {
+    let Some(reserva) = ai.reservar_dono() else {
         return Err(tr("erros.turnoEmAndamento", &[]));
-    }
+    };
     let spec = bancada_spec(&ai);
-    let cancel = Arc::clone(&ai.cancel);
-    let feito = Arc::clone(&ai);
+    let cancel = reserva.cancel();
     let gerente = Arc::clone(&state.manager);
     let resultado = tauri::async_runtime::spawn_blocking(move || {
         let emit = {
@@ -1891,23 +2147,25 @@ pub async fn bancada_rodar(app: AppHandle, state: State<'_, AppState>) -> Result
                 let _ = app.emit("bancada-evento", &evento);
             }
         };
-        crate::bancada::rodar(&ai, &gerente, spec, &cancel, emit)
+        let resultado = crate::bancada::rodar(&ai, &gerente, spec, &cancel, emit);
+        drop(reserva);
+        resultado
     })
     .await;
-    feito.end();
     resultado
         .map_err(|e| tr("erros.turnoNaoTerminou", &[("detalhe", &e.to_string())]))?;
     Ok(())
 }
 
 /// A bancada toma o motor como um turno toma, então é o mesmo cancelador que a
-/// para: `ai.cancel`. Não há segundo interruptor a divergir do primeiro.
+/// para. Não há segundo interruptor a divergir do primeiro.
 #[tauri::command]
 pub fn bancada_cancelar(state: State<'_, AppState>) -> Result<(), String> {
-    if !state.ai.is_busy() {
+    let Some(turno) = state.ai.active_turn() else {
         return Err(tr("erros.nadaEmCurso", &[]));
-    }
-    state.ai.request_cancel();
+    };
+    state.ai.request_cancel(turno.id);
+    state.manager.cancel_turn(turno.id);
     Ok(())
 }
 

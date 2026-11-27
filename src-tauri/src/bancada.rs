@@ -236,7 +236,12 @@ fn caso_placa(engine: &Engine, capacidade: Option<&Capacidade>, inicio: Instant)
         ),
     ];
     if let Some(alojado) = &acelerador.alojado {
-        medidas.push(medida("bancada.medida.cedido", fracionario(alojado.cedido as f64 / 1_048_576.0, 1)));
+        // O cedido é a VRAM que sumiu entre antes e depois da carga. Onde a
+        // carga não pousou em placa não há este lado, e escrevê-lo como 0 MB
+        // seria a bancada medindo o que a máquina não tem.
+        if let Some(cedido) = alojado.cedido {
+            medidas.push(medida("bancada.medida.cedido", fracionario(cedido as f64 / 1_048_576.0, 1)));
+        }
         medidas.push(medida(
             "bancada.medida.previsao",
             match &alojado.previsto {
@@ -887,7 +892,7 @@ fn caso_dobrar(
                     break Err(t("bancada.dobrar.parou"));
                 }
                 let anterior = resumo.as_ref().map(|r| r.texto.as_str());
-                let (texto, gasto, _) = match compactacao::dobrar(
+                let (texto, gasto, lidas) = match compactacao::dobrar(
                     engine,
                     template,
                     &params,
@@ -905,7 +910,7 @@ fn caso_dobrar(
                 };
                 dobras += 1;
                 tokens_do_resumo += gasto.generated_tokens;
-                resumo = Some(Resumo { texto, ate });
+                resumo = Some(Resumo { texto, ate: desde + lidas });
             }
         }
     };

@@ -14,8 +14,8 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::types::Type;
 
 use super::{
-    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto, erro_de_prazo,
-    prazo_de_espera, prazo_em_ms, teto_de_leitura,
+    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto,
+    erro_coluna_invalida, erro_de_prazo, ordem_de, prazo_de_espera, prazo_em_ms, teto_de_leitura,
 };
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
@@ -111,7 +111,7 @@ fn conferir_coluna(coluna: &str, conhecidas: &[(String, String)]) -> Result<(Str
         .iter()
         .find(|(nome, _)| nome.eq_ignore_ascii_case(coluna))
         .cloned()
-        .ok_or_else(|| anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", coluna)])))
+        .ok_or_else(|| erro_coluna_invalida(coluna, conhecidas))
 }
 
 /// A ida única ao catálogo de uma fonte: a tabela conferida e as colunas dela,
@@ -406,8 +406,9 @@ impl Motor for Postgres {
         let onde = onde_sql(filtro, &esquema, &mut params, &mut numero)?;
         let ordenar = match ordem {
             None => String::new(),
-            Some((coluna, desc)) => {
-                let (nome, _) = conferir_coluna(coluna, &esquema)?;
+            Some((texto, desc)) => {
+                let (coluna, desc) = ordem_de(texto, desc, Some(&esquema))?;
+                let (nome, _) = conferir_coluna(&coluna, &esquema)?;
                 format!(
                     " ORDER BY {} {}",
                     citado(&nome),
@@ -657,6 +658,35 @@ mod tests {
             Some("-c statement_timeout=15000"),
             "defeito 4: a ficha abre sem prazo, e uma declaração pendurada segura a conversa"
         );
+    }
+
+    /// O nome da ordem continua sendo conferido no schema real; texto de SQL
+    /// não vira coluna, e o erro ajuda o modelo a corrigir a chamada.
+    #[test]
+    fn coluna_de_ordem_invalida_lista_as_validas_e_o_exemplo() {
+        let schema = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("qt_venda".to_string(), "integer".to_string()),
+        ];
+        let (nome, _) = conferir_coluna("QT_VENDA", &schema).unwrap();
+        assert_eq!(nome, "qt_venda");
+        for entrada in [
+            "qt_venda DESC",
+            "qt_venda, id",
+            "qt_venda; DROP TABLE vendas",
+        ] {
+            let erro = conferir_coluna(entrada, &schema).unwrap_err().to_string();
+            for trecho in [
+                entrada,
+                "id",
+                "qt_venda",
+                "ordem",
+                "ordemDesc",
+                "bancos_colunas",
+            ] {
+                assert!(erro.contains(trecho), "{entrada}: {erro}");
+            }
+        }
     }
 
     /// A conferência de fonte e colunas cabe numa consulta ao catálogo: duas

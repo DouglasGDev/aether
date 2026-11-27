@@ -106,7 +106,7 @@ fn conferir_coluna(coluna: &str, conhecidas: &[(String, String)]) -> Result<(Str
         .iter()
         .find(|(nome, _)| nome.eq_ignore_ascii_case(coluna))
         .cloned()
-        .ok_or_else(|| anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", coluna)])))
+        .ok_or_else(|| erro_coluna_invalida(coluna, conhecidas))
 }
 
 /// Um valor do JSON tipado pelo que o TDS entende. Número inteiro vai como
@@ -382,8 +382,8 @@ impl Mssql {
 }
 
 use super::{
-    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto, erro_de_prazo,
-    prazo_de_espera, teto_de_leitura,
+    Comparacao, Consulta, Cronometro, Filtro, Motor, ResultadoSql, aparar_no_teto,
+    erro_coluna_invalida, erro_de_prazo, ordem_de, prazo_de_espera, teto_de_leitura,
 };
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
@@ -428,8 +428,9 @@ impl Motor for Mssql {
         let onde = onde_sql(filtro, &esquema, &mut params, &mut numero)?;
         let ordenar = match ordem {
             None => String::new(),
-            Some((coluna, desc)) => {
-                let (nome, _) = conferir_coluna(coluna, &esquema)?;
+            Some((texto, desc)) => {
+                let (coluna, desc) = ordem_de(texto, desc, Some(&esquema))?;
+                let (nome, _) = conferir_coluna(&coluna, &esquema)?;
                 format!(" ORDER BY {} {}", citado(&nome), if desc { "DESC" } else { "ASC" })
             }
         };
@@ -633,6 +634,35 @@ mod tests {
     use super::*;
     use crate::bancos::config::{conexao_de_teste, Tipo};
     use crate::bancos::motor::PRAZO_DE_LEITURA;
+
+    /// O nome da ordem continua sendo conferido no schema real; texto de SQL
+    /// não vira coluna, e o erro ajuda o modelo a corrigir a chamada.
+    #[test]
+    fn coluna_de_ordem_invalida_lista_as_validas_e_o_exemplo() {
+        let schema = vec![
+            ("id".to_string(), "int".to_string()),
+            ("qt_venda".to_string(), "int".to_string()),
+        ];
+        let (nome, _) = conferir_coluna("QT_VENDA", &schema).unwrap();
+        assert_eq!(nome, "qt_venda");
+        for entrada in [
+            "qt_venda DESC",
+            "qt_venda, id",
+            "qt_venda; DROP TABLE vendas",
+        ] {
+            let erro = conferir_coluna(entrada, &schema).unwrap_err().to_string();
+            for trecho in [
+                entrada,
+                "id",
+                "qt_venda",
+                "ordem",
+                "ordemDesc",
+                "bancos_colunas",
+            ] {
+                assert!(erro.contains(trecho), "{entrada}: {erro}");
+            }
+        }
+    }
 
     /// O catálogo de uma fonte cabe numa declaração: a tabela conferida e as
     /// colunas dela na mesma junta. Duas viagens — a lista inteira e depois as

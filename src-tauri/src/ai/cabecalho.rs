@@ -245,6 +245,30 @@ impl Cabecalho {
 /// Abre o arquivo e lê só o cabeçalho. Ler o cabeçalho não é carregar pesos: o
 /// parser para nas fichas dos tensores, nenhuma camada se move e a placa não é
 /// tocada — é por isso que esta função roda em qualquer máquina.
+///
+/// **Aqui não há cache, e a razão é medida, não prudência genérica.** Houve: a
+/// leitura chegou a ser guardada por assinatura de disco, como a do catálogo.
+/// Caiu pela medição da própria máquina: reescrever o mesmo caminho com o mesmo
+/// tamanho devolve assinatura idêntica na maioria das tentativas — cinco de oito
+/// na corrida que fechou esta árvore — porque a data que `Assinatura` lê tem, na
+/// prática, granularidade maior que o intervalo entre duas escritas seguidas. O
+/// teste `a_assinatura_muda_quando_o_arquivo_muda_de_tamanho`, em `catalog.rs`,
+/// publica a contagem de cada execução. E o padrão existe no repositório:
+/// `tipo_sem_bloco_medido_nao_vira_ficha_inventada` e
+/// `a_ficha_le_template_eos_e_paradas_do_gguf`, em `alojamento.rs`, reescrevem o
+/// mesmo `.gguf` com o mesmo comprimento e dtype diferente — com o cache, a
+/// ficha diria 68 bytes onde o arquivo novo escreve 66, e a tela mentiria sobre
+/// o que a placa vai carregar. Uma assinatura de metadata não cobre esse caso, e
+/// o ponto de escrita está em arquivo que este frente não edita, onde não há
+/// `invalidar` a chamar. Errar aqui é errar alojamento; reler um cabeçalho custa
+/// milissegundos.
+///
+/// O que resolve de verdade está em outro lugar: `state::AiRuntime` guarda as
+/// fichas derivadas — assinadas, com teto e sem lock atravessando o disco —, e é
+/// delas que o roteador decide a cada turno. O que sobra aqui é a carga do
+/// motor, que chama `fichar` duas vezes para o mesmo arquivo (`engine.rs` e a
+/// sonda do `ggml`): duplicação de uma única carga, a eliminar passando a mesma
+/// `Ficha` adentro, não guardando cabeçalho em RAM.
 pub fn ler(caminho: &Path) -> Result<Cabecalho> {
     let aberto = std::fs::File::open(caminho).map_err(|e| {
         anyhow::anyhow!(tr(

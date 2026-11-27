@@ -407,8 +407,10 @@ de cada `.rs` tocado por esta frente e de um comentário corrigido em
 
 - **Uma máquina sem placa.** Esta tem uma RX 9060 XT. O degrau de CPU correu porque
   a sonda pede `Destino::Sistema`, não porque o `Engine::load` o escolheu: a
-  cascada real (`engine.rs:417` → `:464`) não foi exercitada de ponta a ponta, e o
-  caminho "a placa recusou, a CPU serviu" continua sem medição de verdade.
+  cascada real (`engine.rs:456` → `:513`) não foi exercitada de ponta a ponta, e o
+  caminho "a placa recusou, a CPU serviu" continua sem medição de verdade. O §9
+  escreve a conta que este degrau ainda não tinha, e escreve sem carga de verdade:
+  os pesos estão em disco, o aplicativo é que não foi aberto nesta frente.
 - **Nenhuma janela aberta.** Por ordem do mantenedor, o aplicativo não foi executado
   nesta frente. Não existe captura de tela do caminho de CPU, nem verificação no app
   real do `Acelerador` que ele publica.
@@ -427,3 +429,118 @@ de cada `.rs` tocado por esta frente e de um comentário corrigido em
   de antes — não uma regressão medida, mas também não uma vitória medida.
 - **Concorrência.** Cada linha das tabelas carregou o modelo e andou sozinha. Numa
   máquina sem placa atendendo duas conversas, a escala é a mesma e o gargalo não.
+
+## 9. A RAM manda no degrau sem placa (2026-11-26, passada seguinte)
+
+O §1 descreve a escada e o §2 a escala, mas até aqui o degrau de CPU carregava com
+**qualquer janela**: `maior_janela_inteira` começava com `let cap = capacidade?`, e
+sem placa não há capacidade — então `Acelerador.janela_inteira` saía `None` e a
+escala de geração oferecia o máximo do arquivo. Numa máquina com placa isso é só um
+teto faltando; sem placa é o buraco: pesos, KV e estado pousam todos na RAM, e uma
+janela maior que a memória livre não é "um pouco mais lento" — é troca com disco a
+cada token, que é o consumo de RAM variável que se reclamou, ou recusa do contexto.
+
+O que entrou, com as linhas desta árvore:
+
+- **Um só leitor de RAM.** `alojamento::medir_memoria_do_sistema`
+  ([../src-tauri/src/ai/alojamento.rs:741](../src-tauri/src/ai/alojamento.rs)) é a
+  única chamada a `GlobalMemoryStatusEx`; `memoria_do_sistema` (`:763`) é a mesma
+  leitura como opção, e `router::measure_hardware` passou a ler daqui em vez de
+  abrir a chamada por conta própria — duas leituras do mesmo sistema operacional
+  podem discordar, e a frase que explica a escolha tem de citar o número que a
+  conta dela usou.
+- **A conta do sistema.** `caber_no_sistema` (`:788`) soma pesos + KV + estado e
+  compara com a RAM livre, **sem** a folga de computação do §4 — aqueles 518 MiB de
+  piso são o `sched_reserve` do grafo Vulkan medido nesta placa, e o kernel de CPU
+  não tem nada medido parecido. Chutar um piso para o lado sem placa seria chamar
+  de medida o que é transferência de outra máquina.
+- **Uma varredura só.** `maior_potencia` (`:707`) é o laço que desce de `teto` pela
+  metade; `maior_janela_inteira` e `maior_janela_no_sistema` (`:804`) são agora o
+  mesmo passo com réguas diferentes, porque a monotonia é a mesma — o KV cresce com
+  a janela.
+- **A carga obedece.** No braço `Err(falha_gpu)` ([../src-tauri/src/ai/engine.rs:513](../src-tauri/src/ai/engine.rs))
+  a janela pedida é conferida contra a RAM antes de `Motor::novo`: se não cabe e
+  existe teto, a carga desce para `teto.min(context)` (`:546`) — nunca sobe — e a
+  última linha do `motivo` diz quantos tokens foram pedidos, quanto custaria, quanta
+  RAM havia e em quantos ficou (`erros.janelaCurtaSistema`, `:550`).
+  `Acelerador.janela_inteira` sai medida com a mesma RAM que mandou na carga.
+- **O alojamento do degrau sem placa.** `Alojado.cedido` passou a
+  [`Option<u64>`](../src-tauri/src/ai/engine.rs) (`:340`) e o braço de CPU publica
+  `alojado` (`:564`): o veredito é o `SoSistema` da conta com a **janela que foi
+  carregada**, não a pedida, então o chip do gerenciador de modelos diz quantos
+  bytes de pesos e de cache a carga ocupa no sistema — que é a informação que
+  estava faltando — e o `cedido` vai `None`, porque nenhum byte de VRAM mudou de
+  dono. O mesmo `None` cobre a placa que carregou sem que a sonda de depois
+  respondesse (`:482`, `:489`): ali o veredito continua sendo conta feita com a
+  leitura de antes, e só o delta é que não existe. Na tela,
+  [`ModelManager.tsx:33`](../src/components/ModelManager.tsx) deixa o título do chip
+  vazio em vez de escrever "0 MiB levados", e
+  [`bancada.rs:242`](../src-tauri/src/bancada.rs) só empurra a medida
+  `bancada.medida.cedido` quando ela foi medida.
+- **A tela diz qual memória é.** `geracao.janelaInteira` ficou para a placa e
+  entrou `geracao.janelaInteiraSistema` ("inteira na RAM até {n}") para o degrau
+  sem placa; `inteiraMedida` leva o `tipo` do acelerador junto porque a mesma
+  grandeza tem duas moedas.
+
+A corrente fecha onde a compactação automática começa: `state.rs:737` grava a
+janela que a biblioteca aceitou, e `session.rs:557` tira de `engine.context()` o
+`limite` e o `limite_macio` que disparam a dobra. Reduzir a janela na carga, quando
+a RAM manda, é o que faz o gatilho automático da compactação existir numa máquina
+sem placa — antes ele disparava contra um teto que a RAM nunca deixou existir.
+
+### 9.1 Medido nesta máquina
+
+- A leitura, por `a_ram_do_sistema_responde_e_o_livre_nao_passa_do_total` rodado com
+  `--nocapture`: **`RAM lida nesta máquina: 15.2 GiB livres de 31.9 GiB`**.
+- O instrumento estranho concorda no total: `Get-CimInstance Win32_OperatingSystem`
+  devolveu, minutos antes, `FreePhysicalMemory 17216072` e
+  `TotalVisibleMemorySize 33471868` — 16,4 GiB livres de **31,92 GiB**, o mesmo
+  total dígito por dígito; o livre difere porque são duas leituras em dois
+  momentos, não duas contas.
+- O teto do granite 4.2 3B Q4_K_M, calculado com a ficha do §5 e a RAM lida acima:
+  `2136 MiB + 81920 B/tokens × 131072 = 12.376 MiB` (12,09 GiB) contra 15,2 GiB
+  livres — cabe. Nesta máquina o teto é o `janela_maxima` que o arquivo declara, não
+  a RAM, então **a redução não dispara aqui em janela nenhuma**. Ela só morde em
+  máquina com menos memória, que é exatamente onde o buraco do §9 estava.
+- Portas desta passada: `cargo test --lib` →
+  **`test result: ok. 790 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 6.57s`**
+  (sete testes novos: seis da conta de RAM em `alojamento::testes` e o do leitor
+  acima), com zero linhas `warning` no `cargo check --all-targets`.
+- Portas da passada seguinte, a do `cedido` opcional: `cargo test --lib` →
+  **`test result: ok. 791 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 7.00s`**
+  — o um a mais é `o_degrau_sem_placa_publica_o_sistema_sem_cedido_falso`, que vê o
+  `SoSistema` serializado com `"cedido":null` e recusa `"cedido":0`.
+  `cargo check --all-targets` → `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 7.08s`,
+  zero linhas `warning`. `npm run build` → `tsc && vite build`, `✓ built in 207ms`,
+  sem aviso de TypeScript.
+- A consequence de publicar o veredito no degrau de CPU: as frases que já existiam
+  e nunca haviam sido alcançadas por uma carga — `modelos.placaSistema` no chip do
+  gerenciador e `bancada.previsao.sistema` ("só no sistema") na bancada — passam a
+  ser o que a tela tem de mostrar quando não há placa. Estão nas duas locales e o
+  `previsao()` já as formatava; o que faltava era o núcleo publicar o veredito.
+
+### 9.2 O que continua não medido
+
+- **Nenhuma carga real passou pela conta.** Os pesos estão em disco —
+  `AppData\Local\ai.aether.core\models` tem `granite-4.2-3b-Q4_K_M.gguf` de
+  2.244.011.552 B, `Ornith-1.5-9B-Q4_K_M.gguf` de 5.780.090.816 B e o codificador
+  Qwen3 — o que não houve foi carga: o aplicativo não foi aberto nesta frente.
+  Então o `motivo` de janela reduzida nunca foi impresso por uma carga de verdade,
+  nem o RSS depois de um `Destino::Sistema` foi comparado com o `total` previsto.
+  A aritmética está testada; a predição contra memória real de processo, não.
+- **Nenhuma janela aberta.** O chip `SoSistema` do gerenciador de modelos e a linha
+  da bancada existem desde esta passada só no papel: sem carga, sem aplicativo
+  rodando, não há captura que mostre o `cedido` ausente no lugar certo. O que está
+  provado aqui é a serialização (`"cedido":null`) e o tipo que a tela lê, não o
+  pixel.
+- **A placa que carregou sem responder depois.** Os dois ramos novos do lado de GPU
+  (`:482`, `:489`) publicam o veredito com `cedido: None` quando a sonda de depois
+  falhou. Nesta máquina a sonda responde, então esse caminho continua sendo conta
+  escrita contra um caso que ainda não aconteceu — e é por isso que ele leva o
+  motivo da sonda no `motivo` junto, para a tela nunca parecer que mediu.
+- **O teto em outros modelos.** O número de 9.1 é do granite com a ficha do §5. Um
+  9B Q4_K_M, um híbrido com estado recorrente (as camadas de atenção linear que um
+  gemma-4 paga) ou uma quant maior mudam a conta — e em alguns casos mudam o lado
+  que manda: o
+  arquivo ou a RAM.
+

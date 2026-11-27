@@ -5,11 +5,13 @@ use super::servidor::{self, Publicador};
 use super::tool::ToolInfo;
 use crate::bancos;
 use crate::config::{McpConfig, Segredos};
-use crate::connectors::{ConnectorKind, DesktopOs, McpEntry, Registry, ToolMeta, parse_qualified_name};
+use crate::connectors::{
+    Connector, ConnectorKind, DesktopOs, McpEntry, Registry, ToolMeta, parse_qualified_name,
+};
 use crate::idiomas::tr;
 use crate::local::{self, pastas::Pastas};
 use crate::permissions::{PermissionGate, ToolEffect};
-use crate::state::{trava_estado, trava_escrita, trava_leitura};
+use crate::state::{trava_escrita, trava_estado, trava_leitura};
 use anyhow::{Context, Result, anyhow, bail};
 use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
@@ -25,11 +27,16 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 type Client = RunningService<RoleClient, ()>;
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum McpEvent {
     ToolsDiscovered {
         connector_id: String,
@@ -51,28 +58,37 @@ enum ConnectionCommand {
     Call {
         params: CallToolRequestParams,
         reply: oneshot::Sender<Result<CallToolResult, ServiceError>>,
+        cancel: CancellationToken,
     },
-    Shutdown,
 }
 
 /// Um servidor MCP é um processo separado, com um canal de comandos. O conector
 /// embutido é o próprio aplicativo: não há canal, e a chamada roda aqui dentro.
-/// O servidor que o aplicativo publica é um terceiro caso: há canal e há rede,
-/// mas a outra ponta somos nós — e é lá que o gate decide, uma única vez.
+/// O servidor que o aplicativo publica mantém a conexão de descoberta, mas as
+/// chamadas do laço interno rodam no `Execucao`: o turno nunca atravessa a rede
+/// num metadado que um cliente externo também poderia escrever.
 #[derive(Clone)]
 enum Canal {
     Remoto(mpsc::Sender<ConnectionCommand>),
-    Publicado(mpsc::Sender<ConnectionCommand>),
+    Publicado,
     Local,
 }
 
 struct Connection {
     canal: Canal,
+    cliente_descoberta: Option<Client>,
     /// Tudo que o servidor anunciou, sem filtro. O que o modelo pode usar é o
     /// que `tools` devolve, já passado pela allowlist do cadastro: assim, ligar
     /// ou desligar uma ferramenta no grafo vale na chamada seguinte, sem
     /// precisar derrubar e levantar o processo do servidor.
     anunciadas: Vec<ToolInfo>,
+    /// Desligar a conexão não pode ficar atrás de `client.call_tool`. Este token
+    /// é observado tanto pelo laço de comandos quanto pela chamada ativa.
+    desligamento: CancellationToken,
+    /// Esperar a tarefa é o que garante que `client.cancel()` — e, no stdio, o
+    /// Drop do transporte que mata o filho — aconteceu antes de `disconnect`
+    /// devolver.
+    tarefa: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct McpManager {
@@ -91,6 +107,9 @@ pub struct McpManager {
     config_path: Arc<PathBuf>,
     /// O token do servidor publicado, que nunca vai para o disco.
     segredos: Arc<Segredos>,
+    /// Um `CancellationToken` não carrega ID de usuário. Esta é a ligação
+    /// explícita token → turno; sem ela a chamada seria tratada como manual.
+    turns: Mutex<HashMap<CancellationToken, u64>>,
 }
 
 /// As ferramentas que o próprio aplicativo sabe executar, na ordem do catálogo.
@@ -156,6 +175,7 @@ impl McpManager {
             config,
             config_path,
             segredos,
+            turns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -172,7 +192,9 @@ impl McpManager {
         };
         {
             let mut connections = trava_escrita(&self.connections);
-            let Some(connection) = connections.get_mut(local::CONECTOR) else { return };
+            let Some(connection) = connections.get_mut(local::CONECTOR) else {
+                return;
+            };
             connection.anunciadas = anunciadas;
         }
         let _ = self.events.send(McpEvent::ToolsDiscovered {
@@ -187,6 +209,17 @@ impl McpManager {
 
     pub fn approvals(&self) -> Arc<ApprovalBroker> {
         self.execucao.aprovacoes()
+    }
+
+    /// Associa o token criado pela reserva do turno ao seu ID. É necessária uma
+    /// vez por turno porque `CancellationToken` não transporta metadado; o main
+    /// chama isto ao reservar e `finish_turn` ao soltar a reserva.
+    pub fn register_turn(&self, turn_id: u64, cancel: CancellationToken) {
+        trava_estado(&self.turns).insert(cancel, turn_id);
+    }
+
+    pub fn finish_turn(&self, turn_id: u64) {
+        trava_estado(&self.turns).retain(|_, turn| *turn != turn_id);
     }
 
     pub fn registry_snapshot(&self) -> Registry {
@@ -287,6 +320,17 @@ impl McpManager {
     }
 
     pub async fn connect(&self, connector_id: &str) -> Result<Vec<ToolInfo>> {
+        self.connect_inner(connector_id, None).await
+    }
+
+    async fn connect_inner(
+        &self,
+        connector_id: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolInfo>> {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
         if trava_leitura(&self.connections).contains_key(connector_id) {
             bail!(tr("erros.servidorJaConectado", &[("id", connector_id)]));
         }
@@ -306,9 +350,18 @@ impl McpManager {
                 let registry = trava_leitura(&self.registry);
                 permitidas(&registry, connector_id, &anunciadas)
             };
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                bail!(tr("erros.pedidoCancelado", &[]));
+            }
             trava_escrita(&self.connections).insert(
                 connector_id.to_string(),
-                Connection { canal: Canal::Local, anunciadas },
+                Connection {
+                    canal: Canal::Local,
+                    cliente_descoberta: None,
+                    anunciadas,
+                    desligamento: CancellationToken::new(),
+                    tarefa: None,
+                },
             );
             let _ = self.events.send(McpEvent::ToolsDiscovered {
                 connector_id: connector_id.to_string(),
@@ -317,12 +370,11 @@ impl McpManager {
             return Ok(tools);
         }
 
-        let connector = crate::config::resolve_connector(&stored, &self.segredos).with_context(
-            || tr("erros.falhaResolverSegredos", &[("id", connector_id)]),
-        )?;
-        let entry = connector.entry_on(DesktopOs::current()).ok_or_else(|| {
-            anyhow!(tr("erros.servidorSemEntrada", &[("id", connector_id)]))
-        })?;
+        let connector = crate::config::resolve_connector(&stored, &self.segredos)
+            .with_context(|| tr("erros.falhaResolverSegredos", &[("id", connector_id)]))?;
+        let entry = connector
+            .entry_on(DesktopOs::current())
+            .ok_or_else(|| anyhow!(tr("erros.servidorSemEntrada", &[("id", connector_id)])))?;
 
         // Um servidor do catálogo que só enxerga pastas recebe as concedidas
         // agora, não quando foi instalado: revogar uma pasta tem de valer já.
@@ -334,17 +386,46 @@ impl McpManager {
             _ => entry.clone(),
         };
 
-        let client = dentro_do_prazo(Self::dial(&entry), PRAZO_CONEXAO, connector_id).await?;
+        let client = match cancel {
+            Some(cancel) => {
+                dentro_do_prazo_cancelavel(Self::dial(&entry), PRAZO_CONEXAO, connector_id, cancel)
+                    .await?
+            }
+            None => dentro_do_prazo(Self::dial(&entry), PRAZO_CONEXAO, connector_id).await?,
+        };
         // A descoberta também tem prazo, e aqui há algo a limpar: o cliente já
         // está de pé, com o processo do servidor vivo atrás dele. Devolver o
         // erro sem fechar a conexão deixaria um filho órfão com a tela dizendo
         // apenas que não conseguiu conectar.
-        let descoberta = dentro_do_prazo(
-            async { client.list_all_tools().await.context(tr("erros.falhaListarFerramentas", &[])) },
-            PRAZO_CONEXAO,
-            connector_id,
-        )
-        .await;
+        let descoberta = match cancel {
+            Some(cancel) => {
+                dentro_do_prazo_cancelavel(
+                    async {
+                        client
+                            .list_all_tools()
+                            .await
+                            .context(tr("erros.falhaListarFerramentas", &[]))
+                    },
+                    PRAZO_CONEXAO,
+                    connector_id,
+                    cancel,
+                )
+                .await
+            }
+            None => {
+                dentro_do_prazo(
+                    async {
+                        client
+                            .list_all_tools()
+                            .await
+                            .context(tr("erros.falhaListarFerramentas", &[]))
+                    },
+                    PRAZO_CONEXAO,
+                    connector_id,
+                )
+                .await
+            }
+        };
         let advertised = match descoberta {
             Ok(ferramentas) => ferramentas,
             Err(erro) => {
@@ -363,19 +444,32 @@ impl McpManager {
             .cloned()
             .collect();
 
-        let (sender, receiver) = mpsc::channel(32);
-        tokio::spawn(run_connection(client, receiver));
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            let _ = client.cancel().await;
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
+        // A conexão com o servidor publicado serve à descoberta. As chamadas do
+        // laço interno não voltam pela rede: `Canal::Publicado` executa aqui.
+        let (canal, cliente_descoberta, desligamento, tarefa) =
+            if connector_id == servidor::CONECTOR {
+                (Canal::Publicado, Some(client), CancellationToken::new(), None)
+            } else {
+                let (sender, receiver) = mpsc::channel(32);
+                let desligamento = CancellationToken::new();
+                let tarefa = tokio::spawn(run_connection(client, receiver, desligamento.clone()));
+                (Canal::Remoto(sender), None, desligamento, Some(tarefa))
+            };
 
-        // Ligarse ao servidor que o próprio aplicativo publica é uma ligação de
-        // rede como qualquer outra — com uma diferença: a outra ponta decide.
-        let canal = if connector_id == servidor::CONECTOR {
-            Canal::Publicado(sender)
-        } else {
-            Canal::Remoto(sender)
-        };
-
-        trava_escrita(&self.connections)
-            .insert(connector_id.to_string(), Connection { canal, anunciadas });
+        trava_escrita(&self.connections).insert(
+            connector_id.to_string(),
+            Connection {
+                canal,
+                cliente_descoberta,
+                anunciadas,
+                desligamento,
+                tarefa,
+            },
+        );
 
         let _ = self.events.send(McpEvent::ToolsDiscovered {
             connector_id: connector_id.to_string(),
@@ -399,6 +493,28 @@ impl McpManager {
         expired
     }
 
+    /// Cancela só o turno pedido. O token corta chamadas que ainda não chegaram
+    /// ao broker; broker e gate removem os cards que já existiam. O waiter emite
+    /// `ApprovalSettled` ao acordar, sem um segundo evento aqui.
+    pub fn cancel_turn(&self, turn_id: u64) -> usize {
+        let tokens: Vec<CancellationToken> = trava_estado(&self.turns)
+            .iter()
+            .filter(|(_, turn)| **turn == turn_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        // O broker cancela os tokens enquanto segura o mapa dos waiters. Sem
+        // isso, um worker acordado pelo token pode remover o card antes de o
+        // gerente contá-lo, fazendo `cancel_turn` devolver zero indevidamente.
+        let cancelados = self.execucao.aprovacoes().cancel_turn_com(turn_id, || {
+            for token in &tokens {
+                token.cancel();
+            }
+        });
+        trava_estado(&self.execucao.gate()).cancel_turn(turn_id);
+        trava_estado(&self.turns).retain(|_, turn| *turn != turn_id);
+        cancelados
+    }
+
     pub async fn disconnect(&self, connector_id: &str) -> Result<()> {
         let connection = trava_escrita(&self.connections).remove(connector_id);
         let Some(connection) = connection else {
@@ -409,11 +525,15 @@ impl McpManager {
         self.execucao.aprovacoes().cancel_connector(connector_id);
         trava_estado(&self.execucao.gate()).flush_connector(connector_id);
 
-        match connection.canal {
-            Canal::Remoto(sender) | Canal::Publicado(sender) => {
-                let _ = sender.send(ConnectionCommand::Shutdown).await;
-            }
-            Canal::Local => {}
+        // O token é independente da fila de comandos: mesmo com `call_tool`
+        // pendurado, o laço larga a chamada, fecha o cliente e devolve. Só então
+        // `disconnect` confirma que o transporte (e o filho stdio) foi encerrado.
+        connection.desligamento.cancel();
+        if let Some(tarefa) = connection.tarefa {
+            let _ = tarefa.await;
+        }
+        if let Some(cliente) = connection.cliente_descoberta {
+            let _ = cliente.cancel().await;
         }
         let _ = self.events.send(McpEvent::Disconnected {
             connector_id: connector_id.to_string(),
@@ -421,11 +541,37 @@ impl McpManager {
         Ok(())
     }
 
+    /// Comando manual da UI: sem turno e sem cancelamento.
     pub async fn call_tool(
         &self,
         qualified_name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult> {
+        self.call_tool_inner(qualified_name, arguments, None, &CancellationToken::new())
+            .await
+    }
+
+    pub async fn call_tool_cancellable(
+        &self,
+        qualified_name: &str,
+        arguments: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<CallToolResult> {
+        let turn_id = trava_estado(&self.turns).get(&cancel).copied();
+        self.call_tool_inner(qualified_name, arguments, turn_id, &cancel)
+            .await
+    }
+
+    async fn call_tool_inner(
+        &self,
+        qualified_name: &str,
+        arguments: serde_json::Value,
+        turn_id: Option<u64>,
+        cancel: &CancellationToken,
+    ) -> Result<CallToolResult> {
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
         let meta = {
             let registry = trava_leitura(&self.registry);
             ToolMeta::resolve(&registry, qualified_name)
@@ -440,7 +586,10 @@ impl McpManager {
             // correção cabe na rodada seguinte.
             None => {
                 let nomes = |id: &str| -> Vec<String> {
-                    self.tools(id).into_iter().map(|t| t.qualified_name).collect()
+                    self.tools(id)
+                        .into_iter()
+                        .map(|t| t.qualified_name)
+                        .collect()
                 };
                 // O conector pode nem estar conectado: aí a lista útil é a de
                 // tudo o que existe agora, senão o erro não ensina nada.
@@ -467,7 +616,10 @@ impl McpManager {
         let (canal, effect) = {
             let connections = trava_leitura(&self.connections);
             let connection = connections.get(&meta.connector_id).ok_or_else(|| {
-                anyhow!(tr("erros.servidorNaoConectado", &[("id", &meta.connector_id)]))
+                anyhow!(tr(
+                    "erros.servidorNaoConectado",
+                    &[("id", &meta.connector_id)]
+                ))
             })?;
             let effect = connection
                 .anunciadas
@@ -485,17 +637,30 @@ impl McpManager {
                 // decide antes, como decide para qualquer efeito que escreve.
                 if meta.tool == servidor::FERRAMENTA {
                     self.execucao
-                        .aprovar(local::CONECTOR, &meta.tool, effect, &arguments)
+                        .aprovar_cancelavel(
+                            local::CONECTOR,
+                            &meta.tool,
+                            effect,
+                            &arguments,
+                            turn_id,
+                            cancel,
+                        )
                         .await?;
-                    return Ok(resultado_publicado(&self.publicar().await?));
+                    if cancel.is_cancelled() {
+                        bail!(tr("erros.pedidoCancelado", &[]));
+                    }
+                    let estado = self.publicar_cancelavel(cancel).await?;
+                    return Ok(resultado_publicado(&estado));
                 }
                 let saida = self
                     .execucao
-                    .ferramenta(
+                    .ferramenta_cancelavel(
                         local::CONECTOR,
                         &meta.tool,
                         effect,
                         serde_json::Value::Object(arguments),
+                        turn_id,
+                        cancel,
                     )
                     .await?;
                 Ok(resultado_local(saida))
@@ -504,15 +669,33 @@ impl McpManager {
                 // A ferramenta roda do outro lado, então a decisão tem de acontecer
                 // aqui: é o cliente que sabe o que o usuário permitiu.
                 self.execucao
-                    .aprovar(&meta.connector_id, &meta.tool, effect, &arguments)
+                    .aprovar_cancelavel(
+                        &meta.connector_id,
+                        &meta.tool,
+                        effect,
+                        &arguments,
+                        turn_id,
+                        cancel,
+                    )
                     .await?;
-                self.enviar(sender, &meta, arguments).await
+                self.enviar(sender, &meta, arguments, cancel).await
             }
-            Canal::Publicado(sender) => {
-                // A outra ponta é o nosso próprio servidor, que passa pelo mesmo
-                // gate com o mesmo id de conector. Decidir aqui também seria
-                // pedir a mesma aprovação duas vezes.
-                self.enviar(sender, &meta, arguments).await
+            Canal::Publicado => {
+                // O turno é uma identidade interna, não um metadado de protocolo.
+                // Executar aqui conserva esse vínculo e evita uma segunda decisão
+                // no endpoint externo, onde toda chamada é manual.
+                let saida = self
+                    .execucao
+                    .ferramenta_cancelavel(
+                        &meta.connector_id,
+                        &meta.tool,
+                        effect,
+                        serde_json::Value::Object(arguments),
+                        turn_id,
+                        cancel,
+                    )
+                    .await?;
+                Ok(resultado_local(saida))
             }
         }
     }
@@ -522,23 +705,44 @@ impl McpManager {
         sender: mpsc::Sender<ConnectionCommand>,
         meta: &ToolMeta,
         arguments: serde_json::Map<String, serde_json::Value>,
+        cancel: &CancellationToken,
     ) -> Result<CallToolResult> {
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
         let params = CallToolRequestParams::new(meta.tool.clone()).with_arguments(arguments);
         let (reply_tx, reply_rx) = oneshot::channel();
-        sender
-            .send(ConnectionCommand::Call {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!(tr("erros.pedidoCancelado", &[])),
+            enviado = sender.send(ConnectionCommand::Call {
                 params,
                 reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow!(tr("erros.servidorParou", &[("id", &meta.connector_id)])))?;
+                cancel: cancel.clone(),
+            }) => {
+                enviado.map_err(|_| anyhow!(tr("erros.servidorParou", &[("id", &meta.connector_id)])))?;
+            }
+        }
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
 
-        reply_rx
-            .await
-            .map_err(|_| anyhow!(tr("erros.servidorDerrubouChamada", &[("id", &meta.connector_id)])))?
-            .map_err(|e| {
-                anyhow!(tr("erros.falhaChamarFerramenta", &[("detalhe", &e.to_string())]))
-            })
+        let resposta = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!(tr("erros.pedidoCancelado", &[])),
+            resposta = async { reply_rx.await } => {
+                resposta.map_err(|_| anyhow!(tr("erros.servidorDerrubouChamada", &[("id", &meta.connector_id)])))?
+            }
+        };
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
+        }
+        resposta.map_err(|e| {
+            anyhow!(tr(
+                "erros.falhaChamarFerramenta",
+                &[("detalhe", &e.to_string())]
+            ))
+        })
     }
 
     /// Levanta o servidor MCP das ferramentas do Aether e o entra no cadastro,
@@ -549,24 +753,152 @@ impl McpManager {
     /// `${AETHER_MCP_TOKEN}`, nunca o valor. Reconectar vale porque a porta muda a
     /// cada execução: o cliente velho aponta para uma porta que não existe mais.
     pub async fn publicar(&self) -> Result<servidor::Estado> {
-        let (estado, token) = self.publicador.abrir().await?;
-        self.segredos.guardar(servidor::VARIAVEL_TOKEN, &token);
+        let cancel = CancellationToken::new();
+        self.publicar_com(&cancel, || async {
+            self.connect_inner(servidor::CONECTOR, Some(&cancel))
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
 
-        let registry = {
-            let mut config = trava_estado(&self.config);
-            config.upsert(servidor::conector(&estado));
-            config.save(&self.config_path)?;
-            config.registry()?
-        };
-        self.replace_registry(registry);
+    async fn publicar_cancelavel(&self, cancel: &CancellationToken) -> Result<servidor::Estado> {
+        self.publicar_com(cancel, || async {
+            self.connect_inner(servidor::CONECTOR, Some(cancel))
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
 
-        // Uma ligação velha cai com a porta velha; sem isto o conector ficaria
-        // "conectado" apontando para um endereço que já não escuta.
-        if trava_leitura(&self.connections).contains_key(servidor::CONECTOR) {
-            self.disconnect(servidor::CONECTOR).await.ok();
+    /// O futuro de conexão entra como parâmetro para que o cancelamento possa
+    /// ser observado antes de qualquer handshake. Em produção é o `connect_inner`
+    /// cancelável; nos testes, uma conexão parada prova o rollback no meio do
+    /// caminho sem depender de um servidor que por acaso responda devagar.
+    async fn publicar_com<F, Fut>(
+        &self,
+        cancel: &CancellationToken,
+        conectar: F,
+    ) -> Result<servidor::Estado>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        if cancel.is_cancelled() {
+            bail!(tr("erros.pedidoCancelado", &[]));
         }
-        self.connect(servidor::CONECTOR).await?;
+        let conector_anterior = trava_estado(&self.config)
+            .servers
+            .iter()
+            .find(|conector| conector.id == servidor::CONECTOR)
+            .cloned();
+        let mut config_alterada = false;
+        let (estado, token) = self.publicador.abrir().await?;
+
+        let resultado: Result<()> = async {
+            if cancel.is_cancelled() {
+                bail!(tr("erros.pedidoCancelado", &[]));
+            }
+            self.segredos.guardar(servidor::VARIAVEL_TOKEN, &token);
+            let registry = {
+                let mut config = trava_estado(&self.config);
+                config.upsert(servidor::conector(&estado));
+                config_alterada = true;
+                config.save(&self.config_path)?;
+                config.registry()?
+            };
+            self.replace_registry(registry);
+            if cancel.is_cancelled() {
+                bail!(tr("erros.pedidoCancelado", &[]));
+            }
+
+            // Uma ligação velha cai com a porta velha; sem isto o conector ficaria
+            // "conectado" apontando para um endereço que já não escuta.
+            if trava_leitura(&self.connections).contains_key(servidor::CONECTOR) {
+                self.disconnect(servidor::CONECTOR).await.ok();
+            }
+            if cancel.is_cancelled() {
+                bail!(tr("erros.pedidoCancelado", &[]));
+            }
+            let conexao = conectar();
+            let resultado = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(anyhow!(tr("erros.pedidoCancelado", &[]))),
+                resultado = conexao => resultado,
+            };
+            // Um handshake que ficou pronto no mesmo poll do cancelamento não
+            // pode publicar uma conexão que o Stop já mandou desfazer.
+            if cancel.is_cancelled() {
+                bail!(tr("erros.pedidoCancelado", &[]));
+            }
+            resultado?;
+            Ok(())
+        }
+        .await;
+
+        if resultado.is_err() || cancel.is_cancelled() {
+            let original = if cancel.is_cancelled() {
+                anyhow!(tr("erros.pedidoCancelado", &[]))
+            } else {
+                resultado.expect_err("o caminho de rollback só roda com erro")
+            };
+            if let Err(limpeza) = self
+                .restaurar_publicacao(conector_anterior, config_alterada)
+                .await
+            {
+                // `to_string()` continua sendo o motivo original; a cadeia
+                // mantém a falha de limpeza para quem precisar diagnosticá-la.
+                return Err(limpeza.context(format!("{original:#}")));
+            }
+            return Err(original);
+        }
         Ok(estado)
+    }
+
+    /// Desfaz somente o conector publicado, sem sobrescrever alterações que a
+    /// tela tenha feito em outros servidores durante a tentativa. O servidor
+    /// sempre fecha e o segredo sempre sai: uma publicação cancelada não deixa
+    /// uma porta viva atrás do Stop.
+    async fn restaurar_publicacao(
+        &self,
+        conector_anterior: Option<Connector>,
+        config_alterada: bool,
+    ) -> Result<()> {
+        let mut primeira_falha: Option<anyhow::Error> = None;
+        if trava_leitura(&self.connections).contains_key(servidor::CONECTOR)
+            && let Err(e) = self.disconnect(servidor::CONECTOR).await
+        {
+            primeira_falha.get_or_insert_with(|| anyhow!(e));
+        }
+        if let Err(e) = self.publicador.fechar().await {
+            primeira_falha.get_or_insert_with(|| anyhow!(e));
+        }
+        self.segredos.esquecer(servidor::VARIAVEL_TOKEN);
+
+        if config_alterada {
+            let (salvar, registro) = {
+                let mut config = trava_estado(&self.config);
+                if let Some(conector) = conector_anterior {
+                    config.upsert(conector);
+                } else {
+                    config.remove(servidor::CONECTOR);
+                }
+                (config.save(&self.config_path), config.registry())
+            };
+            if let Err(e) = salvar {
+                primeira_falha.get_or_insert(e);
+            }
+            match registro {
+                Ok(registry) => self.replace_registry(registry),
+                Err(e) => {
+                    primeira_falha.get_or_insert_with(|| anyhow!(e));
+                }
+            }
+        }
+        match primeira_falha {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Derruba o servidor e esquece o segredo. O cadastro fica onde está: é o
@@ -608,10 +940,13 @@ impl McpManager {
             McpEntry::Stdio { command, args, env } => {
                 let mut cmd = Command::new(command);
                 cmd.args(args).envs(env);
-                let transport = TokioChildProcess::new(cmd)
-                    .context(tr("erros.falhaIniciarServidor", &[]))?;
+                let transport =
+                    TokioChildProcess::new(cmd).context(tr("erros.falhaIniciarServidor", &[]))?;
                 ().serve(transport).await.map_err(|e| {
-                    anyhow!(tr("erros.falhaConectarServidor", &[("detalhe", &format!("{e:?}"))]))
+                    anyhow!(tr(
+                        "erros.falhaConectarServidor",
+                        &[("detalhe", &format!("{e:?}"))]
+                    ))
                 })
             }
             McpEntry::Http { url, headers } => {
@@ -619,9 +954,8 @@ impl McpManager {
                 if !headers.is_empty() {
                     let mut parsed = HashMap::new();
                     for (name, value) in headers {
-                        let name = HeaderName::from_bytes(name.as_bytes()).with_context(|| {
-                            tr("erros.cabecalhoInvalido", &[("nome", name)])
-                        })?;
+                        let name = HeaderName::from_bytes(name.as_bytes())
+                            .with_context(|| tr("erros.cabecalhoInvalido", &[("nome", name)]))?;
                         let value = HeaderValue::from_str(value).with_context(|| {
                             tr("erros.valorCabecalhoInvalido", &[("nome", name.as_str())])
                         })?;
@@ -631,23 +965,60 @@ impl McpManager {
                 }
                 let transport = StreamableHttpClientTransport::from_config(config);
                 ().serve(transport).await.map_err(|e| {
-                    anyhow!(tr("erros.falhaConectarServidor", &[("detalhe", &format!("{e:?}"))]))
+                    anyhow!(tr(
+                        "erros.falhaConectarServidor",
+                        &[("detalhe", &format!("{e:?}"))]
+                    ))
                 })
             }
         }
     }
 }
 
-async fn run_connection(client: Client, mut receiver: mpsc::Receiver<ConnectionCommand>) {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            ConnectionCommand::Call { params, reply } => {
-                let result = client.call_tool(params).await;
-                let _ = reply.send(result);
+/// Dropar o futuro do rmcp **enfileira** o `notifications/cancelled`; quem o
+/// despeja é o laço do serviço, no mesmo canal que `close()` vai fechar. Sem uma
+/// volta do executor entre os dois, o desligamento cala o aviso antes de ele
+/// chegar — e o servidor remoto continua executando a ferramenta sem ninguém do
+/// outro lado para receber o resultado. É espera com fim, não sondagem: o prazo
+/// é o teto do aviso, não uma aposta de que a conexão está lenta.
+const AVISO_DE_CANCELAMENTO: Duration = Duration::from_millis(50);
+
+async fn run_connection(
+    client: Client,
+    mut receiver: mpsc::Receiver<ConnectionCommand>,
+    desligamento: CancellationToken,
+) {
+    loop {
+        let comando = tokio::select! {
+            biased;
+            _ = desligamento.cancelled() => break,
+            comando = receiver.recv() => match comando {
+                Some(comando) => comando,
+                None => break,
+            },
+        };
+        match comando {
+            ConnectionCommand::Call {
+                params,
+                reply,
+                cancel,
+            } => {
+                // Dropar o futuro do rmcp envia `notifications/cancelled` de
+                // forma best-effort. Só esta chamada é dropada; o cliente serial e
+                // a conexão continuam vivos para os outros turnos. Já o token de
+                // desligamento corta a chamada ativa e encerra o cliente inteiro.
+                tokio::select! {
+                    biased;
+                    _ = desligamento.cancelled() => break,
+                    _ = cancel.cancelled() => {}
+                    result = client.call_tool(params) => {
+                        let _ = reply.send(result);
+                    }
+                }
             }
-            ConnectionCommand::Shutdown => break,
         }
     }
+    let _ = tokio::time::sleep(AVISO_DE_CANCELAMENTO).await;
     let _ = client.cancel().await;
 }
 
@@ -699,6 +1070,40 @@ where
     }
 }
 
+/// A mesma regra do timeout, com o Stop do turno na frente. Depois do resultado
+/// o token é reconferido: ficar pronto junto com o cancelamento não é sucesso.
+async fn dentro_do_prazo_cancelavel<T, F>(
+    fazer: F,
+    prazo: Duration,
+    id: &str,
+    cancel: &CancellationToken,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    if cancel.is_cancelled() {
+        bail!(tr("erros.pedidoCancelado", &[]));
+    }
+    let espera = async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow!(tr("erros.pedidoCancelado", &[]))),
+            resultado = fazer => resultado,
+        }
+    };
+    let resultado = tokio::time::timeout(prazo, espera).await;
+    if cancel.is_cancelled() {
+        bail!(tr("erros.pedidoCancelado", &[]));
+    }
+    match resultado {
+        Ok(feito) => feito,
+        Err(_) => bail!(tr(
+            "erros.servidorSemResposta",
+            &[("id", id), ("segundos", &prazo.as_secs().to_string())],
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,7 +1124,11 @@ mod tests {
         let texto = erro.to_string();
         assert!(texto.contains("filesystem"), "{texto}");
         assert!(texto.contains("respondeu"), "{texto}");
-        assert!(inicio.elapsed() < Duration::from_secs(1), "o prazo não cortou a espera: {:?} para lá do que 50 ms", inicio.elapsed());
+        assert!(
+            inicio.elapsed() < Duration::from_secs(1),
+            "o prazo não cortou a espera: {:?} para lá do que 50 ms",
+            inicio.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -735,15 +1144,15 @@ mod tests {
     /// abrir a porta outra vez.
     #[test]
     fn o_catalogo_embutido_ganha_a_ferramenta_de_publicar() {
-        let nomes: Vec<String> = ferramentas_locais()
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
+        let nomes: Vec<String> = ferramentas_locais().into_iter().map(|t| t.name).collect();
         assert_eq!(
             nomes.len(),
             local::catalogo().len() + bancos::ferramentas::catalogo().len() + 1
         );
-        assert!(nomes.contains(&servidor::FERRAMENTA.to_string()), "{nomes:?}");
+        assert!(
+            nomes.contains(&servidor::FERRAMENTA.to_string()),
+            "{nomes:?}"
+        );
         assert!(nomes.contains(&"bancos_listar".to_string()), "{nomes:?}");
         assert!(nomes.contains(&"bancos_apagar".to_string()), "{nomes:?}");
         let apagar = ferramentas_locais()
@@ -764,10 +1173,613 @@ mod tests {
         let resultado = resultado_publicado(&estado);
         let json = serde_json::to_string(&resultado.content).expect("o conteúdo serializa");
         assert!(json.contains("4599"), "{json}");
-        assert!(!json.contains(servidor::VARIAVEL_TOKEN), "o token não vai no resultado");
+        assert!(
+            !json.contains(servidor::VARIAVEL_TOKEN),
+            "o token não vai no resultado"
+        );
         assert_eq!(resultado.is_error, Some(false));
         let vista = resultado.structured_content.expect("o cartão lê a vista");
         assert_eq!(vista["porta"], serde_json::json!(4599));
         assert_eq!(vista["ferramentas"], serde_json::json!(11));
+    }
+
+    async fn manager_conectado(modo: crate::permissions::AgentMode) -> (Arc<McpManager>, PathBuf) {
+        let raiz = std::env::temp_dir().join(format!("aether-manager-{}", std::process::id()));
+        std::fs::create_dir_all(&raiz).expect("pasta de teste");
+        let pastas = Arc::new(RwLock::new(Pastas {
+            raizes: vec![raiz.clone()],
+        }));
+        let manager = Arc::new(McpManager::new(
+            Registry::new(vec![local::conector()]).expect("conector embutido"),
+            Arc::new(Mutex::new(PermissionGate::new(modo))),
+            Arc::clone(&pastas),
+            Arc::new(crate::ai::memoria::Custodio::novo(
+                &[],
+                &raiz.join("modelos"),
+                &raiz.join("memoria"),
+                raiz.join("rag.json"),
+                &raiz.join(crate::ai::base::PASTA),
+                pastas,
+            )),
+            Arc::new(Mutex::new(McpConfig::default())),
+            Arc::new(raiz.join("mcp.json")),
+            Arc::new(Segredos::default()),
+            Arc::new(raiz.join("bancos.json")),
+            Arc::new(raiz.join("resultados")),
+        ));
+        manager
+            .connect(local::CONECTOR)
+            .await
+            .expect("conector embutido conecta");
+        (manager, raiz)
+    }
+
+    async fn proxima_aprovacao(eventos: &mut broadcast::Receiver<McpEvent>) -> ApprovalRequest {
+        tokio::time::timeout(Duration::from_secs(1), eventos.recv())
+            .await
+            .expect("aprovação chega")
+            .expect("canal de eventos aberto")
+            .into()
+    }
+
+    impl From<McpEvent> for ApprovalRequest {
+        fn from(event: McpEvent) -> Self {
+            match event {
+                McpEvent::ApprovalRequested { request } => request,
+                other => panic!("esperava aprovação, veio {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelar_turno_nao_atinge_aprovacao_de_outro_turno() {
+        use tokio_util::sync::CancellationToken;
+
+        let (manager, raiz) = manager_conectado(crate::permissions::AgentMode::Default).await;
+        let token_um = CancellationToken::new();
+        let token_dois = CancellationToken::new();
+        manager.register_turn(11, token_um.clone());
+        manager.register_turn(12, token_dois.clone());
+        let mut eventos = manager.subscribe();
+        let alvo_um = raiz.join("turno-11.txt");
+        let alvo_dois = raiz.join("turno-12.txt");
+        let args_um = serde_json::json!({
+            "caminho": alvo_um.to_string_lossy(),
+            "conteudo": "cancelado",
+        });
+        let args_dois = serde_json::json!({
+            "caminho": alvo_dois.to_string_lossy(),
+            "conteudo": "autorizado",
+        });
+        let primeira = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .call_tool_cancellable(
+                        &format!("{}__escrever_arquivo", local::CONECTOR),
+                        args_um,
+                        token_um,
+                    )
+                    .await
+            })
+        };
+        let segunda = {
+            let manager = Arc::clone(&manager);
+            let token_tarefa = token_dois.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_tool_cancellable(
+                        &format!("{}__escrever_arquivo", local::CONECTOR),
+                        args_dois,
+                        token_tarefa,
+                    )
+                    .await
+            })
+        };
+
+        let mut pedidos = Vec::new();
+        while pedidos.len() < 2 {
+            pedidos.push(proxima_aprovacao(&mut eventos).await);
+        }
+        let pedido_um = pedidos
+            .iter()
+            .find(|p| p.turn_id == Some(11))
+            .expect("card do turno 11");
+        let pedido_dois = pedidos
+            .iter()
+            .find(|p| p.turn_id == Some(12))
+            .expect("card do turno 12");
+
+        assert_eq!(manager.cancel_turn(11), 1);
+        assert!(
+            !token_dois.is_cancelled(),
+            "o token do outro turno continua vivo"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), primeira)
+                .await
+                .expect("turno cancelado termina")
+                .expect("tarefa do turno conclui")
+                .expect_err("turno cancelado não executa")
+                .to_string()
+                == tr("erros.pedidoCancelado", &[])
+        );
+        assert!(!segunda.is_finished(), "o outro turno continua esperando");
+        assert!(!manager.approvals().resolve(&pedido_um.id, true));
+        assert!(manager.approvals().resolve(&pedido_dois.id, true));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), segunda)
+                .await
+                .expect("outro turno termina")
+                .is_ok()
+        );
+        assert!(!alvo_um.exists(), "cancelado não escreve");
+        assert!(alvo_dois.exists(), "aprovado escreve");
+    }
+
+    #[tokio::test]
+    async fn chamada_manual_continua_sem_turn_id() {
+        let (manager, raiz) = manager_conectado(crate::permissions::AgentMode::Default).await;
+        let mut eventos = manager.subscribe();
+        let alvo = raiz.join("manual.txt");
+        let args = serde_json::json!({
+            "caminho": alvo.to_string_lossy(),
+            "conteudo": "manual",
+        });
+        let tarefa = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .call_tool(&format!("{}__escrever_arquivo", local::CONECTOR), args)
+                    .await
+            })
+        };
+        let pedido = proxima_aprovacao(&mut eventos).await;
+        assert_eq!(pedido.turn_id, None);
+        assert!(manager.approvals().resolve(&pedido.id, true));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), tarefa)
+                .await
+                .expect("manual termina")
+                .is_ok()
+        );
+        assert!(alvo.exists());
+    }
+
+    #[tokio::test]
+    async fn token_ja_cancelado_nao_envia_chamada_remota() {
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let (manager, _) = manager_conectado(crate::permissions::AgentMode::FullAccess).await;
+        let (sender, mut receptor) = mpsc::channel(1);
+        let meta = ToolMeta {
+            connector_id: local::CONECTOR.to_string(),
+            tool: "info_sistema".to_string(),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let erro = manager
+            .enviar(sender, &meta, serde_json::Map::new(), &cancel)
+            .await
+            .expect_err("token já cancelado recusa envio");
+        assert_eq!(erro.to_string(), tr("erros.pedidoCancelado", &[]));
+        assert!(
+            matches!(
+                receptor.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "nenhum comando chega ao servidor"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelar_o_token_encerra_a_espera_da_resposta_remota() {
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let (manager, _) = manager_conectado(crate::permissions::AgentMode::FullAccess).await;
+        let (sender, mut receptor) = mpsc::channel(1);
+        let meta = ToolMeta {
+            connector_id: local::CONECTOR.to_string(),
+            tool: "info_sistema".to_string(),
+        };
+        let cancel = CancellationToken::new();
+        let mut futura = Box::pin(manager.enviar(sender, &meta, serde_json::Map::new(), &cancel));
+        let comando = tokio::select! {
+            comando = receptor.recv() => comando.expect("comando enviado"),
+            _ = &mut futura => panic!("espera terminou antes do envio"),
+        };
+        assert!(matches!(comando, ConnectionCommand::Call { .. }));
+        drop(comando); // derruba o oneshot sem responder
+
+        cancel.cancel();
+        let erro = tokio::time::timeout(Duration::from_millis(250), &mut futura)
+            .await
+            .expect("não fica esperando resposta depois do cancelamento")
+            .expect_err("resposta foi derrubada");
+        assert_eq!(erro.to_string(), tr("erros.pedidoCancelado", &[]));
+    }
+
+    #[tokio::test]
+    async fn cancelamento_corta_o_handshake_sem_esperar_o_prazo_inteiro() {
+        use tokio_util::sync::CancellationToken;
+
+        let cancel = CancellationToken::new();
+        let inicio = Instant::now();
+        let espera = async {
+            cancel.cancel();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, anyhow::Error>(())
+        };
+        let erro = tokio::time::timeout(
+            Duration::from_millis(250),
+            dentro_do_prazo_cancelavel(espera, Duration::from_secs(45), "aether", &cancel),
+        )
+        .await
+        .expect("o cancelamento não espera os 45 segundos")
+        .expect_err("handshake cancelado não tem sucesso");
+        assert_eq!(erro.to_string(), tr("erros.pedidoCancelado", &[]));
+        assert!(inicio.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn publicacao_cancelada_no_meio_nao_deixa_servidor_segredo_nem_cadastro() {
+        let (manager, _) = manager_conectado(crate::permissions::AgentMode::FullAccess).await;
+        let cancel = CancellationToken::new();
+        let (chegou_na_conexao, mut aviso) = mpsc::channel(1);
+        let tarefa = {
+            let manager = Arc::clone(&manager);
+            let cancel_tarefa = cancel.clone();
+            tokio::spawn(async move {
+                manager
+                    .publicar_com(&cancel_tarefa, move || {
+                        // `send` é assíncrono: segurar o futuro sem aguardar não
+                        // entrega nada. `try_send` empurra na hora, que é o que o
+                        // aviso precisa — a conexão em si continua pendurada.
+                        let _ = chegou_na_conexao.try_send(());
+                        std::future::pending::<Result<()>>()
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), aviso.recv())
+            .await
+            .expect("publicação chega à conexão")
+            .expect("aviso aberto");
+        // O servidor, o segredo e o cadastro já existem neste ponto. Parar aqui
+        // é o caso que antes podia esperar o handshake e ainda publicar.
+        assert!(manager.estado_servidor().ativa);
+        assert!(manager.token_servidor().is_some());
+        assert!(manager.segredos.obter(servidor::VARIAVEL_TOKEN).is_some());
+        assert!(
+            manager
+                .registry_snapshot()
+                .get(servidor::CONECTOR)
+                .is_some()
+        );
+        cancel.cancel();
+
+        let erro = tokio::time::timeout(Duration::from_secs(1), tarefa)
+            .await
+            .expect("publicação cancelada termina sem o handshake")
+            .expect("tarefa conclui")
+            .expect_err("Stop não devolve publicação");
+        assert_eq!(erro.to_string(), tr("erros.pedidoCancelado", &[]));
+        assert!(!manager.estado_servidor().ativa, "servidor foi fechado");
+        assert!(manager.token_servidor().is_none(), "token foi esquecido");
+        assert!(
+            manager.segredos.obter(servidor::VARIAVEL_TOKEN).is_none(),
+            "segredo foi removido"
+        );
+        assert!(
+            !manager
+                .connected_ids()
+                .contains(&servidor::CONECTOR.to_string()),
+            "nenhuma conexão publicada sobrou"
+        );
+        assert!(
+            manager
+                .registry_snapshot()
+                .get(servidor::CONECTOR)
+                .is_none(),
+            "cadastro em memória foi restaurado"
+        );
+        let config = McpConfig::load(&manager.config_path).expect("mcp.json lê após rollback");
+        assert!(
+            config
+                .servers
+                .iter()
+                .all(|conector| conector.id != servidor::CONECTOR),
+            "cadastro em disco foi restaurado"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !manager.estado_servidor().ativa,
+            "nenhum trabalho tardio torna a publicar"
+        );
+    }
+
+    #[tokio::test]
+    async fn chamada_publicada_interna_executa_uma_vez_com_o_turno_interno() {
+        let (manager, raiz) = manager_conectado(crate::permissions::AgentMode::Default).await;
+        manager.replace_registry(
+            Registry::new(vec![
+                local::conector(),
+                servidor::conector(&servidor::Estado {
+                    ativa: true,
+                    url: "http://127.0.0.1:4599/mcp".to_string(),
+                    porta: 4599,
+                    ferramentas: 1,
+                }),
+            ])
+            .expect("registro interno e publicado"),
+        );
+        let anunciadas: Vec<ToolInfo> = local::catalogo()
+            .iter()
+            .chain(bancos::ferramentas::catalogo().iter())
+            .map(|ferramenta| ToolInfo::local(servidor::CONECTOR, ferramenta))
+            .collect();
+        trava_escrita(&manager.connections).insert(
+            servidor::CONECTOR.to_string(),
+            Connection {
+                canal: Canal::Publicado,
+                cliente_descoberta: None,
+                anunciadas,
+                desligamento: CancellationToken::new(),
+                tarefa: None,
+            },
+        );
+        let cancel = CancellationToken::new();
+        manager.register_turn(91, cancel.clone());
+        let mut eventos = manager.subscribe();
+        let alvo = raiz.join("publicado-interno.txt");
+        let args = serde_json::json!({
+            "caminho": alvo.to_string_lossy(),
+            "conteudo": "turno interno",
+        });
+        let tarefa = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .call_tool_cancellable(
+                        &format!("{}__escrever_arquivo", servidor::CONECTOR),
+                        args,
+                        cancel,
+                    )
+                    .await
+            })
+        };
+        let pedido = proxima_aprovacao(&mut eventos).await;
+        assert_eq!(pedido.turn_id, Some(91), "o turno continua sendo interno");
+        {
+            // A conexão publicada não tem canal nem worker: não existe por onde a
+            // chamada interna sair pela rede, e é isso que a assertiva de baixo
+            // ("roda uma única vez") passa a significar sozinha.
+            let conexoes = trava_leitura(&manager.connections);
+            let publicada = conexoes
+                .get(servidor::CONECTOR)
+                .expect("a conexão publicada continua de pé");
+            assert!(
+                matches!(publicada.canal, Canal::Publicado) && publicada.tarefa.is_none(),
+                "a conexão interna não tem caminho de rede"
+            );
+        }
+        assert!(manager.approvals().resolve(&pedido.id, true));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), tarefa)
+                .await
+                .expect("chamada interna termina")
+                .expect("tarefa conclui")
+                .is_ok()
+        );
+        assert!(alvo.exists(), "Execucao roda a ferramenta uma única vez");
+        let mut reapareceram = 0;
+        while let Ok(evento) = eventos.try_recv() {
+            if matches!(evento, McpEvent::ApprovalRequested { .. }) {
+                reapareceram += 1;
+            }
+        }
+        assert_eq!(reapareceram, 0, "nenhuma segunda aprovação para a mesma chamada");
+    }
+
+    #[derive(Clone)]
+    struct ServidorSondo {
+        iniciou: Arc<tokio::sync::Notify>,
+        cancelou: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl rmcp::ServerHandler for ServidorSondo {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> std::result::Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            if request.name.as_ref() == "pendurar" {
+                self.iniciou.notify_one();
+                tokio::select! {
+                    _ = context.ct.cancelled() => {
+                        self.cancelou
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        Err(rmcp::ErrorData::internal_error("cancelado", None))
+                    }
+                    _ = std::future::pending::<()>() => unreachable!(),
+                }
+            } else {
+                Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resposta_remota_cancelada_nao_derruba_a_conexao() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+        use tokio_util::sync::CancellationToken;
+
+        let iniciou = Arc::new(Notify::new());
+        let cancelou = Arc::new(AtomicBool::new(false));
+        let (servidor_io, cliente_io) = tokio::io::duplex(8192);
+        let servidor = {
+            let iniciou = Arc::clone(&iniciou);
+            let cancelou = Arc::clone(&cancelou);
+            tokio::spawn(async move {
+                let running = rmcp::service::serve_directly::<rmcp::RoleServer, _, _, _, _>(
+                    ServidorSondo { iniciou, cancelou },
+                    servidor_io,
+                    None,
+                );
+                running.waiting().await.expect("servidor direto encerra");
+            })
+        };
+        let cliente = rmcp::service::serve_directly::<RoleClient, _, _, _, _>((), cliente_io, None);
+        let (sender, receptor) = mpsc::channel(4);
+        let desligamento = CancellationToken::new();
+        let conexao = tokio::spawn(run_connection(cliente, receptor, desligamento.clone()));
+        let cancel = CancellationToken::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(ConnectionCommand::Call {
+                params: CallToolRequestParams::new("pendurar"),
+                reply: reply_tx,
+                cancel: cancel.clone(),
+            })
+            .await
+            .expect("comando na fila");
+        tokio::time::timeout(Duration::from_secs(1), iniciou.notified())
+            .await
+            .expect("servidor recebeu a chamada");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), reply_rx)
+            .await
+            .expect("resposta cancelada não fica pendurada");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelou.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notifications/cancelled chega ao servidor");
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(ConnectionCommand::Call {
+                params: CallToolRequestParams::new("responder"),
+                reply: reply_tx,
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .expect("próxima chamada na mesma conexão");
+        let resposta = tokio::time::timeout(Duration::from_secs(1), reply_rx)
+            .await
+            .expect("conexão continua responsiva")
+            .expect("oneshot aberto")
+            .expect("segunda chamada funciona");
+        assert_eq!(resposta.is_error, Some(false));
+
+        desligamento.cancel();
+        tokio::time::timeout(Duration::from_secs(1), conexao)
+            .await
+            .expect("conexão encerra")
+            .expect("sem pânico");
+        tokio::time::timeout(Duration::from_secs(1), servidor)
+            .await
+            .expect("servidor encerra")
+            .expect("sem pânico");
+    }
+
+    #[tokio::test]
+    async fn disconnect_interrompe_a_chamada_ativa_e_encerra_o_cliente() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let (manager, _) = manager_conectado(crate::permissions::AgentMode::FullAccess).await;
+        let anunciadas = manager.anunciadas(local::CONECTOR);
+        let iniciou = Arc::new(Notify::new());
+        let cancelou = Arc::new(AtomicBool::new(false));
+        let (servidor_io, cliente_io) = tokio::io::duplex(8192);
+        let servidor = {
+            let iniciou = Arc::clone(&iniciou);
+            let cancelou = Arc::clone(&cancelou);
+            tokio::spawn(async move {
+                let running = rmcp::service::serve_directly::<rmcp::RoleServer, _, _, _, _>(
+                    ServidorSondo { iniciou, cancelou },
+                    servidor_io,
+                    None,
+                );
+                running.waiting().await.expect("servidor direto encerra");
+            })
+        };
+        let cliente = rmcp::service::serve_directly::<RoleClient, _, _, _, _>((), cliente_io, None);
+        let (sender, receptor) = mpsc::channel(4);
+        let desligamento = CancellationToken::new();
+        let tarefa = tokio::spawn(run_connection(cliente, receptor, desligamento.clone()));
+        trava_escrita(&manager.connections).insert(
+            local::CONECTOR.to_string(),
+            Connection {
+                canal: Canal::Remoto(sender),
+                cliente_descoberta: None,
+                anunciadas,
+                desligamento,
+                tarefa: Some(tarefa),
+            },
+        );
+
+        let chamada = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .call_tool(
+                        &format!("{}__pendurar", local::CONECTOR),
+                        serde_json::json!({}),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), iniciou.notified())
+            .await
+            .expect("servidor recebeu a chamada ativa");
+
+        tokio::time::timeout(Duration::from_secs(1), manager.disconnect(local::CONECTOR))
+            .await
+            .expect("disconnect não fica atrás de call_tool")
+            .expect("conexão é removida");
+        let erro = tokio::time::timeout(Duration::from_secs(1), chamada)
+            .await
+            .expect("chamada ativa acorda")
+            .expect("tarefa conclui")
+            .expect_err("desconexão derruba a chamada");
+        assert!(
+            erro.to_string().contains(&tr(
+                "erros.servidorDerrubouChamada",
+                &[("id", local::CONECTOR)]
+            )),
+            "{erro:#}"
+        );
+        assert!(
+            !manager
+                .connected_ids()
+                .contains(&local::CONECTOR.to_string())
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelou.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("o cliente cancela a chamada no servidor");
+        tokio::time::timeout(Duration::from_secs(1), servidor)
+            .await
+            .expect("cliente/canal do servidor encerram")
+            .expect("sem pânico");
     }
 }

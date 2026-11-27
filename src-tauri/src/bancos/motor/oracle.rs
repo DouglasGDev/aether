@@ -14,8 +14,8 @@ use oracledb::{
 use serde_json::{Map, Value};
 
 use super::{
-    Comparacao, Consulta, Cronometro, Filtro, Motor, PRAZO_DE_LEITURA, ResultadoSql, aparar_no_teto,
-    teto_de_leitura,
+    Comparacao, Consulta, Cronometro, Filtro, Motor, PRAZO_DE_LEITURA, ResultadoSql,
+    aparar_no_teto, erro_coluna_invalida, ordem_de, teto_de_leitura,
 };
 use crate::bancos::config::Conexao;
 use crate::idiomas::tr;
@@ -264,7 +264,7 @@ impl Oracle {
             .iter()
             .find(|(nome, _)| nome.eq_ignore_ascii_case(coluna))
             .map(|(nome, _)| conferido(&nome))
-            .ok_or_else(|| anyhow!(tr("erros.bancoColunaInexistente", &[("coluna", coluna)])))
+            .ok_or_else(|| erro_coluna_invalida(coluna, conhecidas))
     }
 
     /// A marca do parâmetro com o valor que o modelo mandou — `TO_NUMBER(:1)`,
@@ -527,8 +527,9 @@ impl Motor for Oracle {
         let onde = Self::onde_sql(filtro, &schema, &mut params)?;
         let ordenar = match ordem {
             None => String::new(),
-            Some((coluna, desc)) => {
-                let coluna = Self::conferir_coluna(coluna, &schema)?;
+            Some((texto, desc)) => {
+                let (coluna, desc) = ordem_de(texto, desc, Some(&schema))?;
+                let coluna = Self::conferir_coluna(&coluna, &schema)?;
                 format!(" ORDER BY {coluna} {}", if desc { "DESC" } else { "ASC" })
             }
         };
@@ -645,6 +646,39 @@ impl Motor for Oracle {
 mod tests {
     use super::*;
     use crate::bancos::config::{conexao_de_teste, Tipo};
+
+    /// O nome da ordem continua sendo conferido no schema real; texto de SQL
+    /// não vira coluna, e o erro ajuda o modelo a corrigir a chamada.
+    #[test]
+    fn coluna_de_ordem_invalida_lista_as_validas_e_o_exemplo() {
+        let schema = vec![
+            ("ID".to_string(), "NUMBER".to_string()),
+            ("QT_VENDA".to_string(), "NUMBER".to_string()),
+        ];
+        assert_eq!(
+            Oracle::conferir_coluna("qt_venda", &schema).unwrap(),
+            "\"QT_VENDA\""
+        );
+        for entrada in [
+            "qt_venda DESC",
+            "qt_venda, id",
+            "qt_venda; DROP TABLE vendas",
+        ] {
+            let erro = Oracle::conferir_coluna(entrada, &schema)
+                .unwrap_err()
+                .to_string();
+            for trecho in [
+                entrada,
+                "ID",
+                "QT_VENDA",
+                "ordem",
+                "ordemDesc",
+                "bancos_colunas",
+            ] {
+                assert!(erro.contains(trecho), "{entrada}: {erro}");
+            }
+        }
+    }
 
     /// O catálogo de uma fonte cabe numa declaração: a tabela conferida e as
     /// colunas dela na mesma junta. Duas viagens — a lista inteira de `user_tables`

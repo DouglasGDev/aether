@@ -17,6 +17,7 @@ use super::session::TURN_MARKER;
 use crate::idiomas::tr;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 /// O teto de tokens do resumo. É a conta que a janela faz quando ainda não
@@ -52,11 +53,147 @@ impl Resumo {
     }
 }
 
+/// A pasta padrão do Aether: `~/.aether`. É ela, e não o arquivo de cada
+/// conversa, que se abre de fora para ver o que o modelo dobrou — o resumo mora
+/// dentro da conversa porque a conversa precisa dele para continuar, e mora aqui
+/// porque a pessoa precisa dele depois que a conversa fecha.
+///
+/// `AETHER_CASA` move a raiz da casa, não só a pasta do registro: um caminho
+/// escrito à mão em dois lugares é como um teste acaba lendo o `.aether` de
+/// verdade.
+pub fn casa() -> Result<PathBuf> {
+    let raiz = std::env::var_os("AETHER_CASA")
+        .or_else(|| std::env::var_os("HOME"))
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|r| !r.as_os_str().is_empty());
+    match raiz {
+        Some(raiz) => Ok(raiz.join(".aether")),
+        None => bail!(tr("erros.semPastaAether", &[])),
+    }
+}
+
+/// O nome da subpasta dentro de `.aether`. Fica separado das conversas de
+/// propósito: apagar uma conversa não é apagar a prova do que ela custou.
+pub const COMPACTACOES: &str = "compactacoes";
+
+/// Uma dobra como ela fica no disco: o texto que o modelo escreveu, onde ele
+/// corta, e o que a dobra cobrou. Os números vêm todos da mesma rodada que
+/// produziu o resumo — um registro escrito com uma conta de fora seria o
+/// aplicativo narrando a própria memória em vez de registrá-la.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dobra {
+    /// O id da conversa, que é também o nome do arquivo.
+    pub conversa: String,
+    /// Quantas dobras esta conversa já teve, contando esta. É o que distingue a
+    /// terceira dobrada da primeira: o texto do resumo diz o que ficou, este
+    /// número diz quantas vezes aquilo foi lido e escrito de novo.
+    pub ordem: usize,
+    /// O modelo que escreveu o resumo. Uma dobra é saída daquele modelo: lida
+    /// com outro, a conversa começa de outro jeito.
+    pub modelo: String,
+    /// A janela que o motor aceitou nesta rodada, não a que o arquivo declara.
+    pub janela: usize,
+    pub texto: String,
+    /// Índice da primeira mensagem que este texto não cobre.
+    pub ate: usize,
+    pub lidas: usize,
+    pub descartadas: usize,
+    /// Tokens que o resumo gerou — o preço medido da dobra, pago na placa.
+    pub tokens: usize,
+    /// Millis desde a epoch, do relógio do sistema — a mesma unidade que as
+    /// fichas de conversa usam, para que uma dobra e o turno que a provocou se
+    /// ordenem na mesma escala.
+    pub quando: u64,
+}
+
+impl Dobra {
+    /// Quantas dobras este registro é o último de uma conversa: lida do arquivo
+    /// anterior, antes de ele ser substituído. Arquivo ausente ou ilegível é a
+    /// primeira dobra, não um erro: o histórico de dobras é um registro, e a
+    /// conversa continua sendo a fonte do resumo que o prompt usa.
+    pub fn ordem_anterior(raiz: &Path, conversa: &str) -> usize {
+        Self::caminho(raiz, conversa)
+            .and_then(|caminho| ler_o_ultimo(caminho))
+            .unwrap_or(0)
+    }
+
+    /// O caminho desta dobra: `<casa>/compactacoes/<conversa>.json`, onde
+    /// `raiz` é a própria pasta de compactações, não a `.aether`.
+    pub fn caminho(raiz: &Path, conversa: &str) -> Option<PathBuf> {
+        crate::conversas::id_valido(conversa).then(|| raiz.join(format!("{conversa}.json")))
+    }
+
+    /// Escrita atômica: um arquivo de registro partido ao meio não conta nada
+    /// sobre nenhuma conversa. O temporário leva o pid porque duas janelas do
+    /// aplicativo podem dobrar a mesma conversa na mesma hora.
+    pub fn gravar(&self, raiz: &Path) -> Result<PathBuf> {
+        let caminho = Self::caminho(raiz, &self.conversa).ok_or_else(|| {
+            anyhow::anyhow!(tr(
+                "erros.conversaIdInvalido",
+                &[("id", &self.conversa)]
+            ))
+        })?;
+        if let Some(pai) = caminho.parent() {
+            std::fs::create_dir_all(pai).map_err(|e| {
+                anyhow::anyhow!(tr(
+                    "erros.falhaCriarPasta",
+                    &[("caminho", &pai.display().to_string()), ("detalhe", &e.to_string())]
+                ))
+            })?;
+        }
+        let texto = serde_json::to_string_pretty(self).map_err(|e| {
+            anyhow::anyhow!(tr(
+                "erros.falhaSerializar",
+                &[("caminho", &caminho.display().to_string()), ("detalhe", &e.to_string())]
+            ))
+        })?;
+        let temporario = caminho.with_extension(format!(
+            "json.tmp.{}",
+            std::process::id()
+        ));
+        std::fs::write(&temporario, &texto).map_err(|e| {
+            anyhow::anyhow!(tr(
+                "erros.falhaEscrever",
+                &[("caminho", &temporario.display().to_string()), ("detalhe", &e.to_string())]
+            ))
+        })?;
+        std::fs::rename(&temporario, &caminho).map_err(|e| {
+            anyhow::anyhow!(tr(
+                "erros.falhaMover",
+                &[("caminho", &caminho.display().to_string()), ("detalhe", &e.to_string())]
+            ))
+        })?;
+        Ok(caminho)
+    }
+}
+
+fn ler_o_ultimo(caminho: PathBuf) -> Option<usize> {
+    let texto = std::fs::read_to_string(caminho).ok()?;
+    serde_json::from_str::<Dobra>(&texto).ok().map(|dobra| dobra.ordem)
+}
+
+pub(crate) fn agora() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Os tokens que o prompt pode ocupar: a janela menos o que a resposta vai
 /// levar. É a mesma conta de sempre, escrita uma vez para o turno e para o
 /// resumo não divergirem.
 pub fn limite(janela: usize, resposta: usize) -> usize {
     janela.saturating_sub(resposta.min(janela / 2)).max(1)
+}
+
+/// O gatilho macio chega antes do estouro: compacta com folga para a resposta e
+/// para o próprio resumo, sem nunca passar do limite duro da janela.
+pub fn limite_macio(janela: usize, resposta: usize) -> usize {
+    (janela.saturating_mul(85) / 100)
+        .min(limite(janela, resposta))
+        .max(1)
 }
 
 /// Tokens do texto como o modelo os lê. Uma medida de encaixe que não usa este
@@ -86,31 +223,34 @@ fn pedido_de_resumo(anterior: Option<&str>, corpo: &[ChatMessage]) -> Vec<ChatMe
     conversa
 }
 
-/// Os ids do pedido de resumo e quantas mensagens dele chegam ao motor dentro
-/// de `teto`. Não coube tudo? Cai a ponta mais antiga — dos antigos, o que
-/// importa lembrar é o que chegou mais perto do que ainda está na janela — e o
-/// número devolvido é o que restou, porque é a única verdade sobre o que foi
-/// lido. Contar o trecho inteiro quando as mais antigas ficaram de fora seria o
-/// aplicativo garantindo uma memória que a janela não teve.
-///
-/// A medição entra por callback: o custo real é do template renderizado e
-/// tokenizado na placa, e a conta tem de poder ser conferida sem ela.
-fn apara_ate_caber(
+/// Os ids do pedido de resumo. O trecho inteiro entra ou não há resumo: cortar
+/// a ponta antiga deixaria um buraco entre o resumo anterior e as mensagens que
+/// continuam no prompt.
+fn ids_do_resumo(
     trecho: &[ChatMessage],
     teto: usize,
     medir: &dyn Fn(&[ChatMessage]) -> Result<Vec<u32>>,
 ) -> Result<(Vec<u32>, usize)> {
-    let mut corpo = trecho.to_vec();
-    loop {
-        let ids = medir(&corpo)?;
-        // Uma mensagem não se corta: mandá-la assim mesmo é o que deixa o motor
-        // decidir o que ler dela. Chegar a zero não resumiria nada e o turno
-        // giraria para sempre pedindo o resumo de um corpo vazio.
-        if ids.len() <= teto || corpo.len() <= 1 {
-            return Ok((ids, corpo.len()));
-        }
-        corpo.remove(0);
+    let ids = medir(trecho)?;
+    if ids.len() > teto {
+        bail!(tr(
+            "erros.promptForaDaJanela",
+            &[("tokens", &ids.len().to_string()), ("janela", &teto.to_string())]
+        ));
     }
+    Ok((ids, trecho.len()))
+}
+
+pub fn resumo_cabe(
+    engine: &Engine,
+    template: &ChatTemplate,
+    anterior: Option<&str>,
+    trecho: &[ChatMessage],
+) -> Result<bool> {
+    let prompt = template
+        .render(&pedido_de_resumo(anterior, trecho), &[], false)
+        .context(tr("erros.renderizarConversa", &[]))?;
+    Ok(codificar(engine, prompt.as_str())?.len() <= limite(engine.context(), TETO_TOKENS))
 }
 
 /// Dobra `trecho` dentro do resumo e devolve o texto novo com o que o motor
@@ -135,7 +275,7 @@ pub fn dobrar(
     // curta. A gramática de chamada custaria tokens e convidaria o modelo a
     // executar em vez de narrar o que já foi executado.
     let amostra = SamplingParams { max_tokens: TETO_TOKENS, ..params.clone() };
-    let (ids, lidas) = apara_ate_caber(trecho, limite(engine.context(), TETO_TOKENS), &|corpo| {
+    let (ids, lidas) = ids_do_resumo(trecho, limite(engine.context(), TETO_TOKENS), &|corpo| {
         Ok(codificar(
             engine,
             template
@@ -171,6 +311,90 @@ pub fn dobrar(
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    fn raiz_de_teste(nome: &str) -> PathBuf {
+        let raiz = std::env::temp_dir().join(format!(
+            "aether-compactacao-{}-{nome}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&raiz);
+        raiz
+    }
+
+    fn dobra(conversa: &str, ordem: usize, texto: &str) -> Dobra {
+        Dobra {
+            conversa: conversa.to_string(),
+            ordem,
+            modelo: "granite-4.2-3b".to_string(),
+            janela: 8192,
+            texto: texto.to_string(),
+            ate: 7,
+            lidas: 5,
+            descartadas: 1,
+            tokens: 214,
+            quando: 1_700_000_000_000,
+        }
+    }
+
+    /// A casa é a `.aether` pedida, e não um caminho escolhido por quem chama.
+    #[test]
+    fn o_registro_mora_na_pasta_padrao_do_aether() {
+        let casa = casa().expect("a máquina tem pasta de casa");
+        assert_eq!(
+            casa.file_name().map(|n| n.to_string_lossy().to_string()),
+            Some(".aether".to_string())
+        );
+    }
+
+    #[test]
+    fn uma_dobra_ocupa_um_arquivo_e_volta_inteira_da_leitura() {
+        let raiz = raiz_de_teste("gravada");
+        let feita = dobra("11111111-2222", 1, "a pessoa pediu a página");
+        let caminho = feita.gravar(&raiz).expect("escreve");
+        assert!(caminho.starts_with(&raiz), "{}", caminho.display());
+        assert_eq!(caminho.file_name().unwrap().to_string_lossy(), "11111111-2222.json");
+        let lida: Dobra =
+            serde_json::from_str(&std::fs::read_to_string(&caminho).expect("lê")).expect("JSON");
+        assert_eq!(lida, feita);
+        // Escrita atômica: o temporário é o que desaparece, não o registro.
+        assert!(
+            std::fs::read_dir(&raiz)
+                .expect("a pasta existe")
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().contains(".tmp.")),
+            "nenhum temporário sobra"
+        );
+    }
+
+    #[test]
+    fn a_conta_de_dobras_segue_o_registro_e_o_ilegivel_recomeca_sem_travar() {
+        let raiz = raiz_de_teste("ordem");
+        let id = "1234-abcd";
+        assert_eq!(Dobra::ordem_anterior(&raiz, id), 0, "sem arquivo não houve dobra");
+        dobra(id, 1, "primeira").gravar(&raiz).expect("grava a primeira");
+        assert_eq!(Dobra::ordem_anterior(&raiz, id), 1);
+        std::fs::write(Dobra::caminho(&raiz, id).expect("caminho"), "{ quebrado")
+            .expect("corrompe");
+        assert_eq!(
+            Dobra::ordem_anterior(&raiz, id),
+            0,
+            "um registro ilegível não pode travar a conversa: a conversa é a fonte"
+        );
+    }
+
+    /// O id vem da interface. Um `../` nele seria o registro escrito fora da
+    /// pasta — e a pasta fora do registro não é criada nem para o erro.
+    #[test]
+    fn um_id_fora_do_formato_nao_escreve_fora_da_pasta() {
+        let raiz = raiz_de_teste("fuga");
+        assert!(Dobra::caminho(&raiz, "../escapada").is_none());
+        assert!(Dobra::caminho(&raiz, "").is_none());
+        let erro = dobra("../escapada", 1, "x")
+            .gravar(&raiz)
+            .expect_err("o id recusado não escreve");
+        assert!(erro.to_string().contains("escapada"), "{erro}");
+        assert!(!raiz.exists(), "nada é criado para um id recusado");
+    }
 
     /// A reserva é conta, não adjetivo: metade da janela é o piso do que sobra
     /// para ler, e um teto de resposta maior que isso não aumenta o prompt.
@@ -239,36 +463,43 @@ mod testes {
         Ok(vec![0u32; n])
     }
 
-    /// O trecho que não coube: caem as mais antigas e o número devolvido é o que
-    /// restou. Medir o trecho inteiro aqui é o defeito original — a tela dizia
-    /// "5 mensagens dobradas" com 3 na frente do modelo.
     #[test]
-    fn o_que_nao_cabe_fica_de_fora_e_o_numero_diz_o_que_foi_lido() {
+    fn o_gatilho_macio_antecede_o_duro_sem_ultrapassar_a_resposta() {
+        assert_eq!(limite_macio(8192, 512), 6963);
+        assert_eq!(limite_macio(65536, 900), 55705);
+        assert_eq!(limite_macio(2048, 2048), 1024);
+        assert_eq!(limite_macio(1, 1024), 1);
+    }
+
+    /// O trecho que não coube não perde as mensagens antigas em silêncio: sem
+    /// resumo integral, a fronteira gravada mentiria sobre o que o modelo leu.
+    #[test]
+    fn o_trecho_acima_da_regua_falha_em_vez_de_descartar_o_comeco() {
         let trecho: Vec<ChatMessage> = (0..5)
             .map(|_| ChatMessage::new("user", "100"))
             .collect();
-        let (ids, lidas) = apara_ate_caber(&trecho, 300, &medir_por_corpo).unwrap();
-        assert_eq!(lidas, 3, "as duas mais antigas não couberam em 300 tokens");
-        assert_eq!(ids.len(), 300);
+        let erro = ids_do_resumo(&trecho, 300, &medir_por_corpo)
+            .expect_err("um pedido de resumo truncado não pode ser aprovado");
+        assert!(erro.to_string().contains("500"), "{erro}");
+        assert!(erro.to_string().contains("300"), "{erro}");
     }
 
     #[test]
-    fn quando_cabe_tudo_nada_e_descartado() {
+    fn quando_cabe_tudo_o_numero_diz_todas_as_mensagens_lidas() {
         let trecho: Vec<ChatMessage> = (0..5)
             .map(|_| ChatMessage::new("user", "100"))
             .collect();
-        let (ids, lidas) = apara_ate_caber(&trecho, 900, &medir_por_corpo).unwrap();
+        let (ids, lidas) = ids_do_resumo(&trecho, 900, &medir_por_corpo).unwrap();
         assert_eq!(lidas, 5);
         assert_eq!(ids.len(), 500);
     }
 
-    /// Uma mensagem só, maior que a régua: não há o que cortar sem sobrar nada
-    /// para ler, então ela vai assim mesmo e o motor cuida do resto. O número
-    /// continua sendo 1 — dizer 0 seria afirmar que o resumo não leu nada.
     #[test]
-    fn uma_mensagem_acima_da_regua_e_a_unica_lida() {
+    fn uma_mensagem_acima_da_regua_tambem_falha_sem_fingir_que_foi_lida() {
         let trecho = vec![ChatMessage::new("tool", "900")];
-        let (_, lidas) = apara_ate_caber(&trecho, 100, &medir_por_corpo).unwrap();
-        assert_eq!(lidas, 1);
+        let erro = ids_do_resumo(&trecho, 100, &medir_por_corpo)
+            .expect_err("não há resumo possível de uma mensagem que não cabe inteira");
+        assert!(erro.to_string().contains("900"), "{erro}");
+        assert!(erro.to_string().contains("100"), "{erro}");
     }
 }
